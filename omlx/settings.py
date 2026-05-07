@@ -383,14 +383,24 @@ class SubKeyEntry:
     key: str
     name: str = ""
     created_at: str = ""
+    max_context_window: int | None = None
+    enable_thinking: bool | None = None
+    thinking_budget_tokens: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {
+        data = {
             "key": self.key,
             "name": self.name,
             "created_at": self.created_at,
         }
+        if self.max_context_window is not None:
+            data["max_context_window"] = self.max_context_window
+        if self.enable_thinking is not None:
+            data["enable_thinking"] = self.enable_thinking
+        if self.thinking_budget_tokens is not None:
+            data["thinking_budget_tokens"] = self.thinking_budget_tokens
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SubKeyEntry:
@@ -399,6 +409,9 @@ class SubKeyEntry:
             key=data.get("key", ""),
             name=data.get("name", ""),
             created_at=data.get("created_at", ""),
+            max_context_window=data.get("max_context_window"),
+            enable_thinking=data.get("enable_thinking"),
+            thinking_budget_tokens=data.get("thinking_budget_tokens"),
         )
 
 

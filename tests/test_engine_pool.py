@@ -4,6 +4,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -109,6 +110,53 @@ class TestEnginePoolInit:
         entry_b = pool.get_entry("model-b")
         assert entry_b is not None
         assert entry_b.is_pinned is False
+
+
+class TestEnginePoolVlmMtp:
+    """Tests for VLM engine dispatch when Native MTP is enabled."""
+
+    @pytest.mark.asyncio
+    async def test_mtp_enabled_vlm_stays_vlm_engine(self, tmp_path):
+        """Native MTP must not force compatible VLM models into LM dispatch."""
+        model_dir = tmp_path / "vlm-mtp"
+        model_dir.mkdir()
+
+        pool = EnginePool(max_model_memory=None)
+        pool._entries["vlm-mtp"] = EngineEntry(
+            model_id="vlm-mtp",
+            model_path=str(model_dir),
+            model_type="vlm",
+            engine_type="vlm",
+            estimated_size=0,
+        )
+        pool._settings_manager = SimpleNamespace(
+            get_settings=lambda _model_id: SimpleNamespace(
+                mtp_enabled=True,
+                trust_remote_code=False,
+                dflash_enabled=False,
+                dflash_draft_model=None,
+            )
+        )
+
+        fake_vlm = MagicMock()
+        fake_vlm.start = AsyncMock()
+        fake_vlm.stop = AsyncMock()
+        fake_batched = MagicMock()
+        fake_batched.start = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=fake_vlm) as vlm_cls,
+            patch("omlx.engine_pool.BatchedEngine", return_value=fake_batched) as batched_cls,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool.mx") as mock_mx,
+        ):
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+            await pool._load_engine("vlm-mtp")
+
+        vlm_cls.assert_called_once()
+        batched_cls.assert_not_called()
+        assert pool._entries["vlm-mtp"].engine is fake_vlm
 
 
 class TestDiscoverModelsMerge:
@@ -613,6 +661,44 @@ class TestEnginePoolAsync:
         assert engine1 is engine2
         # start() should only be called once
         assert mock_engine.start.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_get_engine_unloads_other_loaded_model_on_switch(
+        self, pool_with_mock_engines
+    ):
+        """Requesting another model keeps only the requested engine loaded."""
+        pool = pool_with_mock_engines
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+        mock_engine_b.stop = AsyncMock()
+
+        def create_engine(*args, **kwargs):
+            model_name = str(kwargs.get("model_name", args[0] if args else ""))
+            if "model-a" in model_name:
+                return mock_engine_a
+            return mock_engine_b
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine),
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool.mx") as mock_mx,
+        ):
+            mock_mx.get_active_memory.side_effect = [1000, 1000]
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+
+        mock_engine_a.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is mock_engine_b
+        assert pool.loaded_model_count == 1
 
     @pytest.mark.asyncio
     async def test_unload_engine(self, pool_with_mock_engines):

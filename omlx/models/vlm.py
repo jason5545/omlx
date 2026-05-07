@@ -75,6 +75,20 @@ class VLMModelAdapter(nn.Module):
         return self._language_model.model.layers
 
     @property
+    def language_model(self):
+        """Expose the wrapped language model for native MTP eligibility checks."""
+        return self._language_model
+
+    @property
+    def mtp_available(self) -> bool:
+        """Return True when the wrapped language model exposes a live MTP head."""
+        return (
+            hasattr(self._language_model, "mtp_forward")
+            and hasattr(self._language_model, "make_mtp_cache")
+            and getattr(self._language_model, "mtp", None) is not None
+        )
+
+    @property
     def model_type(self) -> str:
         """Expose model_type for config access."""
         if hasattr(self._vlm_model, "config") and hasattr(self._vlm_model.config, "model_type"):
@@ -105,6 +119,25 @@ class VLMModelAdapter(nn.Module):
             return self._language_model.make_cache()
         from mlx_lm.models.cache import KVCache
         return [KVCache() for _ in range(len(self.layers))]
+
+    def make_mtp_cache(self) -> List[Any]:
+        """Create the language model's native MTP cache."""
+        if hasattr(self._language_model, "make_mtp_cache"):
+            return self._language_model.make_mtp_cache()
+        return []
+
+    def mtp_forward(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        mtp_cache: List[Any],
+    ) -> Any:
+        """Delegate Native MTP head inference to the wrapped language model."""
+        return self._language_model.mtp_forward(
+            hidden_states,
+            next_token_ids,
+            mtp_cache,
+        )
 
     def set_pending_embeddings(
         self,
@@ -226,6 +259,7 @@ class VLMModelAdapter(nn.Module):
         Returns:
             Model output (logits as mx.array)
         """
+        return_hidden = bool(kwargs.get("return_hidden", False))
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
         vlm_extra.pop("_captured_rope_deltas", None)
@@ -251,9 +285,13 @@ class VLMModelAdapter(nn.Module):
                 deltas = self._batch_rope_deltas
                 if (offsets is not None and isinstance(offsets, mx.array)
                         and deltas.size == B):
-                    positions = offsets + deltas
+                    positions = offsets + mx.reshape(deltas, (-1,))[:B]
+                    token_positions = (
+                        mx.reshape(positions, (-1, 1))
+                        + mx.arange(L)[None, :]
+                    )
                     position_ids = mx.broadcast_to(
-                        positions[None, :, None], (3, B, L)
+                        token_positions[None, :, :], (3, B, L)
                     )
                     # Decode never adds new image tokens; the broadcast
                     # collapses the 3 mRoPE sections to identical values,
@@ -275,8 +313,12 @@ class VLMModelAdapter(nn.Module):
                         break
                 if offsets is not None:
                     B, L = input_ids.shape
+                    token_positions = (
+                        mx.reshape(offsets[:B], (-1, 1))
+                        + mx.arange(L)[None, :]
+                    )
                     position_ids = mx.broadcast_to(
-                        offsets[None, :, None], (3, B, L)
+                        token_positions[None, :, :], (3, B, L)
                     )
                     with force_text_only_rope():
                         result = self._language_model(
@@ -291,7 +333,13 @@ class VLMModelAdapter(nn.Module):
                     self._vlm_model._set_position_state(input_ids)
                 result = self._language_model(input_ids, cache=cache, **kwargs)
 
+        if return_hidden and isinstance(result, tuple):
+            return result
         if hasattr(result, "logits"):
+            if return_hidden:
+                hidden = getattr(result, "hidden_states", None)
+                if hidden is not None:
+                    return result.logits, hidden
             return result.logits
         return result
 

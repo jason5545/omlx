@@ -256,6 +256,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # OpenAI-compatible caller identifier
+    user: Optional[str] = None
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -338,6 +340,8 @@ class CompletionRequest(BaseModel):
     frequency_penalty: float | None = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # OpenAI-compatible caller identifier
+    user: Optional[str] = None
 
     @field_validator("stop", mode="before")
     @classmethod

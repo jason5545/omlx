@@ -334,8 +334,11 @@ class EnginePool:
                     )
                     await self._unload_engine(model_id)
                 else:
+                    await self._unload_other_engines_for_switch(model_id)
                     entry.last_access = time.time()
                     return entry.engine
+
+            await self._unload_other_engines_for_switch(model_id)
 
             # Check if model is too large for memory limit
             if (
@@ -411,6 +414,39 @@ class EnginePool:
             await self._load_engine(model_id, force_lm=force_lm)
 
             return self._entries[model_id].engine
+
+    async def _unload_other_engines_for_switch(self, model_id: str) -> None:
+        """Keep interactive model switching to one loaded engine at a time.
+
+        oMLX still supports pinned models as a stronger "never evict" signal;
+        those are left loaded so existing pinning behavior is not silently
+        changed. Non-pinned engines are unloaded before serving a different
+        requested model, even when model-memory limits would otherwise allow
+        multiple resident models.
+        """
+        victims = [
+            mid
+            for mid, entry in self._entries.items()
+            if mid != model_id and entry.engine is not None
+        ]
+        for victim in victims:
+            victim_entry = self._entries.get(victim)
+            if victim_entry is None or victim_entry.engine is None:
+                continue
+            if victim_entry.is_pinned:
+                logger.debug(
+                    "Keeping pinned model '%s' loaded while switching to '%s'",
+                    victim,
+                    model_id,
+                )
+                continue
+            logger.info(
+                "Switching requested model to '%s'; unloading previously "
+                "loaded model '%s'",
+                model_id,
+                victim,
+            )
+            await self._unload_engine(victim)
 
     async def _ensure_memory_available(self, required: int) -> None:
         """
@@ -603,21 +639,15 @@ class EnginePool:
             if self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
 
-            # Native MTP forces LM-only dispatch even for VLM models. Vision
-            # encoder weights are ignored because the patched mtp_forward only
-            # exists on the language model path. mtp_enabled was already
-            # validated as mutually exclusive with dflash / turboquant in
-            # ModelSettings.__post_init__.
             if (
                 model_settings is not None
                 and getattr(model_settings, "mtp_enabled", False)
                 and effective_type == "vlm"
             ):
                 logger.info(
-                    f"MTP enabled for VLM model {model_id}; "
-                    f"forcing LM-only dispatch, vision components ignored"
+                    f"VLM+MTP requested for {model_id}; "
+                    f"loading VLMBatchedEngine and preserving vision inputs"
                 )
-                effective_type = "batched"
 
             # Check if DFlash is enabled — takes priority over engine type
             # since DFlash has its own model loading pipeline

@@ -49,7 +49,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
@@ -257,7 +257,7 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import verify_any_api_key
+    from .admin.auth import identify_api_key
 
     # No auth required if no API key is configured
     if _server_state.api_key is None:
@@ -285,11 +285,170 @@ async def verify_api_key(
         if _server_state.global_settings is not None
         else []
     )
-    if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
-        logger.warning("Rejected API key: %r", api_key_value)
+    identity = identify_api_key(api_key_value, _server_state.api_key, sub_keys)
+    if identity is None:
+        logger.warning("Rejected API key")
         raise HTTPException(status_code=401, detail="Invalid API key")
 
+    state = getattr(request, "state", None)
+    if state is not None:
+        state.omlx_api_key_kind = identity.get("kind")
+        state.omlx_api_key_name = identity.get("name")
+        state.omlx_sub_key = identity.get("sub_key")
+
     return True
+
+
+REQUEST_CLIENT_HEADERS = ("x-omlx-client", "x-client-name", "x-request-client")
+DEFAULT_SUB_KEY_POLICIES: dict[str, dict[str, Any]] = {
+    "voco": {"max_context_window": 16384, "enable_thinking": False},
+}
+
+
+def _clean_requester_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalized_policy_name(value: Any) -> str:
+    return (_clean_requester_value(value) or "").lower().replace("_", "-")
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    if value is None or value is False:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _get_request_state_attr(http_request: FastAPIRequest | None, attr: str) -> Any:
+    state = getattr(http_request, "state", None)
+    if state is None:
+        return None
+    return getattr(state, attr, None)
+
+
+def _identify_request_client(
+    http_request: FastAPIRequest | None,
+    request_user: Any = None,
+) -> tuple[str | None, str | None]:
+    sub_key_name = _clean_requester_value(
+        _get_request_state_attr(http_request, "omlx_api_key_name")
+    )
+    sub_key = _get_request_state_attr(http_request, "omlx_sub_key")
+    if sub_key is not None and sub_key_name and sub_key_name != "sub-key":
+        return sub_key_name, "api-sub-key"
+
+    for header in REQUEST_CLIENT_HEADERS:
+        header_value = _clean_requester_value(
+            http_request.headers.get(header) if http_request is not None else None
+        )
+        if header_value:
+            return header_value, f"header:{header}"
+
+    user_value = _clean_requester_value(request_user)
+    if user_value:
+        return user_value, "request.user"
+
+    if sub_key_name:
+        return sub_key_name, "api-key"
+    return None, None
+
+
+def _build_request_policy(
+    http_request: FastAPIRequest | None,
+    request_user: Any = None,
+) -> dict[str, Any]:
+    client, source = _identify_request_client(http_request, request_user=request_user)
+    policy: dict[str, Any] = {"client": client, "source": source}
+
+    sub_key = _get_request_state_attr(http_request, "omlx_sub_key")
+    if sub_key is not None:
+        max_context_window = _positive_int_or_none(
+            getattr(sub_key, "max_context_window", None)
+        )
+        enable_thinking = _bool_or_none(getattr(sub_key, "enable_thinking", None))
+        thinking_budget = _positive_int_or_none(
+            getattr(sub_key, "thinking_budget_tokens", None)
+        )
+        if max_context_window is not None:
+            policy["max_context_window"] = max_context_window
+        if enable_thinking is not None:
+            policy["enable_thinking"] = enable_thinking
+        if thinking_budget is not None:
+            policy["thinking_budget_tokens"] = thinking_budget
+
+    default_policy = DEFAULT_SUB_KEY_POLICIES.get(_normalized_policy_name(client))
+    if default_policy:
+        for key, value in default_policy.items():
+            if policy.get(key) is None:
+                policy[key] = value
+
+    return policy
+
+
+def _request_policy_has_overrides(policy: dict[str, Any] | None) -> bool:
+    return bool(
+        policy
+        and (
+            policy.get("max_context_window") is not None
+            or policy.get("enable_thinking") is not None
+            or policy.get("thinking_budget_tokens") is not None
+        )
+    )
+
+
+def _log_request_policy(policy: dict[str, Any], model_id: str | None) -> None:
+    if not _request_policy_has_overrides(policy) or policy.get("_logged"):
+        return
+    parts = []
+    if policy.get("max_context_window") is not None:
+        parts.append(f"max_context_window<={policy['max_context_window']}")
+    if policy.get("enable_thinking") is not None:
+        parts.append(f"enable_thinking={policy['enable_thinking']}")
+    if policy.get("thinking_budget_tokens") is not None:
+        parts.append(f"thinking_budget_tokens={policy['thinking_budget_tokens']}")
+    logger.info(
+        "Request policy active: client=%s source=%s model=%s %s",
+        policy.get("client") or "(unknown)",
+        policy.get("source") or "(unknown)",
+        model_id or "(unknown)",
+        ", ".join(parts),
+    )
+    policy["_logged"] = True
+
+
+def _apply_request_chat_template_overrides(
+    merged_ct_kwargs: dict[str, Any],
+    request_policy: dict[str, Any] | None,
+) -> None:
+    if not request_policy:
+        return
+    enable_thinking = _bool_or_none(request_policy.get("enable_thinking"))
+    if enable_thinking is None:
+        return
+    merged_ct_kwargs["enable_thinking"] = enable_thinking
+    if enable_thinking is False:
+        merged_ct_kwargs.pop("preserve_thinking", None)
 
 
 @asynccontextmanager
@@ -947,8 +1106,21 @@ def get_sampling_params(
     return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold
 
 
-def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
+def _resolve_thinking_budget(
+    request,
+    model_id: str | None,
+    request_policy: dict[str, Any] | None = None,
+) -> int | None:
     """Resolve thinking budget: request param > model settings > None."""
+    if request_policy and _bool_or_none(request_policy.get("enable_thinking")) is False:
+        return None
+    policy_budget = (
+        _positive_int_or_none(request_policy.get("thinking_budget_tokens"))
+        if request_policy
+        else None
+    )
+    if policy_budget is not None:
+        return policy_budget
     # Check request-level override (OpenAI format)
     req_budget = getattr(request, 'thinking_budget', None)
     # For Anthropic: check thinking.budget_tokens
@@ -995,7 +1167,10 @@ def _get_ocr_defaults(model_id: str | None) -> dict | None:
     return None
 
 
-def get_max_context_window(model_id: str | None = None) -> int | None:
+def get_max_context_window(
+    model_id: str | None = None,
+    request_policy: dict[str, Any] | None = None,
+) -> int | None:
     """
     Get effective max context window limit.
 
@@ -1012,9 +1187,20 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
     if model_settings and model_settings.max_context_window is not None:
-        return model_settings.max_context_window
+        base_context = model_settings.max_context_window
+    else:
+        base_context = _server_state.sampling.max_context_window
 
-    return _server_state.sampling.max_context_window
+    policy_context = (
+        _positive_int_or_none(request_policy.get("max_context_window"))
+        if request_policy
+        else None
+    )
+    if policy_context is None:
+        return base_context
+    if base_context is None:
+        return policy_context
+    return min(base_context, policy_context)
 
 
 def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int:
@@ -1050,14 +1236,16 @@ def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int
 
 
 def validate_context_window(
-    num_prompt_tokens: int, model_id: str | None = None
+    num_prompt_tokens: int,
+    model_id: str | None = None,
+    request_policy: dict[str, Any] | None = None,
 ) -> None:
     """
     Validate that prompt token count does not exceed max context window.
 
     Raises HTTPException 400 if the prompt is too long.
     """
-    max_ctx = get_max_context_window(model_id)
+    max_ctx = get_max_context_window(model_id, request_policy=request_policy)
     if max_ctx and num_prompt_tokens > max_ctx:
         raise HTTPException(
             status_code=400,
@@ -1905,6 +2093,11 @@ async def create_completion(
     _: bool = Depends(verify_api_key),
 ):
     """Create a text completion."""
+    request_policy = _build_request_policy(
+        http_request, request_user=getattr(request, "user", None)
+    )
+    _log_request_policy(request_policy, request.model)
+
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -1920,7 +2113,7 @@ async def create_completion(
     # Validate context window for each prompt
     for prompt in prompts:
         num_tokens = len(engine.tokenizer.encode(prompt))
-        validate_context_window(num_tokens, request.model)
+        validate_context_window(num_tokens, request.model, request_policy=request_policy)
 
     if request.stream:
         return StreamingResponse(
@@ -2041,6 +2234,10 @@ async def create_chat_completion(
         for i, msg in enumerate(request.messages):
             content_preview = str(msg.content)[:200] if msg.content else "(empty)"
             logger.log(5, "  Message[%d]: role=%s, content=%s...", i, msg.role, content_preview)
+    request_policy = _build_request_policy(
+        http_request, request_user=getattr(request, "user", None)
+    )
+    _log_request_policy(request_policy, request.model)
 
     # Block inference during quantization to prevent GPU Metal errors
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -2079,6 +2276,7 @@ async def create_chat_completion(
         for k, v in request.chat_template_kwargs.items():
             if k not in forced_keys:
                 merged_ct_kwargs[k] = v
+    _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
     # Extract messages - different engines need different content handling.
     # Templates that expose message.reasoning_content natively (Qwen 3.6+)
@@ -2155,7 +2353,7 @@ async def create_chat_completion(
                 status_code=400, detail=f"Chat template error: {e}"
             )
         raise
-    validate_context_window(num_prompt_tokens, request.model)
+    validate_context_window(num_prompt_tokens, request.model, request_policy=request_policy)
 
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
@@ -2185,7 +2383,9 @@ async def create_chat_completion(
         chat_kwargs["seed"] = request.seed
 
     # Add thinking budget if applicable
-    thinking_budget = _resolve_thinking_budget(request, request.model)
+    thinking_budget = _resolve_thinking_budget(
+        request, request.model, request_policy=request_policy
+    )
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
 
@@ -2214,7 +2414,11 @@ async def create_chat_completion(
     # the reasoning phase and the grammar can activate.
     if compiled_grammar is not None:
         chat_kwargs["compiled_grammar"] = compiled_grammar
-        if reasoning_parser and "thinking_budget" not in chat_kwargs:
+        if (
+            reasoning_parser
+            and "thinking_budget" not in chat_kwargs
+            and merged_ct_kwargs.get("enable_thinking") is not False
+        ):
             default_budget = min(max_tokens // 2, 4096)
             chat_kwargs["thinking_budget"] = default_budget
             logger.debug(
@@ -3339,6 +3543,11 @@ async def create_anthropic_message(
         f"messages={len(request.messages)}, stream={request.stream}, "
         f"max_tokens={request.max_tokens}"
     )
+    metadata_user = None
+    if isinstance(getattr(request, "metadata", None), dict):
+        metadata_user = request.metadata.get("user_id") or request.metadata.get("user")
+    request_policy = _build_request_policy(http_request, request_user=metadata_user)
+    _log_request_policy(request_policy, request.model)
 
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
@@ -3381,6 +3590,7 @@ async def create_anthropic_message(
                 merged_ct_kwargs["enable_thinking"] = True
             elif thinking_type == "disabled":
                 merged_ct_kwargs["enable_thinking"] = False
+    _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
     logger.debug(
         f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
@@ -3429,7 +3639,9 @@ async def create_anthropic_message(
     }
 
     # Add thinking budget if applicable
-    thinking_budget = _resolve_thinking_budget(request, request.model)
+    thinking_budget = _resolve_thinking_budget(
+        request, request.model, request_policy=request_policy
+    )
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
 
@@ -3495,7 +3707,7 @@ async def create_anthropic_message(
                 status_code=400, detail=f"Chat template error: {e}"
             )
         raise
-    validate_context_window(num_prompt_tokens, request.model)
+    validate_context_window(num_prompt_tokens, request.model, request_policy=request_policy)
 
     # Add stop sequences
     if request.stop_sequences:
@@ -3728,6 +3940,10 @@ async def create_response(
     logger.debug(
         f"Responses API request: model={request.model}, stream={request.stream}"
     )
+    request_policy = _build_request_policy(
+        http_request, request_user=getattr(request, "user", None)
+    )
+    _log_request_policy(request_policy, request.model)
 
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
@@ -3770,6 +3986,7 @@ async def create_response(
         # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+    _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
     # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
     # are NOT called here because convert_responses_input_to_messages() already
@@ -3841,7 +4058,7 @@ async def create_response(
                 status_code=400, detail=f"Chat template error: {e}"
             )
         raise
-    validate_context_window(num_prompt_tokens, request.model)
+    validate_context_window(num_prompt_tokens, request.model, request_policy=request_policy)
 
     # Build sampling kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = (
@@ -3865,7 +4082,9 @@ async def create_response(
         chat_kwargs["seed"] = request.seed
 
     # Add thinking budget if applicable
-    thinking_budget = _resolve_thinking_budget(request, request.model)
+    thinking_budget = _resolve_thinking_budget(
+        request, request.model, request_policy=request_policy
+    )
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
 
@@ -3888,7 +4107,11 @@ async def create_response(
     # Add compiled grammar for logit-level structured output.
     if compiled_grammar is not None:
         chat_kwargs["compiled_grammar"] = compiled_grammar
-        if reasoning_parser and "thinking_budget" not in chat_kwargs:
+        if (
+            reasoning_parser
+            and "thinking_budget" not in chat_kwargs
+            and merged_ct_kwargs.get("enable_thinking") is not False
+        ):
             default_budget = min(max_tokens // 2, 4096)
             chat_kwargs["thinking_budget"] = default_budget
             logger.debug(

@@ -197,8 +197,15 @@ def _model_has_mtp_module(model: Any) -> bool:
     ``mtp_forward`` call would AttributeError, so we gate eligibility on
     the actual module's presence.
     """
-    inner = getattr(model, "language_model", model)
-    return hasattr(inner, "mtp") and getattr(inner, "mtp", None) is not None
+    inner = getattr(model, "language_model", None)
+    if inner is None:
+        inner = getattr(model, "_language_model", model)
+    return (
+        hasattr(inner, "mtp_forward")
+        and hasattr(inner, "make_mtp_cache")
+        and hasattr(inner, "mtp")
+        and getattr(inner, "mtp", None) is not None
+    )
 
 
 def _is_mtp_eligible(gen_batch: Any) -> bool:

@@ -109,6 +109,28 @@ class TestVLMModelAdapter:
         vlm.language_model.make_cache.assert_called_once()
         assert cache is vlm.language_model.make_cache.return_value
 
+    def test_mtp_hooks_delegate_to_language_model(self):
+        """Test Native MTP hooks are exposed through the VLM adapter."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        vlm.language_model.mtp = object()
+        vlm.language_model.mtp_forward = MagicMock(return_value="mtp-logits")
+        vlm.language_model.make_mtp_cache = MagicMock(return_value=["mtp-cache"])
+        adapter = VLMModelAdapter(vlm)
+
+        assert adapter.language_model is vlm.language_model
+        assert adapter.mtp_available is True
+        assert adapter.make_mtp_cache() == ["mtp-cache"]
+        assert adapter.mtp_forward("hidden", "tokens", ["cache"]) == "mtp-logits"
+
+        vlm.language_model.make_mtp_cache.assert_called_once()
+        vlm.language_model.mtp_forward.assert_called_once_with(
+            "hidden",
+            "tokens",
+            ["cache"],
+        )
+
     def test_set_pending_embeddings(self):
         """Test set_pending_embeddings stores state."""
         from omlx.models.vlm import VLMModelAdapter
@@ -160,6 +182,22 @@ class TestVLMModelAdapter:
         call_args = vlm.language_model.call_args
         assert call_args[0][0] is input_ids
         assert call_args[1]["cache"] is cache
+
+    def test_forward_return_hidden_preserves_tuple(self):
+        """Native MTP verify calls need ``(logits, hidden)`` to pass through."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        vlm.language_model.return_value = ("logits", "hidden")
+        result = adapter(
+            MockMXArray(shape=(1, 2)),
+            cache=[MagicMock()],
+            return_hidden=True,
+        )
+
+        assert result == ("logits", "hidden")
 
     def test_forward_text_only_uses_language_model_directly(self):
         """Text-only decode passes cache directly to language_model."""
@@ -485,6 +523,5 @@ class TestVLMModelAdapterModelProperty:
 
         # BatchGenerator accesses model.layers
         assert adapter.layers is vlm.language_model.model.layers
-
 
 

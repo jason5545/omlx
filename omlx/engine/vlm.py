@@ -38,12 +38,14 @@ from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
 from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
+from ..patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_patch
 from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
 )
+from ..utils.model_loading import maybe_apply_pre_load_patches
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
@@ -448,6 +450,11 @@ class VLMBatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_vlm_sync():
+            maybe_apply_pre_load_patches(
+                self._model_name,
+                model_settings=self._model_settings,
+            )
+            apply_mlx_vlm_mtp_patch()
             _patch_video_processor_bug()
             with _strip_audio_config_if_orphaned(Path(self._model_name)):
                 return vlm_load(
@@ -521,6 +528,23 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        if (
+            self._model_settings is not None
+            and getattr(self._model_settings, "mtp_enabled", False)
+        ):
+            if getattr(self._adapter, "mtp_available", False):
+                logger.info(
+                    "VLM+MTP enabled and active for %s "
+                    "(adapter exposes native hooks)",
+                    self._model_name,
+                )
+            else:
+                logger.warning(
+                    "VLM+MTP unavailable for %s because adapter lacks native "
+                    "hooks; continuing with VLM engine without MTP",
+                    self._model_name,
+                )
 
         # TurboQuant KV cache
         if self._model_settings is not None:

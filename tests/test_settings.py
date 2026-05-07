@@ -406,12 +406,22 @@ class TestAuthSettings:
         from omlx.settings import SubKeyEntry
         settings = AuthSettings(
             api_key="my-key",
-            sub_keys=[SubKeyEntry(key="sk1", name="Test", created_at="2024-01-01")],
+            sub_keys=[
+                SubKeyEntry(
+                    key="sk1",
+                    name="Test",
+                    created_at="2024-01-01",
+                    max_context_window=8192,
+                    enable_thinking=False,
+                )
+            ],
         )
         result = settings.to_dict()
         assert len(result["sub_keys"]) == 1
         assert result["sub_keys"][0]["key"] == "sk1"
         assert result["sub_keys"][0]["name"] == "Test"
+        assert result["sub_keys"][0]["max_context_window"] == 8192
+        assert result["sub_keys"][0]["enable_thinking"] is False
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -426,13 +436,23 @@ class TestAuthSettings:
         data = {
             "api_key": "loaded-key",
             "sub_keys": [
-                {"key": "sk1", "name": "My Key", "created_at": "2024-01-01"},
+                {
+                    "key": "sk1",
+                    "name": "My Key",
+                    "created_at": "2024-01-01",
+                    "max_context_window": 4096,
+                    "enable_thinking": False,
+                    "thinking_budget_tokens": 512,
+                },
             ],
         }
         settings = AuthSettings.from_dict(data)
         assert len(settings.sub_keys) == 1
         assert settings.sub_keys[0].key == "sk1"
         assert settings.sub_keys[0].name == "My Key"
+        assert settings.sub_keys[0].max_context_window == 4096
+        assert settings.sub_keys[0].enable_thinking is False
+        assert settings.sub_keys[0].thinking_budget_tokens == 512
 
     def test_from_dict_backward_compat(self):
         """Test creation from dictionary without secret_key (backward compat)."""

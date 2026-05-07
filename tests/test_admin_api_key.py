@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from omlx.admin.auth import validate_api_key, verify_any_api_key, verify_api_key
+from omlx.admin.auth import (
+    identify_api_key,
+    validate_api_key,
+    verify_any_api_key,
+    verify_api_key,
+)
 from omlx.model_settings import ModelSettings
 import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
 import omlx.admin.routes as admin_routes
@@ -218,6 +223,17 @@ class TestVerifyAnyApiKey:
         from omlx.settings import SubKeyEntry
         sub_keys = [SubKeyEntry(key="sub1"), SubKeyEntry(key="sub2"), SubKeyEntry(key="sub3")]
         assert verify_any_api_key("sub1", "main-key", sub_keys) is True
+
+    def test_identify_sub_key_returns_safe_metadata(self):
+        from omlx.settings import SubKeyEntry
+
+        sub_key = SubKeyEntry(key="sub2", name="voco", max_context_window=8192)
+        identity = identify_api_key("sub2", "main-key", [sub_key])
+        assert identity is not None
+        assert identity["kind"] == "sub"
+        assert identity["name"] == "voco"
+        assert identity["sub_key"] is sub_key
+        assert "sub2" not in str({k: v for k, v in identity.items() if k != "sub_key"})
 
 
 class TestLoginRejectsSubKey:

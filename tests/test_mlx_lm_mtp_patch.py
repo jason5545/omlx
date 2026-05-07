@@ -161,6 +161,21 @@ class TestQwen35Model:
         assert hasattr(Model, "_omlx_mtp_patched")
 
 
+class TestQwen35VlmRuntime:
+    def test_runtime_patch_exposes_native_hooks(self):
+        try:
+            from mlx_vlm.models.qwen3_5 import language
+        except ImportError:
+            pytest.skip("mlx-vlm qwen3_5 not importable")
+
+        from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_patch
+
+        assert apply_mlx_vlm_mtp_patch() is True
+        assert hasattr(language.LanguageModel, "mtp_forward")
+        assert hasattr(language.LanguageModel, "make_mtp_cache")
+        assert hasattr(language.Qwen3_5GatedDeltaNet, "_omlx_mtp_runtime_patched")
+
+
 class TestDeepseekV4Model:
     def test_skip_when_base_patch_not_applied(self, monkeypatch):
         """deepseek_v4 MTP patch must skip cleanly if the base

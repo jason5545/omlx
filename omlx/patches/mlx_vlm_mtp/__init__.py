@@ -35,13 +35,15 @@ def apply_mlx_vlm_mtp_patch() -> bool:
     if _PATCHED:
         return True
 
-    from . import qwen35_vlm_model, qwen35_moe_vlm_model
+    from . import qwen35_moe_vlm_model, qwen35_vlm_model, qwen35_vlm_runtime
 
     if not qwen35_vlm_model.apply():
         logger.debug("Qwen3.5 VLM MTP sanitize patch did not apply")
     if not qwen35_moe_vlm_model.apply():
         logger.debug("Qwen3.5 MoE VLM MTP sanitize patch did not apply")
+    if not qwen35_vlm_runtime.apply():
+        logger.debug("Qwen3.5 VLM MTP runtime patch did not apply")
 
     _PATCHED = True
-    logger.info("mlx-vlm MTP sanitize patch applied")
+    logger.info("mlx-vlm MTP patch applied")
     return True

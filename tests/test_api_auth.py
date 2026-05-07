@@ -3,6 +3,7 @@
 
 import pytest
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 # Note: These tests need a mock server setup since the actual server requires models
@@ -12,6 +13,7 @@ def _mock_request(headers=None):
     """Create a mock FastAPI request with given headers."""
     req = MagicMock()
     req.headers = headers or {}
+    req.state = SimpleNamespace()
     return req
 
 
@@ -162,6 +164,8 @@ class TestXApiKeyHeader:
             request = _mock_request(headers={"x-api-key": "sub-key-1"})
             result = asyncio.run(verify_api_key(request=request, credentials=None))
             assert result is True
+            assert request.state.omlx_api_key_name == "Test Sub Key"
+            assert request.state.omlx_api_key_kind == "sub"
         finally:
             _server_state.api_key = original_key
             _server_state.global_settings = original_gs
@@ -192,8 +196,11 @@ class TestSubKeyVerification:
 
         try:
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="sub-key-1")
-            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=credentials))
+            request = _mock_request()
+            result = asyncio.run(verify_api_key(request=request, credentials=credentials))
             assert result is True
+            assert request.state.omlx_api_key_name == "Test Sub Key"
+            assert request.state.omlx_api_key_kind == "sub"
         finally:
             _server_state.api_key = original_key
             _server_state.global_settings = original_gs
@@ -248,8 +255,11 @@ class TestSubKeyVerification:
 
         try:
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="main-key")
-            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=credentials))
+            request = _mock_request()
+            result = asyncio.run(verify_api_key(request=request, credentials=credentials))
             assert result is True
+            assert request.state.omlx_api_key_name == "main"
+            assert request.state.omlx_api_key_kind == "main"
         finally:
             _server_state.api_key = original_key
             _server_state.global_settings = original_gs

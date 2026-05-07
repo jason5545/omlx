@@ -175,6 +175,14 @@ def _patch_class(cls: Any, label: str) -> bool:
     """Replace cls.__call__ with the mlx-lm-equivalent body once."""
     if id(cls) in _patched_classes:
         return True
+    if (
+        "_omlx_mtp_runtime_patched" in cls.__dict__
+        and hasattr(cls.__call__, "__code__")
+        and "n_confirmed" in cls.__call__.__code__.co_varnames
+    ):
+        _patched_classes.add(id(cls))
+        logger.info(f"GatedDeltaNet patch skipped; MTP runtime body already active: {label}")
+        return True
     cls.__call__ = _build_replacement_call()
     _patched_classes.add(id(cls))
     logger.info(f"GatedDeltaNet patch applied (body replacement): {label}")
