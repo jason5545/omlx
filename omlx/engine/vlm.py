@@ -318,6 +318,9 @@ class VLMBatchedEngine(BaseEngine):
         self._grammar_compiler_init_attempted = False
         self._vision_cache = None
         self._vision_cache_enabled = True
+        # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
+        # Phase 2A: attached but not yet wired into the decode path.
+        self._vlm_mtp_drafter: Any | None = None
 
     @property
     def model_name(self) -> str:
@@ -569,6 +572,32 @@ class VLMBatchedEngine(BaseEngine):
         self._loaded = True
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
 
+    def set_vlm_mtp_drafter(self, drafter: Any) -> None:
+        """Attach a loaded gemma4_assistant drafter for VLM MTP decoding.
+
+        Passes the drafter (and the configured draft-block size) down to
+        the scheduler so eligible requests get routed to mlx-vlm's MTP
+        round loop at decode time.
+        """
+        self._vlm_mtp_drafter = drafter
+        block_size = None
+        if self._model_settings is not None:
+            block_size = getattr(self._model_settings, "vlm_mtp_draft_block_size", None)
+        scheduler = None
+        if self._engine is not None and hasattr(self._engine, "engine"):
+            scheduler = getattr(self._engine.engine, "scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "set_vlm_mtp_drafter"):
+            scheduler.set_vlm_mtp_drafter(drafter, draft_block_size=block_size)
+        logger.info(
+            "VLM MTP drafter attached to engine: %s (block_size=%s)",
+            self._model_name,
+            block_size,
+        )
+
+    @property
+    def vlm_mtp_drafter(self) -> Any | None:
+        return self._vlm_mtp_drafter
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         if self._engine:
@@ -586,6 +615,7 @@ class VLMBatchedEngine(BaseEngine):
         self._processor = None
         self._adapter = None
         self._tokenizer = None
+        self._vlm_mtp_drafter = None
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
 
