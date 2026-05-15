@@ -10,6 +10,7 @@ follow-up once the BatchGenerator integration body is filled in.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -370,6 +371,37 @@ class TestBatchGeneratorDispatch:
         assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
         # Empty batch never triggers.
         assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
+
+    def test_extend_transfers_mtp_state_only_for_solo_host(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _MtpState,
+            _reconcile_extended_mtp_state,
+        )
+
+        state = _MtpState()
+        host = SimpleNamespace(uids=[7])
+        donor = SimpleNamespace(_omlx_mtp_state=state)
+
+        _reconcile_extended_mtp_state(host, donor, state)
+
+        assert host._omlx_mtp_state is state
+        assert not hasattr(donor, "_omlx_mtp_state")
+
+    def test_extend_drops_mtp_state_for_multi_row_host(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _MtpState,
+            _reconcile_extended_mtp_state,
+        )
+
+        host_state = _MtpState()
+        donor_state = _MtpState()
+        host = SimpleNamespace(uids=[1, 2], _omlx_mtp_state=host_state)
+        donor = SimpleNamespace(_omlx_mtp_state=donor_state)
+
+        _reconcile_extended_mtp_state(host, donor, donor_state)
+
+        assert not hasattr(host, "_omlx_mtp_state")
+        assert not hasattr(donor, "_omlx_mtp_state")
 
 
 # ---------------------------------------------------------------------------

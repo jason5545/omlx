@@ -142,19 +142,13 @@ def apply() -> bool:
         # then merges it into ``self._generation_batch`` via extend(). The
         # MTP post-init runs on the fresh batch (since that's the one whose
         # __init__ fires with uids=[0]); without this transfer the state
-        # would die with the donor instance.
+        # would die with the donor instance.  If the merge leaves the host
+        # with multiple live rows, drop the donor state instead: this mirrors
+        # the mixed-mode constraint from sleepy/omlx without trying to graft
+        # its old scheduler path onto the current BatchGenerator patch.
         donor_state = getattr(batch, "_omlx_mtp_state", None)
         result = original_extend(self, batch, *args, **kwargs)
-        if donor_state is not None and not hasattr(self, "_omlx_mtp_state"):
-            self._omlx_mtp_state = donor_state
-            try:
-                delattr(batch, "_omlx_mtp_state")
-            except AttributeError:
-                pass
-            logger.debug(
-                "MTP state transferred from donor batch to host batch (uid=%s)",
-                getattr(self, "uids", ["?"])[0] if getattr(self, "uids", None) else "?",
-            )
+        _reconcile_extended_mtp_state(self, batch, donor_state)
         return result
 
     def patched_filter(self, keep, *args, **kwargs):
@@ -264,6 +258,54 @@ def _ineligibility_reason(gen_batch: Any) -> str:
     if len(uids) != 1:
         return f"batch size {len(uids)} != 1 (continuous batching, MTP off by design)"
     return ""
+
+
+def _drop_mtp_state(gen_batch: Any) -> Optional["_MtpState"]:
+    """Remove and return any speculative MTP state attached to a batch."""
+    state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if state is None:
+        return None
+    try:
+        delattr(gen_batch, "_omlx_mtp_state")
+    except AttributeError:
+        pass
+    return state
+
+
+def _reconcile_extended_mtp_state(
+    host: Any,
+    donor: Any,
+    donor_state: Optional["_MtpState"],
+) -> None:
+    """Keep MTP state only when an extend result is still a solo batch.
+
+    sleepy/omlx's scheduler-native branch keeps an MTP request out of the
+    normal batch when other requests arrive.  In this newer integration the
+    safe equivalent is stricter: once ``GenerationBatch.extend`` produces a
+    multi-row host, no per-row MTP state may remain attached to that host.
+    That prevents a stale single-request draft/verify cycle from surviving
+    inside a continuous batch and becoming active again after later filters.
+    """
+    uids = getattr(host, "uids", None) or []
+    host_state = getattr(host, "_omlx_mtp_state", None)
+
+    if len(uids) == 1:
+        if donor_state is not None and host_state is None:
+            host._omlx_mtp_state = donor_state
+            _drop_mtp_state(donor)
+            logger.debug(
+                "MTP state transferred from donor batch to host batch (uid=%s)",
+                uids[0],
+            )
+        return
+
+    dropped_host = _drop_mtp_state(host)
+    dropped_donor = _drop_mtp_state(donor)
+    if dropped_host is not None or dropped_donor is not None or donor_state is not None:
+        logger.debug(
+            "MTP state dropped after batch extend because host batch size is %d",
+            len(uids),
+        )
 
 
 class _MtpStepFallback(RuntimeError):
