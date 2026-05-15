@@ -36,6 +36,7 @@ from omlx.oq import (
     _is_moe_router,
     _is_vision_tensor,
     _LazyTensorIndex,
+    _measure_sensitivity,
     _normalize_quant_path,
     _quantize_chunked,
     _should_quantize_tensor,
@@ -1545,7 +1546,12 @@ class TestSensitivityRequiredEnforcement:
         """#1204: discovery failure + model > RAM must hard-fail. The old
         behaviour was a silent ``logger.error`` followed by the source weight
         names landing in the output, which loaded with "Received N parameters
-        not in model"."""
+        not in model".
+
+        Sensitivity measurement runs before sanitize-plan discovery, so
+        reaching the discovery block with the model over RAM means the
+        auto-proxy sensitivity path has to succeed first; the proxy build and
+        measurement are stubbed so the run gets as far as discovery."""
         if not HAS_MLX:
             pytest.skip("mlx not available")
         from safetensors.numpy import save_file as np_save
@@ -1562,10 +1568,18 @@ class TestSensitivityRequiredEnforcement:
 
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
 
-        # Force a sanitize_fn that fails during the tracked-tensor dry run,
-        # mimicking an indexing pattern _TrackedTensor cannot trace.
         from omlx import oq as _oq
 
+        # Stub the auto-proxy sensitivity path so the run reaches discovery.
+        monkeypatch.setattr(
+            _oq, "_build_proxy_for_sensitivity", lambda *a, **k: tmp_path / "proxy"
+        )
+        monkeypatch.setattr(
+            _oq, "_measure_sensitivity_from_quantized_model", lambda *a, **k: {0: 0.1}
+        )
+
+        # Force a sanitize_fn that fails during the tracked-tensor dry run,
+        # mimicking an indexing pattern _TrackedTensor cannot trace.
         def _broken_sanitize(weights):
             raise NotImplementedError("simulated unsupported indexing pattern")
 
@@ -1580,7 +1594,7 @@ class TestSensitivityRequiredEnforcement:
                 str(src),
                 str(tmp_path / "out"),
                 4,
-                auto_proxy_sensitivity=False,
+                auto_proxy_sensitivity=True,
             )
 
     def test_proxy_build_failure_raises(self, tmp_path, monkeypatch):
@@ -2135,78 +2149,6 @@ class TestBuildModelSanitizerTextOnly:
             assert "mlx-vlm full sanitize" not in all_messages
 
 
-# Test _build_model_sanitizer text_only VLM bypass
-# =============================================================================
-
-
-class TestBuildModelSanitizerTextOnly:
-    """When text_only=True, _build_model_sanitizer must use the mlx-lm (LLM)
-    sanitize path — never the mlx-vlm (VLM) path — even when the model config
-    lists a ForConditionalGeneration architecture.
-
-    Without this, VLM sanitize uses a _Proxy that lacks self.mtp, silently
-    stripping all mtp.* tensors from the oQ output despite preserve_mtp=True.
-    """
-
-    VLM_CONFIG = {
-        "architectures": ["Qwen2_5_VLForConditionalGeneration"],
-        "model_type": "qwen3_5",
-        "num_hidden_layers": 28,
-        "hidden_size": 3584,
-    }
-
-    LLM_CONFIG = {
-        "architectures": ["Qwen2ForCausalLM"],
-        "model_type": "qwen3_5",
-        "num_hidden_layers": 28,
-        "hidden_size": 3584,
-    }
-
-    def test_vlm_config_without_text_only_attempts_vlm_path(self):
-        """Baseline: VLM config without text_only should try the VLM path."""
-        from unittest.mock import patch
-
-        from omlx.oq import _build_model_sanitizer
-
-        with patch("omlx.oq.logger") as mock_logger:
-            _build_model_sanitizer(self.VLM_CONFIG, text_only=False)
-
-        debug_messages = [str(c) for c in mock_logger.debug.call_args_list]
-        info_messages = [str(c) for c in mock_logger.info.call_args_list]
-        all_messages = " ".join(debug_messages + info_messages)
-        assert "mlx-vlm" in all_messages or "mlx-lm" in all_messages
-
-    def test_vlm_config_with_text_only_skips_vlm_path(self):
-        """With text_only=True, the VLM path must be skipped entirely."""
-        from unittest.mock import patch
-
-        from omlx.oq import _build_model_sanitizer
-
-        with patch("omlx.oq.logger") as mock_logger:
-            _build_model_sanitizer(self.VLM_CONFIG, text_only=True)
-
-        debug_messages = [str(c) for c in mock_logger.debug.call_args_list]
-        info_messages = [str(c) for c in mock_logger.info.call_args_list]
-        all_messages = " ".join(debug_messages + info_messages)
-        assert "mlx-vlm full sanitize" not in all_messages
-
-    def test_llm_config_unaffected_by_text_only(self):
-        """LLM configs (no ForConditionalGeneration) should always use the
-        mlx-lm path regardless of text_only."""
-        from unittest.mock import patch
-
-        from omlx.oq import _build_model_sanitizer
-
-        for text_only in (True, False):
-            with patch("omlx.oq.logger") as mock_logger:
-                _build_model_sanitizer(self.LLM_CONFIG, text_only=text_only)
-
-            debug_messages = [str(c) for c in mock_logger.debug.call_args_list]
-            info_messages = [str(c) for c in mock_logger.info.call_args_list]
-            all_messages = " ".join(debug_messages + info_messages)
-            assert "mlx-vlm full sanitize" not in all_messages
-
-
 # =============================================================================
 # Test _build_proxy_for_sensitivity MTP patch integration
 # =============================================================================
@@ -2309,4 +2251,109 @@ class TestBuildProxyForSensitivityMtpPatch:
 
 
 # =============================================================================
-# Test GPTQ quantization
+# Test _measure_sensitivity MTP patch integration (VLM path)
+# =============================================================================
+
+
+class TestMeasureSensitivityVlmMtp:
+    """_measure_sensitivity must attach the MTP head for VLM checkpoints that
+    declare MTP heads.
+
+    mlx-vlm skips Model.sanitize for MLX-format checkpoints, so the
+    language_model.mtp.* weights stay in the weight dict. Without an attached
+    MTP head load_weights(strict=True) rejects them and the measurement
+    silently returns {}. The function must apply the mlx-vlm runtime MTP
+    patch and toggle mtp_active True for the load, then restore the previous
+    state. The text path needs no toggle (the patched qwen35_model.sanitize
+    self-consistently strips mtp.* when no head is attached).
+    """
+
+    def _patch_common(self, monkeypatch, has_mtp, prev_active=False):
+        from omlx import oq as oq_mod
+
+        mock_apply_runtime = MagicMock()
+        mock_set_active = MagicMock()
+        mock_is_active = MagicMock(return_value=prev_active)
+
+        monkeypatch.setitem(
+            sys.modules, "omlx.utils.model_loading",
+            MagicMock(
+                maybe_apply_pre_load_patches=MagicMock(),
+                _has_mtp_heads=MagicMock(return_value=has_mtp),
+            ),
+        )
+        monkeypatch.setitem(
+            sys.modules, "omlx.patches.mlx_lm_mtp",
+            MagicMock(is_mtp_active=mock_is_active, set_mtp_active=mock_set_active),
+        )
+        monkeypatch.setitem(
+            sys.modules, "omlx.patches.mlx_vlm_mtp",
+            MagicMock(apply_mlx_vlm_mtp_runtime_patch=mock_apply_runtime),
+        )
+        monkeypatch.setitem(sys.modules, "mlx_vlm", MagicMock())
+        monkeypatch.setitem(
+            sys.modules, "mlx_vlm.utils",
+            MagicMock(load_model=MagicMock(return_value=MagicMock())),
+        )
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock())
+        monkeypatch.setitem(
+            sys.modules, "mlx_lm.tokenizer_utils",
+            MagicMock(load=MagicMock(return_value=MagicMock())),
+        )
+        monkeypatch.setattr(
+            oq_mod, "_measure_sensitivity_from_model",
+            MagicMock(return_value={0: 0.1}),
+        )
+        return mock_apply_runtime, mock_set_active
+
+    def test_vlm_with_mtp_heads_attaches_head(self, monkeypatch):
+        """VLM + MTP heads → runtime patch applied, mtp_active toggled True for load."""
+        mock_apply_runtime, mock_set_active = self._patch_common(
+            monkeypatch, has_mtp=True,
+        )
+
+        result = _measure_sensitivity(
+            "/fake/vlm-mtp", {"vision_config": {}}, 6,
+        )
+
+        assert result == {0: 0.1}
+        mock_apply_runtime.assert_called_once()
+        assert mock_set_active.call_args_list[0] == ((True,),)
+        assert mock_set_active.call_args_list[-1] == ((False,),)
+
+    @pytest.mark.parametrize("prev_active", [False, True])
+    def test_mtp_active_restored_after_load(self, monkeypatch, prev_active):
+        """The previous mtp_active state is restored once the load returns."""
+        _, mock_set_active = self._patch_common(
+            monkeypatch, has_mtp=True, prev_active=prev_active,
+        )
+
+        _measure_sensitivity("/fake/vlm-mtp", {"vision_config": {}}, 6)
+
+        assert mock_set_active.call_args_list[-1] == ((prev_active,),)
+
+    def test_vlm_without_mtp_heads_no_toggle(self, monkeypatch):
+        """VLM without MTP heads → no runtime patch, no mtp_active toggle."""
+        mock_apply_runtime, mock_set_active = self._patch_common(
+            monkeypatch, has_mtp=False,
+        )
+
+        _measure_sensitivity("/fake/vlm", {"vision_config": {}}, 6)
+
+        mock_apply_runtime.assert_not_called()
+        mock_set_active.assert_not_called()
+
+    def test_text_model_no_vlm_toggle(self, monkeypatch):
+        """Text checkpoint → VLM MTP toggling is skipped entirely."""
+        mock_apply_runtime, mock_set_active = self._patch_common(
+            monkeypatch, has_mtp=True,
+        )
+        monkeypatch.setitem(
+            sys.modules, "mlx_lm",
+            MagicMock(load=MagicMock(return_value=(MagicMock(), MagicMock()))),
+        )
+
+        _measure_sensitivity("/fake/text", {}, 6)
+
+        mock_apply_runtime.assert_not_called()
+        mock_set_active.assert_not_called()
