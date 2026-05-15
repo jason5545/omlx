@@ -404,10 +404,19 @@ def _resolve_sampler(gen_batch: Any):
 
 
 def _is_greedy(gen_batch: Any) -> bool:
-    """Heuristic mirroring PR 990's ``sampler is None``."""
-    if gen_batch.samplers and gen_batch.samplers[0] is not None:
-        return False
-    return True
+    """Return True when the active sampler is deterministic argmax.
+
+    mlx-lm PR 990 used ``sampler is None`` as the greedy signal. oMLX always
+    routes requests through explicit sampler callables so we also inspect the
+    metadata attached by ``omlx.utils.sampling.make_sampler``. Without this,
+    ``temperature=0`` per-row samplers take the stochastic acceptance path and
+    pay for unnecessary filtered-logprob / residual-sampling work.
+    """
+    sampler = _resolve_sampler(gen_batch)
+    try:
+        return float(getattr(sampler, "temp", 0.0) or 0.0) == 0.0
+    except (TypeError, ValueError):
+        return not (gen_batch.samplers and gen_batch.samplers[0] is not None)
 
 
 def _proc_list(gen_batch: Any) -> Optional[List[Any]]:

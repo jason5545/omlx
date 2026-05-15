@@ -403,6 +403,36 @@ class TestBatchGeneratorDispatch:
         assert not hasattr(host, "_omlx_mtp_state")
         assert not hasattr(donor, "_omlx_mtp_state")
 
+    def test_is_greedy_uses_sampler_temperature_metadata(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        def greedy_sampler(_):
+            return None
+
+        greedy_sampler.temp = 0.0
+
+        def stochastic_sampler(_):
+            return None
+
+        stochastic_sampler.temp = 0.7
+
+        greedy_batch = SimpleNamespace(
+            samplers=[greedy_sampler],
+            fallback_sampler=stochastic_sampler,
+        )
+        stochastic_batch = SimpleNamespace(
+            samplers=[stochastic_sampler],
+            fallback_sampler=greedy_sampler,
+        )
+        fallback_batch = SimpleNamespace(
+            samplers=[],
+            fallback_sampler=greedy_sampler,
+        )
+
+        assert _is_greedy(greedy_batch) is True
+        assert _is_greedy(stochastic_batch) is False
+        assert _is_greedy(fallback_batch) is True
+
 
 # ---------------------------------------------------------------------------
 # ModelSettings — mtp_enabled field + mutual exclusion
