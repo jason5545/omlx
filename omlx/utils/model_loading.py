@@ -280,6 +280,21 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
         if applied:
             logger.info(f"IndexCache applied: freq={index_cache_freq}")
 
+    mtp_enabled = getattr(model_settings, "mtp_enabled", False)
+    if mtp_enabled:
+        try:
+            mtp_draft_depth = int(getattr(model_settings, "mtp_draft_depth", 1) or 1)
+        except (TypeError, ValueError):
+            mtp_draft_depth = 1
+        mtp_draft_depth = max(1, min(mtp_draft_depth, 8))
+        setattr(model, "_omlx_mtp_draft_depth", mtp_draft_depth)
+        setattr(
+            model,
+            "_omlx_mtp_adaptive_depth",
+            bool(getattr(model_settings, "mtp_adaptive_depth", False)),
+        )
+        logger.info("Native MTP draft depth set: %d (adaptive=%s)", mtp_draft_depth, getattr(model, "_omlx_mtp_adaptive_depth"))
+
     return model
 
 

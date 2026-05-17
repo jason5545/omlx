@@ -141,6 +141,8 @@ class ModelSettings:
     # uses MTP draft+verify path for single-request decoding. Compatible model_types:
     # qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with dflash and turboquant.
     mtp_enabled: bool = False
+    mtp_draft_depth: int = 1
+    mtp_adaptive_depth: bool = False
 
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm f96138e+).
     # Target = Gemma4 VLM body, drafter = "gemma-4-26B-A4B-it-assistant"
@@ -195,6 +197,13 @@ class ModelSettings:
                         f"vlm_mtp_enabled and {name} cannot both be True; "
                         "choose one speculative path per model"
                     )
+        try:
+            self.mtp_draft_depth = int(self.mtp_draft_depth or 1)
+        except (TypeError, ValueError):
+            self.mtp_draft_depth = 1
+        if self.mtp_draft_depth < 1 or self.mtp_draft_depth > 8:
+            raise ValueError("mtp_draft_depth must be between 1 and 8")
+        self.mtp_adaptive_depth = bool(self.mtp_adaptive_depth)
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

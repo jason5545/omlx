@@ -149,6 +149,10 @@ def _register_mtp_classes(q35: Any) -> None:
         Unlike the standard ``DecoderLayer`` (which routes through
         ``GatedDeltaNet`` for "linear" layers), the MTP head only uses
         full attention. MoE config is honored when num_experts > 0.
+
+        ``position_offset`` enables correct RoPE positioning for draft
+        tokens — the MTP cache starts empty so without an explicit offset
+        RoPE would encode position 0 instead of the true sequence position.
         """
 
         def __init__(self, args):
@@ -163,10 +167,46 @@ def _register_mtp_classes(q35: Any) -> None:
             else:
                 self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
-        def __call__(self, x, mask=None, cache=None):
-            r = self.self_attn(self.input_layernorm(x), mask, cache)
+        def __call__(self, x, mask=None, cache=None, position_offset=None):
+            if position_offset is not None:
+                r = self._attn_with_offset(x, mask, cache, int(position_offset))
+            else:
+                r = self.self_attn(self.input_layernorm(x), mask, cache)
             h = x + r
             return h + self.mlp(self.post_attention_layernorm(h))
+
+        def _attn_with_offset(self, x, mask, cache, offset):
+            import mlx.core as mx
+            from mlx_lm.models.base import scaled_dot_product_attention
+
+            attn = self.self_attn
+            normed = self.input_layernorm(x)
+            B, L, _ = normed.shape
+
+            q_proj_out = attn.q_proj(normed)
+            queries, gate = mx.split(
+                q_proj_out.reshape(B, L, attn.num_attention_heads, -1),
+                2,
+                axis=-1,
+            )
+            gate = gate.reshape(B, L, -1)
+            keys, values = attn.k_proj(normed), attn.v_proj(normed)
+            queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+            keys = attn.k_norm(
+                keys.reshape(B, L, attn.num_key_value_heads, -1)
+            ).transpose(0, 2, 1, 3)
+            values = values.reshape(
+                B, L, attn.num_key_value_heads, -1
+            ).transpose(0, 2, 1, 3)
+            queries = attn.rope(queries, offset=offset)
+            keys = attn.rope(keys, offset=offset)
+            if cache is not None:
+                keys, values = cache.update_and_fetch(keys, values)
+            out = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=attn.scale, mask=mask
+            )
+            out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return attn.o_proj(out * mx.sigmoid(gate))
 
     class MTPModule(nn.Module):
         """Multi-Token Prediction head from PR #990.
@@ -189,7 +229,15 @@ def _register_mtp_classes(q35: Any) -> None:
             ]
             self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        def __call__(self, hidden_states, next_token_ids, embed_tokens, cache=None):
+        def __call__(
+            self,
+            hidden_states,
+            next_token_ids,
+            embed_tokens,
+            cache=None,
+            position_offset=None,
+            return_hidden=False,
+        ):
             embeds = embed_tokens(next_token_ids)
             e = self.pre_fc_norm_embedding(embeds)
             h = self.pre_fc_norm_hidden(hidden_states)
@@ -200,9 +248,12 @@ def _register_mtp_classes(q35: Any) -> None:
 
             mask = create_attention_mask(fused, cache[0] if cache else None)
             for layer, c in zip(self.layers, cache):
-                fused = layer(fused, mask, c)
+                fused = layer(fused, mask, c, position_offset=position_offset)
 
-            return self.norm(fused)
+            normed = self.norm(fused)
+            if return_hidden:
+                return normed, fused
+            return normed
 
     q35.MTPDecoderLayer = MTPDecoderLayer
     q35.MTPModule = MTPModule
@@ -471,16 +522,33 @@ def _patch_text_model(q35: Any) -> None:
             return out, hidden
         return out
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
-        mtp_out = self.mtp(
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden=False,
+        position_offset=None,
+    ):
+        result = self.mtp(
             hidden_states,
             next_token_ids,
             self.model.embed_tokens,
             mtp_cache,
+            position_offset=position_offset,
+            return_hidden=return_hidden,
         )
+        if return_hidden:
+            mtp_out, mtp_hidden = result
+        else:
+            mtp_out = result
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(mtp_out)
-        return self.lm_head(mtp_out)
+            logits = self.model.embed_tokens.as_linear(mtp_out)
+        else:
+            logits = self.lm_head(mtp_out)
+        if return_hidden:
+            return logits, mtp_hidden
+        return logits
 
     def make_mtp_cache(self):
         if hasattr(self, "mtp"):
@@ -594,9 +662,9 @@ def _patch_outer_model(q35: Any) -> None:
             n_confirmed=n_confirmed,
         )
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache, **kwargs):
         return self.language_model.mtp_forward(
-            hidden_states, next_token_ids, mtp_cache
+            hidden_states, next_token_ids, mtp_cache, **kwargs
         )
 
     def make_mtp_cache(self):
