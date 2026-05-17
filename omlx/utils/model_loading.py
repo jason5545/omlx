@@ -245,7 +245,9 @@ def load_text_model(
     return load(model_name, tokenizer_config=tokenizer_config)
 
 
-def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
+def apply_post_load_transforms(
+    model: Any, model_settings: Any = None, *, model_path: str = "",
+) -> Any:
     """Apply optional post-load model transforms based on settings.
 
     Currently supports:
@@ -295,7 +297,46 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
         )
         logger.info("Native MTP draft depth set: %d (adaptive=%s)", mtp_draft_depth, getattr(model, "_omlx_mtp_adaptive_depth"))
 
+        if model_path:
+            _try_load_mtp_sidecar(model, model_path)
+
     return model
+
+
+def _try_load_mtp_sidecar(model: Any, model_path: str) -> None:
+    """Load MTP weights from a standalone ``mtp.safetensors`` sidecar file."""
+    from pathlib import Path
+
+    import mlx.core as mx
+
+    mtp_file = Path(model_path) / "mtp.safetensors"
+    if not mtp_file.exists():
+        return
+
+    text_model = getattr(model, "language_model", None) or getattr(
+        model, "_language_model", model
+    )
+    mtp_module = getattr(text_model, "mtp", None)
+    if mtp_module is None:
+        logger.debug("mtp.safetensors found but model has no MTP module attached")
+        return
+
+    try:
+        raw = mx.load(str(mtp_file))
+        mtp_weights = {}
+        for key, value in raw.items():
+            if key.startswith("mtp."):
+                mtp_weights[key[4:]] = value
+        del raw
+
+        if mtp_weights:
+            mtp_module.load_weights(list(mtp_weights.items()), strict=False)
+            mx.eval(mtp_module.parameters())
+            logger.info(
+                "Loaded %d MTP tensors from %s", len(mtp_weights), mtp_file.name
+            )
+    except Exception as exc:
+        logger.warning("Failed to load MTP sidecar %s: %s", mtp_file, exc)
 
 
 def maybe_load_custom_quantization(

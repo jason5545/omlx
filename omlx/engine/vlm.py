@@ -723,6 +723,12 @@ class VLMBatchedEngine(BaseEngine):
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
 
+        # Apply post-load transforms (IndexCache, MTP draft depth, mtp.safetensors)
+        from ..utils.model_loading import apply_post_load_transforms
+        apply_post_load_transforms(
+            self._adapter, self._model_settings, model_path=self._model_name,
+        )
+
         # Patch mlx-vlm GatedDeltaNet to mirror mlx-lm fixes (cache.advance(S)
         # + mx.contiguous on cache[0]) that mlx-vlm e41cd25 still lacks.
         # Class-level monkey-patch — no-op when target classes are absent

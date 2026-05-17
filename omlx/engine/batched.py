@@ -250,7 +250,9 @@ class BatchedEngine(BaseEngine):
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import apply_post_load_transforms
 
-        self._model = apply_post_load_transforms(self._model, self._model_settings)
+        self._model = apply_post_load_transforms(
+            self._model, self._model_settings, model_path=self._model_name,
+        )
 
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:
