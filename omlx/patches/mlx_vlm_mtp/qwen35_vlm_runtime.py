@@ -131,10 +131,73 @@ def _register_mtp_classes_for_vlm(q35_lang: Any) -> None:
             )
             self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
-        def __call__(self, x, mask=None, cache=None, position_ids=None):
-            r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+        def __call__(
+            self,
+            x,
+            mask=None,
+            cache=None,
+            position_ids=None,
+            position_offset=None,
+        ):
+            if position_offset is not None:
+                r = self._attn_with_offset(
+                    self.input_layernorm(x), mask, cache, int(position_offset)
+                )
+            else:
+                r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
             h = x + r
             return h + self.mlp(self.post_attention_layernorm(h))
+
+        def _attn_with_offset(self, x, mask, cache, offset):
+            from mlx_vlm.models.base import scaled_dot_product_attention
+
+            attn = self.self_attn
+            B, L, _ = x.shape
+
+            q_proj_output = attn.q_proj(x)
+            queries, gate = mx.split(
+                q_proj_output.reshape(B, L, attn.num_attention_heads, -1),
+                2,
+                axis=-1,
+            )
+            gate = gate.reshape(B, L, -1)
+            keys, values = attn.k_proj(x), attn.v_proj(x)
+            queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+            keys = attn.k_norm(
+                keys.reshape(B, L, attn.num_key_value_heads, -1)
+            ).transpose(0, 2, 1, 3)
+            values = values.reshape(B, L, attn.num_key_value_heads, -1).transpose(
+                0, 2, 1, 3
+            )
+
+            inv_freq = attn.rotary_emb.inv_freq
+            positions = mx.arange(offset, offset + L).astype(mx.float32)
+            freqs = positions[:, None] * inv_freq[None, :].astype(mx.float32)
+            emb = mx.concatenate([freqs, freqs], axis=-1)
+            cos = mx.cos(emb)[None, None, :, :]
+            sin = mx.sin(emb)[None, None, :, :]
+
+            rotary_dim = cos.shape[-1]
+            q_rot, q_pass = queries[..., :rotary_dim], queries[..., rotary_dim:]
+            k_rot, k_pass = keys[..., :rotary_dim], keys[..., rotary_dim:]
+            dtype = queries.dtype
+
+            def _rotate_half(v):
+                half = v.shape[-1] // 2
+                return mx.concatenate([-v[..., half:], v[..., :half]], axis=-1)
+
+            q_rot = ((q_rot * cos) + (_rotate_half(q_rot) * sin)).astype(dtype)
+            k_rot = ((k_rot * cos) + (_rotate_half(k_rot) * sin)).astype(dtype)
+            queries = mx.concatenate([q_rot, q_pass], axis=-1)
+            keys = mx.concatenate([k_rot, k_pass], axis=-1)
+
+            if cache is not None:
+                keys, values = cache.update_and_fetch(keys, values)
+            out = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=attn.scale, mask=mask
+            )
+            out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return attn.o_proj(out * mx.sigmoid(gate))
 
     class MTPModule(nn.Module):
         """Multi-Token Prediction head (mlx-lm PR 990) for dense VLM Qwen3.5/3.6.
@@ -157,7 +220,15 @@ def _register_mtp_classes_for_vlm(q35_lang: Any) -> None:
             ]
             self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        def __call__(self, hidden_states, next_token_ids, embed_tokens, cache=None):
+        def __call__(
+            self,
+            hidden_states,
+            next_token_ids,
+            embed_tokens,
+            cache=None,
+            position_offset=None,
+            return_hidden=False,
+        ):
             embeds = embed_tokens(next_token_ids)
             e = self.pre_fc_norm_embedding(embeds)
             h = self.pre_fc_norm_hidden(hidden_states)
@@ -168,9 +239,12 @@ def _register_mtp_classes_for_vlm(q35_lang: Any) -> None:
 
             mask = create_attention_mask(fused, cache[0] if cache else None)
             for layer, c in zip(self.layers, cache):
-                fused = layer(fused, mask, c)
+                fused = layer(fused, mask, c, position_offset=position_offset)
 
-            return self.norm(fused)
+            normed = self.norm(fused)
+            if return_hidden:
+                return normed, fused
+            return normed
 
     q35_lang.MTPDecoderLayer = MTPDecoderLayer
     q35_lang.MTPModule = MTPModule

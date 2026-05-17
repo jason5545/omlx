@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 _VLM_TEXT_PREFIX = "language_model."
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
+_MLX_VLM_LOAD_CONFIG_PATCHED = False
 
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
@@ -62,10 +63,128 @@ def _patch_mlx_lm_load_config() -> None:
     def _patched(model_path, *args, **kwargs):
         cfg = _original(model_path, *args, **kwargs)
         expand_per_layer_quant_keys(cfg)
+        add_mtplx_sidecar_quantization(cfg, model_path)
         return cfg
 
     _lu.load_config = _patched
     _MLX_LM_LOAD_CONFIG_PATCHED = True
+
+
+def _patch_mlx_vlm_load_config() -> None:
+    """Wrap ``mlx_vlm.utils.load_config`` for MTPLX sidecar quant metadata."""
+    global _MLX_VLM_LOAD_CONFIG_PATCHED
+    if _MLX_VLM_LOAD_CONFIG_PATCHED:
+        return
+
+    try:
+        import mlx_vlm.utils as _vu
+    except ImportError:
+        return
+
+    _original = _vu.load_config
+
+    def _patched(model_path, *args, **kwargs):
+        cfg = _original(model_path, *args, **kwargs)
+        expand_per_layer_quant_keys(cfg)
+        add_mtplx_sidecar_quantization(cfg, model_path)
+        return cfg
+
+    _vu.load_config = _patched
+    _MLX_VLM_LOAD_CONFIG_PATCHED = True
+
+
+def _resolve_mtplx_sidecar_quant(model_path: Path) -> tuple[int, int, str]:
+    """Return ``(bits, group_size, mode)`` for an MTPLX MTP sidecar.
+
+    Current MTPLX optimized-quality artifacts describe the sidecar as
+    ``INT8 affine group128`` in ``mtplx_runtime.json``. Keep a metadata path
+    plus a conservative fallback so older sidecars still load.
+    """
+    bits = 8
+    group_size = 128
+    mode = "affine"
+    meta_path = model_path / "mtplx_runtime.json"
+    if not meta_path.exists():
+        return bits, group_size, mode
+    try:
+        meta = json.loads(meta_path.read_text())
+        sidecar_text = str(meta.get("mtp_sidecar") or "").lower()
+        text = " ".join(
+            str(v)
+            for v in (
+                meta.get("mtp_sidecar"),
+                meta.get("target_precision"),
+                meta.get("recommended_profile"),
+            )
+            if v is not None
+        ).lower()
+        if "int4" in text:
+            bits = 4
+        elif "int8" in text or "flat8" in text:
+            bits = 8
+        if "group128" in sidecar_text or "group 128" in sidecar_text:
+            group_size = 128
+        elif "group64" in sidecar_text or "group 64" in sidecar_text:
+            group_size = 64
+        elif "group128" in text or "group 128" in text:
+            group_size = 128
+        elif "group64" in text or "group 64" in text:
+            group_size = 64
+        if "mxfp4" in text:
+            mode = "mxfp4"
+    except Exception:
+        pass
+    return bits, group_size, mode
+
+
+def add_mtplx_sidecar_quantization(cfg: dict, model_path: str | Path) -> dict:
+    """Add per-module quantization overrides for MTPLX ``mtp.safetensors``.
+
+    MTPLX keeps the MTP head in a sidecar. The main model can be 4-bit while
+    the MTP sidecar is INT8 group128; without explicit overrides mlx-lm /
+    mlx-vlm instantiate MTP projections with the main model's global quant
+    shape and load fails before post-load sidecar handling can run.
+    """
+    model_path = Path(model_path)
+    sidecar = model_path / "mtp.safetensors"
+    if not sidecar.exists():
+        return cfg
+
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return cfg
+
+    bits, group_size, mode = _resolve_mtplx_sidecar_quant(model_path)
+    qspec = {"bits": bits, "group_size": group_size, "mode": mode}
+
+    try:
+        with safe_open(str(sidecar), framework="numpy") as f:
+            keys = set(f.keys())
+    except Exception:
+        return cfg
+
+    modules: set[str] = set()
+    for key in keys:
+        if not key.startswith("mtp.") or not key.endswith(".weight"):
+            continue
+        module_path = key[: -len(".weight")]
+        if f"{module_path}.scales" not in keys:
+            continue
+        modules.add(module_path)
+
+    if not modules:
+        return cfg
+
+    for config_key in ("quantization", "quantization_config"):
+        quant = cfg.get(config_key)
+        if not isinstance(quant, dict):
+            continue
+        for module_path in modules:
+            quant.setdefault(module_path, dict(qspec))
+            quant.setdefault(_VLM_TEXT_PREFIX + module_path, dict(qspec))
+
+    return cfg
 
 
 def maybe_apply_pre_load_patches(
@@ -94,6 +213,7 @@ def maybe_apply_pre_load_patches(
     set_mtp_active(False)
 
     _patch_mlx_lm_load_config()
+    _patch_mlx_vlm_load_config()
 
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
