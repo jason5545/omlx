@@ -236,9 +236,7 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         hidden_pre_norm = out.hidden_states[0]
         return out.logits, hidden_pre_norm, out.gdn_states
 
-    def mtp_forward(
-        self, hidden_states, next_token_ids, mtp_cache, return_hidden: bool = False
-    ):
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
@@ -246,12 +244,8 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             mtp_cache,
         )
         if self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(mtp_out)
-        else:
-            logits = self.lm_head(mtp_out)
-        if return_hidden:
-            return logits, mtp_out
-        return logits
+            return self.model.embed_tokens.as_linear(mtp_out)
+        return self.lm_head(mtp_out)
 
     def make_mtp_cache(self):
         if hasattr(self, "mtp"):
@@ -288,11 +282,9 @@ def _patch_vlm_model_adapter() -> None:
     def mtp(self):
         return getattr(self._language_model, "mtp", None)
 
-    def mtp_forward(
-        self, hidden_states, next_token_ids, mtp_cache, return_hidden: bool = False
-    ):
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
         return self._language_model.mtp_forward(
-            hidden_states, next_token_ids, mtp_cache, return_hidden=return_hidden
+            hidden_states, next_token_ids, mtp_cache
         )
 
     def make_mtp_cache(self):

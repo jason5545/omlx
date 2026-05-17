@@ -722,17 +722,6 @@ class VLMBatchedEngine(BaseEngine):
         # mlx-vlm models now handle per-sequence mx.array offsets natively
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
-        if (
-            self._model_settings is not None
-            and getattr(self._model_settings, "mtp_enabled", False)
-        ):
-            try:
-                mtp_draft_depth = int(
-                    getattr(self._model_settings, "mtp_draft_depth", 1) or 1
-                )
-            except (TypeError, ValueError):
-                mtp_draft_depth = 1
-            self._adapter._omlx_mtp_draft_depth = max(1, min(mtp_draft_depth, 8))
 
         # Patch mlx-vlm GatedDeltaNet to mirror mlx-lm fixes (cache.advance(S)
         # + mx.contiguous on cache[0]) that mlx-vlm e41cd25 still lacks.

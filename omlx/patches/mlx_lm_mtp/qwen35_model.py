@@ -471,9 +471,7 @@ def _patch_text_model(q35: Any) -> None:
             return out, hidden
         return out
 
-    def mtp_forward(
-        self, hidden_states, next_token_ids, mtp_cache, return_hidden: bool = False
-    ):
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
@@ -481,12 +479,8 @@ def _patch_text_model(q35: Any) -> None:
             mtp_cache,
         )
         if self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(mtp_out)
-        else:
-            logits = self.lm_head(mtp_out)
-        if return_hidden:
-            return logits, mtp_out
-        return logits
+            return self.model.embed_tokens.as_linear(mtp_out)
+        return self.lm_head(mtp_out)
 
     def make_mtp_cache(self):
         if hasattr(self, "mtp"):
@@ -600,11 +594,9 @@ def _patch_outer_model(q35: Any) -> None:
             n_confirmed=n_confirmed,
         )
 
-    def mtp_forward(
-        self, hidden_states, next_token_ids, mtp_cache, return_hidden: bool = False
-    ):
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
         return self.language_model.mtp_forward(
-            hidden_states, next_token_ids, mtp_cache, return_hidden=return_hidden
+            hidden_states, next_token_ids, mtp_cache
         )
 
     def make_mtp_cache(self):
