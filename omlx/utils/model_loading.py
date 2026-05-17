@@ -139,10 +139,12 @@ def maybe_apply_pre_load_patches(
             set_mtp_sidecar_expected,
         )
 
-        # Check for MTPLX-style mtp.safetensors sidecar
-        from pathlib import Path
-        if mtp_enabled and (Path(model_name) / "mtp.safetensors").exists():
-            set_mtp_sidecar_expected(True)
+        # Check for MTPLX-style mtp.safetensors sidecar. Keep the sidecar
+        # expectation scoped to this load; the qwen model patch reads it
+        # during TextModel.__init__ and stores an instance flag.
+        mtp_sidecar = mtp_enabled and (Path(model_name) / "mtp.safetensors").exists()
+        set_mtp_sidecar_expected(mtp_sidecar)
+        if mtp_sidecar:
             logger.info("MTP sidecar detected: %s/mtp.safetensors", model_name)
 
         if apply_mlx_lm_mtp_patch():

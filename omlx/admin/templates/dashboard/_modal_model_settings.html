@@ -854,6 +854,32 @@
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                         </button>
                                     </div>
+                                    <div x-show="modelSettings.mtp_enabled" x-transition class="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                                        <div>
+                                            <label class="block text-xs font-medium text-neutral-600">MTP draft depth</label>
+                                            <input type="number"
+                                                   x-model.number="modelSettings.mtp_draft_depth"
+                                                   min="1"
+                                                   max="8"
+                                                   step="1"
+                                                   placeholder="1"
+                                                   class="mt-1 w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black focus:border-transparent">
+                                            <p class="text-xs text-neutral-400 mt-1">Use 2 or 3 for MTPLX-style multi-draft; 1 keeps the original native MTP behavior.</p>
+                                        </div>
+                                        <div class="flex items-start justify-between gap-3 rounded-lg border border-neutral-200 bg-white px-3 py-2">
+                                            <div class="min-w-0">
+                                                <label class="block text-xs font-medium text-neutral-600">Adaptive depth</label>
+                                                <p class="text-xs text-neutral-400 mt-1">Auto-ramp depth up after full accepts and down after early rejects.</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="modelSettings.mtp_adaptive_depth = !modelSettings.mtp_adaptive_depth"
+                                                    :class="modelSettings.mtp_adaptive_depth ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="modelSettings.mtp_adaptive_depth ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 <!-- VLM MTP (mlx-vlm 191d7c8+, gemma4_assistant drafter) -->

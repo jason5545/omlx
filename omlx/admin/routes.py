@@ -141,6 +141,8 @@ class ModelSettingsRequest(BaseModel):
     dflash_ssd_cache: bool | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
+    mtp_draft_depth: int | None = None
+    mtp_adaptive_depth: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
@@ -401,9 +403,10 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     suitable for surfacing to users (admin UI shows it under the toggle).
 
     The check is conservative: even when the config declares MTP layers
-    we also peek at the safetensors weight index to verify that the
-    converter actually preserved the ``mtp.*`` tensors. Default mlx-lm
-    converters strip them; PR 990 ships a separate path that keeps them.
+    we also peek at the safetensors weight index or MTPLX sidecar to verify
+    that the converter actually preserved the ``mtp.*`` tensors. Default
+    mlx-lm converters strip them; PR 990 ships a separate path that keeps
+    them.
     """
     import json
     from pathlib import Path
@@ -436,7 +439,8 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
         return False, (
             "Config declares MTP layers but the converted weights are missing "
             "mtp.* tensors. Re-convert from HF with a converter that preserves "
-            "MTP weights."
+            "MTP weights, or place an MTPLX mtp.safetensors sidecar next to "
+            "the model weights."
         )
     return True, ""
 
@@ -462,6 +466,19 @@ def _model_has_mtp_weight_tensors(model_dir) -> bool:
 
     model_dir = Path(model_dir)
 
+    def _file_has_mtp_keys(path: Path) -> bool:
+        try:
+            with safe_open(str(path), framework="numpy") as f:  # type: ignore[arg-type]
+                return any("mtp." in key for key in f.keys())
+        except Exception:
+            return False
+
+    # MTPLX artifacts keep the MTP head in a standalone sidecar that is not
+    # listed in model.safetensors.index.json.
+    sidecar_path = model_dir / "mtp.safetensors"
+    if sidecar_path.exists() and _file_has_mtp_keys(sidecar_path):
+        return True
+
     # Preferred path: read the index file's weight_map (no tensor data loaded).
     index_path = model_dir / "model.safetensors.index.json"
     if index_path.exists():
@@ -475,13 +492,8 @@ def _model_has_mtp_weight_tensors(model_dir) -> bool:
     # Single-shard fallback: enumerate keys via safe_open metadata. We
     # short-circuit on the first ``mtp.*`` key.
     for path in model_dir.glob("*.safetensors"):
-        try:
-            with safe_open(str(path), framework="numpy") as f:  # type: ignore[arg-type]
-                for key in f.keys():
-                    if "mtp." in key:
-                        return True
-        except Exception:
-            continue
+        if _file_has_mtp_keys(path):
+            return True
     return False
 
 
@@ -2013,6 +2025,23 @@ async def update_model_settings(
                     detail="MTP and TurboQuant KV cannot both be enabled; TurboQuant patches the attention path MTP relies on.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
+    if "mtp_draft_depth" in sent:
+        depth = request.mtp_draft_depth if request.mtp_draft_depth is not None else 1
+        try:
+            depth = int(depth)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="mtp_draft_depth must be an integer between 1 and 8.",
+            )
+        if depth < 1 or depth > 8:
+            raise HTTPException(
+                status_code=400,
+                detail="mtp_draft_depth must be between 1 and 8.",
+            )
+        current_settings.mtp_draft_depth = depth
+    if "mtp_adaptive_depth" in sent:
+        current_settings.mtp_adaptive_depth = bool(request.mtp_adaptive_depth)
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
@@ -2137,6 +2166,9 @@ async def update_model_settings(
             or "dflash_in_memory_cache_max_entries" in sent
             or "dflash_in_memory_cache_max_bytes" in sent
             or "dflash_ssd_cache" in sent
+            or "mtp_enabled" in sent
+            or "mtp_draft_depth" in sent
+            or "mtp_adaptive_depth" in sent
             # trust_remote_code is plumbed at model load time; toggling it on
             # an already-loaded engine has no effect until reload.
             or "trust_remote_code" in sent
