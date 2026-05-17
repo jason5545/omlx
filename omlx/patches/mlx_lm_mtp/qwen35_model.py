@@ -56,6 +56,17 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
+_mtp_sidecar_expected = False
+
+
+def set_mtp_sidecar_expected(expected: bool = True) -> None:
+    """Signal that MTP weights are expected from a sidecar ``mtp.safetensors``.
+
+    When True, ``sanitize`` skips the missing ``mtp.*`` key check — the
+    weights will be loaded later by ``_try_load_mtp_sidecar``.
+    """
+    global _mtp_sidecar_expected
+    _mtp_sidecar_expected = bool(expected)
 
 
 def apply() -> bool:
@@ -576,15 +587,21 @@ def _patch_text_model(q35: Any) -> None:
         if not hasattr(self, "mtp"):
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
         elif not any("mtp." in k for k in weights):
-            raise ValueError(
-                "Native MTP is enabled for this model but the converted "
-                "weights are missing the mtp.* tensors. Default mlx-lm "
-                "converters strip them; you need a converter that preserves "
-                "MTP weights (or a Qwen3.6 / DeepSeek-V4 checkpoint that "
-                "already preserves them). To recover without re-converting, "
-                "open the model's settings in the oMLX admin UI and toggle "
-                "'Native MTP' off, then retry."
-            )
+            if _mtp_sidecar_expected:
+                logger.debug(
+                    "MTP sidecar expected — skipping mtp.* key check in "
+                    "main weights (will load from mtp.safetensors later)"
+                )
+            else:
+                raise ValueError(
+                    "Native MTP is enabled for this model but the converted "
+                    "weights are missing the mtp.* tensors. Default mlx-lm "
+                    "converters strip them; you need a converter that preserves "
+                    "MTP weights (or a Qwen3.6 / DeepSeek-V4 checkpoint that "
+                    "already preserves them). To recover without re-converting, "
+                    "open the model's settings in the oMLX admin UI and toggle "
+                    "'Native MTP' off, then retry."
+                )
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)

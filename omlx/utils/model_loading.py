@@ -133,7 +133,17 @@ def maybe_apply_pre_load_patches(
             model_settings is not None
             and getattr(model_settings, "mtp_enabled", False)
         )
-        from ..patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch, set_mtp_active
+        from ..patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            set_mtp_active,
+            set_mtp_sidecar_expected,
+        )
+
+        # Check for MTPLX-style mtp.safetensors sidecar
+        from pathlib import Path
+        if mtp_enabled and (Path(model_name) / "mtp.safetensors").exists():
+            set_mtp_sidecar_expected(True)
+            logger.info("MTP sidecar detected: %s/mtp.safetensors", model_name)
 
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)

@@ -77,8 +77,6 @@ def apply_mlx_lm_mtp_patch() -> bool:
     if not cache_rollback.apply():
         return False
     if not qwen35_model.apply():
-        # Qwen models are the main target; if the qwen patch refuses we
-        # still continue so DeepSeek-V4 users aren't blocked.
         logger.debug("Qwen3.5/3.6 MTP patch did not apply (likely import error)")
     if not deepseek_v4_model.apply():
         logger.debug("DeepSeek-V4 MTP patch did not apply (likely missing base patch)")
@@ -91,3 +89,9 @@ def apply_mlx_lm_mtp_patch() -> bool:
     _PATCHED = True
     logger.info("mlx-lm MTP patch applied (PR 990 + PR 15)")
     return True
+
+
+def set_mtp_sidecar_expected(expected: bool = True) -> None:
+    """Re-export from qwen35_model for callers in utils/model_loading."""
+    from .qwen35_model import set_mtp_sidecar_expected as _fn
+    _fn(expected)
