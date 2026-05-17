@@ -315,6 +315,206 @@ class _MtpStepFallback(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
+# Sparse sampler support
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _SparseDistribution:
+    """Small top-k probability distribution for exact speculative sampling.
+
+    MTPLX's fast path avoids materializing/filtering the full vocabulary during
+    every verify cycle when the active sampler already caps support with top-k.
+    Keep the same idea local to the native MTP path: probabilities are stored on
+    host for the final filtered distribution, while logits stay on-device long
+    enough to compute top-k and the raw full-vocab normalizer.
+    """
+
+    token_ids: List[int]
+    probs: List[float]
+    vocab_size: int
+
+    def __post_init__(self) -> None:
+        if len(self.token_ids) != len(self.probs) or not self.token_ids:
+            raise ValueError("sparse distribution requires matching non-empty ids/probs")
+        total = float(sum(self.probs))
+        if not math.isfinite(total) or total <= 0.0:
+            self.token_ids = [int(self.token_ids[0])]
+            self.probs = [1.0]
+            return
+        self.token_ids = [int(x) for x in self.token_ids]
+        self.probs = [float(p) / total for p in self.probs]
+
+    def probability(self, token_id: int) -> float:
+        token_id = int(token_id)
+        for idx, candidate in enumerate(self.token_ids):
+            if candidate == token_id:
+                return float(self.probs[idx])
+        return 0.0
+
+    def sample(self) -> int:
+        threshold = random.random()
+        cumulative = 0.0
+        for token_id, prob in zip(self.token_ids, self.probs):
+            cumulative += float(prob)
+            if threshold <= cumulative:
+                return int(token_id)
+        return int(self.token_ids[-1])
+
+
+def _sparse_residual_sample(
+    target: _SparseDistribution,
+    draft: _SparseDistribution,
+) -> int:
+    """Sample from ``max(p_target - p_draft, 0)`` over sparse supports."""
+
+    token_ids = list(dict.fromkeys([*target.token_ids, *draft.token_ids]))
+    residual = [
+        max(target.probability(token_id) - draft.probability(token_id), 0.0)
+        for token_id in token_ids
+    ]
+    total = float(sum(residual))
+    if not math.isfinite(total) or total <= 0.0:
+        return target.sample()
+    dist = _SparseDistribution(token_ids, [p / total for p in residual], target.vocab_size)
+    return dist.sample()
+
+
+def _sparse_distribution_from_logits(logits_2d: Any, sampler: Any) -> Optional[_SparseDistribution]:
+    """Build the sampler's filtered top-k distribution without full-vocab sampling.
+
+    This mirrors ``omlx.utils.sampling.make_sampler`` for the common MTPLX
+    profile: top-p/min-p/top-k are applied to raw logprobs, then temperature is
+    applied for the final categorical draw. If top-k is disabled, return None so
+    the existing full-vocab path preserves exact behavior.
+    """
+
+    temp = float(getattr(sampler, "temp", 0.0) or 0.0)
+    top_k = int(getattr(sampler, "top_k", 0) or 0)
+    if temp <= 0.0 or top_k <= 0:
+        return None
+
+    import mlx.core as mx
+    import numpy as np
+
+    flat = logits_2d.reshape(-1).astype(mx.float32)
+    vocab_size = int(flat.shape[-1])
+    k = min(top_k, vocab_size)
+    if k <= 0:
+        return None
+
+    top_idx = mx.argpartition(-flat, kth=k - 1, axis=-1)[:k]
+    top_vals = flat[top_idx]
+    order = mx.argsort(-top_vals, axis=-1)
+    top_idx = top_idx[order]
+    top_vals = top_vals[order]
+    raw_logprobs = top_vals - mx.logsumexp(flat, axis=-1)
+    mx.eval(top_idx, top_vals, raw_logprobs)
+
+    token_ids = [int(x) for x in np.asarray(top_idx).reshape(-1)]
+    raw_logits = [float(x) for x in np.asarray(top_vals).reshape(-1)]
+    raw_probs = [float(math.exp(x)) for x in np.asarray(raw_logprobs).reshape(-1)]
+
+    keep = [True] * len(token_ids)
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    if 0.0 < top_p < 1.0:
+        cumulative_higher = 0.0
+        for idx, prob in enumerate(raw_probs):
+            keep[idx] = cumulative_higher < top_p
+            cumulative_higher += prob
+        if keep:
+            keep[0] = True
+
+    min_p = float(getattr(sampler, "min_p", 0.0) or 0.0)
+    if min_p != 0.0 and raw_probs:
+        min_keep = int(getattr(sampler, "min_tokens_to_keep", 1) or 1)
+        threshold = max(raw_probs) * min_p
+        min_mask = [prob >= threshold for prob in raw_probs]
+        for idx in range(min(min_keep, len(min_mask))):
+            min_mask[idx] = True
+        keep = [a and b for a, b in zip(keep, min_mask)]
+
+    kept = [(tid, val) for tid, val, ok in zip(token_ids, raw_logits, keep) if ok]
+    if not kept:
+        kept = [(token_ids[0], raw_logits[0])]
+
+    max_score = max(val / temp for _, val in kept)
+    weights = [math.exp((val / temp) - max_score) for _, val in kept]
+    return _SparseDistribution(
+        [tid for tid, _ in kept],
+        weights,
+        vocab_size,
+    )
+
+
+def _sparse_distributions_from_logits(logits: Any, sampler: Any) -> Optional[List[_SparseDistribution]]:
+    import mlx.core as mx
+    import numpy as np
+
+    temp = float(getattr(sampler, "temp", 0.0) or 0.0)
+    top_k = int(getattr(sampler, "top_k", 0) or 0)
+    if temp <= 0.0 or top_k <= 0:
+        return None
+
+    rows = logits.reshape(-1, logits.shape[-1]).astype(mx.float32)
+    vocab_size = int(rows.shape[-1])
+    k = min(top_k, vocab_size)
+    if k <= 0:
+        return None
+
+    top_idx = mx.argpartition(-rows, kth=k - 1, axis=-1)[:, :k]
+    top_vals = mx.take_along_axis(rows, top_idx, axis=-1)
+    order = mx.argsort(-top_vals, axis=-1)
+    top_idx = mx.take_along_axis(top_idx, order, axis=-1)
+    top_vals = mx.take_along_axis(top_vals, order, axis=-1)
+    raw_logprobs = top_vals - mx.logsumexp(rows, axis=-1)[:, None]
+    mx.eval(top_idx, top_vals, raw_logprobs)
+
+    token_rows = np.asarray(top_idx, dtype=np.int64)
+    value_rows = np.asarray(top_vals, dtype=np.float64)
+    prob_rows = np.exp(np.asarray(raw_logprobs, dtype=np.float64))
+
+    keep_rows = np.ones_like(prob_rows, dtype=bool)
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    if 0.0 < top_p < 1.0:
+        cumulative_higher = np.concatenate(
+            (
+                np.zeros((prob_rows.shape[0], 1), dtype=np.float64),
+                np.cumsum(prob_rows[:, :-1], axis=1),
+            ),
+            axis=1,
+        )
+        keep_rows &= cumulative_higher < top_p
+        keep_rows[:, 0] = True
+
+    min_p = float(getattr(sampler, "min_p", 0.0) or 0.0)
+    if min_p != 0.0:
+        min_keep = max(1, int(getattr(sampler, "min_tokens_to_keep", 1) or 1))
+        thresholds = np.max(prob_rows, axis=1, keepdims=True) * min_p
+        min_mask = prob_rows >= thresholds
+        min_mask[:, : min(min_keep, min_mask.shape[1])] = True
+        keep_rows &= min_mask
+
+    distributions: List[_SparseDistribution] = []
+    for token_ids, raw_logits, keep in zip(token_rows, value_rows, keep_rows, strict=True):
+        kept_ids = token_ids[keep]
+        kept_logits = raw_logits[keep]
+        if kept_ids.size == 0:
+            kept_ids = token_ids[:1]
+            kept_logits = raw_logits[:1]
+        max_score = float(np.max(kept_logits / temp))
+        weights = np.exp((kept_logits / temp) - max_score)
+        distributions.append(
+            _SparseDistribution(
+                [int(x) for x in kept_ids],
+                [float(x) for x in weights],
+                vocab_size,
+            )
+        )
+
+    return distributions
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
@@ -726,16 +926,25 @@ def _draft_block_from(
             )
         else:
             prev_with_current = None
-        draft_lp_2d = _logprobs(mtp_logits_2d)
-        draft_tok = sampler(draft_lp_2d)
-        draft_accept_lp_2d = _accept_lp_for(sampler, draft_lp_2d)
-        draft_id = int(draft_tok.tolist()[0])
+        sparse_dist = _sparse_distribution_from_logits(mtp_logits_2d, sampler)
+        if sparse_dist is not None:
+            draft_id = sparse_dist.sample()
+            draft_tok = mx.array([draft_id], dtype=mx.uint32)
+            draft_lp_1d = None
+            draft_accept_lp_1d = sparse_dist
+        else:
+            draft_lp_2d = _logprobs(mtp_logits_2d)
+            draft_tok = sampler(draft_lp_2d)
+            draft_accept_lp_2d = _accept_lp_for(sampler, draft_lp_2d)
+            draft_id = int(draft_tok.tolist()[0])
+            draft_lp_1d = draft_lp_2d.squeeze(0)
+            draft_accept_lp_1d = draft_accept_lp_2d.squeeze(0)
         state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
         drafts.append(
             (
                 _ensure_uint32(draft_tok),
-                draft_lp_2d.squeeze(0),
-                draft_accept_lp_2d.squeeze(0),
+                draft_lp_1d,
+                draft_accept_lp_1d,
                 draft_id,
             )
         )
@@ -971,43 +1180,73 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
             logits_2d = _apply_processors(procs, prev_contexts[idx], logits_2d)
         processed_logits.append(logits_2d)
     combined_logits = mx.concatenate(processed_logits, axis=0)
-    combined_lp = combined_logits - mx.logsumexp(
-        combined_logits, axis=-1, keepdims=True
-    )
-    target_toks = sampler(combined_lp)
-    mx.eval(target_toks)
-    target_ids = [int(x) for x in target_toks.tolist()]
+    sparse_targets = _sparse_distributions_from_logits(combined_logits, sampler)
+    combined_lp = None
+    target_accept_lp = None
+    if sparse_targets is not None and all(item is not None for item in sparse_targets):
+        target_ids = [item.sample() for item in sparse_targets]
+    else:
+        sparse_targets = None
+        combined_lp = combined_logits - mx.logsumexp(
+            combined_logits, axis=-1, keepdims=True
+        )
+        target_toks = sampler(combined_lp)
+        mx.eval(target_toks)
+        target_ids = [int(x) for x in target_toks.tolist()]
+        target_accept_lp = _accept_lp_for(sampler, combined_lp[:draft_count])
 
-    target_accept_lp = _accept_lp_for(sampler, combined_lp[:draft_count])
     accepted_count = 0
     rejection_correction: Optional[int] = None
-    rejected_lp_2d = None
+    rejected_logprobs = None
 
     for depth_index, draft_id in enumerate(state.draft_ids):
-        target_lp_2d = combined_lp[depth_index : depth_index + 1]
         if is_greedy:
+            if combined_lp is None:
+                combined_lp = combined_logits - mx.logsumexp(
+                    combined_logits, axis=-1, keepdims=True
+                )
             accepted_now = target_ids[depth_index] == draft_id
             correction = target_ids[depth_index]
+            target_lp_2d = combined_lp[depth_index : depth_index + 1]
         else:
             draft_accept_lp = state.draft_accept_lps[depth_index]
-            log_accept = (
-                target_accept_lp[depth_index, draft_id].item()
-                - draft_accept_lp[draft_id].item()
-            )
-            accepted_now = log_accept >= 0 or random.random() < math.exp(log_accept)
-            correction = (
-                draft_id
-                if accepted_now
-                else _residual_sample(
-                    target_accept_lp[depth_index : depth_index + 1],
-                    draft_accept_lp,
-                )[0]
-            )
+            if sparse_targets is not None and isinstance(draft_accept_lp, _SparseDistribution):
+                target_dist = sparse_targets[depth_index]
+                p = target_dist.probability(draft_id)
+                q = draft_accept_lp.probability(draft_id)
+                accept_prob = 1.0 if q <= 0.0 and p > 0.0 else (0.0 if q <= 0.0 else min(1.0, p / q))
+                accepted_now = random.random() <= accept_prob
+                correction = (
+                    draft_id
+                    if accepted_now
+                    else _sparse_residual_sample(target_dist, draft_accept_lp)
+                )
+                target_lp_2d = None
+            else:
+                if combined_lp is None:
+                    combined_lp = combined_logits - mx.logsumexp(
+                        combined_logits, axis=-1, keepdims=True
+                    )
+                    target_accept_lp = _accept_lp_for(sampler, combined_lp[:draft_count])
+                target_lp_2d = combined_lp[depth_index : depth_index + 1]
+                log_accept = (
+                    target_accept_lp[depth_index, draft_id].item()
+                    - draft_accept_lp[draft_id].item()
+                )
+                accepted_now = log_accept >= 0 or random.random() < math.exp(log_accept)
+                correction = (
+                    draft_id
+                    if accepted_now
+                    else _residual_sample(
+                        target_accept_lp[depth_index : depth_index + 1],
+                        draft_accept_lp,
+                    )[0]
+                )
         if accepted_now:
             accepted_count += 1
             continue
         rejection_correction = int(correction)
-        rejected_lp_2d = target_lp_2d
+        rejected_logprobs = None if target_lp_2d is None else target_lp_2d.squeeze(0)
         break
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
 
@@ -1043,7 +1282,11 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
 
         bonus_tok = mx.array([target_ids[draft_count]], dtype=mx.uint32)
-        bonus_lp_1d = combined_lp[draft_count]
+        bonus_lp_1d = (
+            None
+            if sparse_targets is not None
+            else combined_lp[draft_count]
+        )
         prev_for_bonus = prev_contexts[-1] if procs is not None else None
         new_drafts = _draft_block_from(
             gen_batch,
@@ -1089,7 +1332,7 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
             mx.eval(replay_logits, replay_hidden)
     state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
 
-    if rejection_correction is None or rejected_lp_2d is None:
+    if rejection_correction is None:
         raise _MtpStepFallback("reject path missing correction token")
     emit_tok = mx.array([rejection_correction], dtype=mx.uint32)
     prev_for_emit = prev_contexts[accepted_count] if procs is not None else None
@@ -1107,7 +1350,7 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         state.draft_lps[:accepted_count],
     ):
         state.queue.append((draft_id, draft_lp, "draft"))
-    state.queue.append((rejection_correction, rejected_lp_2d.squeeze(0), "verify"))
+    state.queue.append((rejection_correction, rejected_logprobs, "verify"))
     state.next_main = emit_tok
     _set_state_drafts(state, new_drafts)
 
