@@ -509,6 +509,8 @@ def _patch_text_model(q35: Any) -> None:
 
         if n_mtp > 0 and is_mtp_active():
             self.mtp = q35.MTPModule(args)
+            if _mtp_sidecar_expected:
+                self._omlx_mtp_sidecar = True
 
     def __call__(
         self,
@@ -587,7 +589,7 @@ def _patch_text_model(q35: Any) -> None:
         if not hasattr(self, "mtp"):
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
         elif not any("mtp." in k for k in weights):
-            if _mtp_sidecar_expected:
+            if getattr(self, "_omlx_mtp_sidecar", False):
                 logger.debug(
                     "MTP sidecar expected — skipping mtp.* key check in "
                     "main weights (will load from mtp.safetensors later)"
