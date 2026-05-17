@@ -49,7 +49,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
@@ -231,7 +230,6 @@ class ServerState:
 
 # Global server state instance
 _server_state: ServerState = ServerState()
-_mtplx_sampling_defaults_cache: dict[str, dict[str, float | int] | None] = {}
 
 
 def get_server_state() -> ServerState:
@@ -988,46 +986,6 @@ async def get_reranker_engine(model: str) -> RerankerEngine:
     return await get_engine(model, EngineType.RERANKER)
 
 
-def _get_mtplx_sampling_defaults(model_id: str | None) -> dict[str, float | int] | None:
-    """Return MTPLX runtime sampler defaults for verified MTPLX artifacts.
-
-    The MTPLX speed lane is tied to the artifact's sampler contract
-    (temperature/top_p/top_k in ``mtplx_runtime.json``). Request and explicit
-    per-model settings still win; this only fills the gap before global
-    defaults such as top_k=0 erase the intended MTPLX profile.
-    """
-
-    if not model_id or _server_state.engine_pool is None:
-        return None
-    cached = _mtplx_sampling_defaults_cache.get(model_id, ...)
-    if cached is not ...:
-        return cached
-
-    defaults: dict[str, float | int] | None = None
-    try:
-        entry = _server_state.engine_pool.get_entry(model_id)
-        if entry is not None:
-            runtime_path = Path(entry.model_path) / "mtplx_runtime.json"
-            if runtime_path.exists():
-                data = json.loads(runtime_path.read_text(encoding="utf-8"))
-                sampler = data.get("sampler") if isinstance(data, dict) else None
-                if isinstance(sampler, dict):
-                    parsed: dict[str, float | int] = {}
-                    if sampler.get("temperature") is not None:
-                        parsed["temperature"] = float(sampler["temperature"])
-                    if sampler.get("top_p") is not None:
-                        parsed["top_p"] = float(sampler["top_p"])
-                    if sampler.get("top_k") is not None:
-                        parsed["top_k"] = int(sampler["top_k"])
-                    defaults = parsed or None
-    except Exception as exc:
-        logger.debug("Could not load MTPLX sampler defaults for %s: %s", model_id, exc)
-        defaults = None
-
-    _mtplx_sampling_defaults_cache[model_id] = defaults
-    return defaults
-
-
 def get_sampling_params(
     req_temperature: float | None,
     req_top_p: float | None,
@@ -1060,10 +1018,9 @@ def get_sampling_params(
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
-    # Resolve OCR / MTPLX artifact defaults if not provided by caller
+    # Resolve OCR defaults if not provided by caller
     if ocr_defaults is None and model_id:
         ocr_defaults = _get_ocr_defaults(model_id)
-    mtplx_defaults = _get_mtplx_sampling_defaults(model_id)
 
     # Check force at any level
     force = global_sampling.force_sampling or (
@@ -1094,8 +1051,6 @@ def get_sampling_params(
             temperature = req_temperature
         elif model_settings and model_settings.temperature is not None:
             temperature = model_settings.temperature
-        elif mtplx_defaults and "temperature" in mtplx_defaults:
-            temperature = float(mtplx_defaults["temperature"])
         elif ocr_defaults and "temperature" in ocr_defaults:
             temperature = ocr_defaults["temperature"]
         else:
@@ -1105,15 +1060,11 @@ def get_sampling_params(
             top_p = req_top_p
         elif model_settings and model_settings.top_p is not None:
             top_p = model_settings.top_p
-        elif mtplx_defaults and "top_p" in mtplx_defaults:
-            top_p = float(mtplx_defaults["top_p"])
         else:
             top_p = global_sampling.top_p
 
         if model_settings and model_settings.top_k is not None:
             top_k = model_settings.top_k
-        elif mtplx_defaults and "top_k" in mtplx_defaults:
-            top_k = int(mtplx_defaults["top_k"])
         else:
             top_k = global_sampling.top_k
 
