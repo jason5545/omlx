@@ -448,14 +448,70 @@ def _sparse_distribution_from_logits(logits_2d: Any, sampler: Any) -> Optional[_
 
 def _sparse_distributions_from_logits(logits: Any, sampler: Any) -> Optional[List[_SparseDistribution]]:
     import mlx.core as mx
+    import numpy as np
 
     temp = float(getattr(sampler, "temp", 0.0) or 0.0)
     top_k = int(getattr(sampler, "top_k", 0) or 0)
     if temp <= 0.0 or top_k <= 0:
         return None
 
-    rows = logits.reshape(-1, logits.shape[-1])
-    return [_sparse_distribution_from_logits(rows[i : i + 1], sampler) for i in range(rows.shape[0])]
+    rows = logits.reshape(-1, logits.shape[-1]).astype(mx.float32)
+    vocab_size = int(rows.shape[-1])
+    k = min(top_k, vocab_size)
+    if k <= 0:
+        return None
+
+    top_idx = mx.argpartition(-rows, kth=k - 1, axis=-1)[:, :k]
+    top_vals = mx.take_along_axis(rows, top_idx, axis=-1)
+    order = mx.argsort(-top_vals, axis=-1)
+    top_idx = mx.take_along_axis(top_idx, order, axis=-1)
+    top_vals = mx.take_along_axis(top_vals, order, axis=-1)
+    raw_logprobs = top_vals - mx.logsumexp(rows, axis=-1)[:, None]
+    mx.eval(top_idx, top_vals, raw_logprobs)
+
+    token_rows = np.asarray(top_idx, dtype=np.int64)
+    value_rows = np.asarray(top_vals, dtype=np.float64)
+    prob_rows = np.exp(np.asarray(raw_logprobs, dtype=np.float64))
+
+    keep_rows = np.ones_like(prob_rows, dtype=bool)
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    if 0.0 < top_p < 1.0:
+        cumulative_higher = np.concatenate(
+            (
+                np.zeros((prob_rows.shape[0], 1), dtype=np.float64),
+                np.cumsum(prob_rows[:, :-1], axis=1),
+            ),
+            axis=1,
+        )
+        keep_rows &= cumulative_higher < top_p
+        keep_rows[:, 0] = True
+
+    min_p = float(getattr(sampler, "min_p", 0.0) or 0.0)
+    if min_p != 0.0:
+        min_keep = max(1, int(getattr(sampler, "min_tokens_to_keep", 1) or 1))
+        thresholds = np.max(prob_rows, axis=1, keepdims=True) * min_p
+        min_mask = prob_rows >= thresholds
+        min_mask[:, : min(min_keep, min_mask.shape[1])] = True
+        keep_rows &= min_mask
+
+    distributions: List[_SparseDistribution] = []
+    for token_ids, raw_logits, keep in zip(token_rows, value_rows, keep_rows, strict=True):
+        kept_ids = token_ids[keep]
+        kept_logits = raw_logits[keep]
+        if kept_ids.size == 0:
+            kept_ids = token_ids[:1]
+            kept_logits = raw_logits[:1]
+        max_score = float(np.max(kept_logits / temp))
+        weights = np.exp((kept_logits / temp) - max_score)
+        distributions.append(
+            _SparseDistribution(
+                [int(x) for x in kept_ids],
+                [float(x) for x in weights],
+                vocab_size,
+            )
+        )
+
+    return distributions
 
 
 # ---------------------------------------------------------------------------
