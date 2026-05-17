@@ -156,10 +156,12 @@ class TestQwen35Model:
 
     def test_outer_model_pass_through_methods(self):
         from mlx_lm.models.qwen3_5 import Model
+        import inspect
 
         assert hasattr(Model, "mtp_forward")
         assert hasattr(Model, "make_mtp_cache")
         assert hasattr(Model, "_omlx_mtp_patched")
+        assert "return_hidden" in inspect.signature(Model.mtp_forward).parameters
 
 
 class TestQwen35MoeSanitize:
@@ -433,6 +435,138 @@ class TestBatchGeneratorDispatch:
         assert _is_greedy(stochastic_batch) is False
         assert _is_greedy(fallback_batch) is True
 
+    def test_resolve_mtp_draft_depth_from_model_attr_and_env(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _resolve_mtp_draft_depth
+
+        batch = SimpleNamespace(model=SimpleNamespace(_omlx_mtp_draft_depth=3))
+        assert _resolve_mtp_draft_depth(batch) == 3
+
+        monkeypatch.setenv("OMLX_MTP_DRAFT_DEPTH", "2")
+        assert _resolve_mtp_draft_depth(batch) == 2
+
+        monkeypatch.setenv("OMLX_MTP_DRAFT_DEPTH", "99")
+        assert _resolve_mtp_draft_depth(batch) == 8
+
+        monkeypatch.setenv("OMLX_MTP_DRAFT_DEPTH", "not-an-int")
+        assert _resolve_mtp_draft_depth(batch) == 1
+
+    def test_cache_trim_helpers_accept_variable_depth(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _restore_or_trim_caches,
+            _trim_mtp_cache,
+        )
+
+        class _Cache:
+            def __init__(self):
+                self.trimmed = []
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.trimmed.append(n)
+
+        prompt_cache = [_Cache(), _Cache()]
+        assert _restore_or_trim_caches(prompt_cache, trim_count=3) is True
+        assert [c.trimmed for c in prompt_cache] == [[3], [3]]
+
+        mtp_cache = [_Cache(), _Cache()]
+        assert _trim_mtp_cache(mtp_cache, 2) is True
+        assert [c.trimmed for c in mtp_cache] == [[2], [2]]
+
+    def test_multidepth_verify_accept_and_partial_reject(self):
+        import mlx.core as mx
+        import mlx_lm.generate  # noqa: F401 - ensures generation_stream exists
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _MtpState,
+            _run_verify_cycle,
+        )
+
+        vocab = 16
+
+        def onehot_logits(ids):
+            rows = [
+                [0.0 if i == int(tok) else -1000.0 for i in range(vocab)]
+                for tok in ids
+            ]
+            return mx.array([rows])
+
+        def sampler(lp):
+            return mx.argmax(lp, axis=-1).astype(mx.uint32)
+
+        sampler.temp = 0.0
+
+        class _Cache:
+            def __init__(self):
+                self.trimmed = []
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.trimmed.append(int(n))
+
+        class _Model:
+            def __init__(self, verify_ids):
+                self.verify_ids = verify_ids
+
+            def __call__(self, inputs, cache=None, return_hidden=False, n_confirmed=0):
+                length = inputs.shape[1]
+                return onehot_logits(self.verify_ids[:length]), mx.ones(
+                    (1, length, 4)
+                )
+
+            def mtp_forward(self, hidden, next_ids, mtp_cache, return_hidden=False):
+                next_tok = int(next_ids.reshape(-1).tolist()[0])
+                logits = onehot_logits([(next_tok + 1) % vocab])
+                next_hidden = hidden + 1
+                return (logits, next_hidden) if return_hidden else logits
+
+        def make_state():
+            return _MtpState(
+                mtp_cache=[_Cache()],
+                next_main=mx.array([10], dtype=mx.uint32),
+                draft_toks=[
+                    mx.array([1], dtype=mx.uint32),
+                    mx.array([2], dtype=mx.uint32),
+                ],
+                draft_lps=[mx.zeros((vocab,)), mx.zeros((vocab,))],
+                draft_accept_lps=[mx.zeros((vocab,)), mx.zeros((vocab,))],
+                draft_ids=[1, 2],
+                draft_depth=2,
+            )
+
+        state = make_state()
+        batch = SimpleNamespace(
+            model=_Model([1, 2, 3]),
+            prompt_cache=[_Cache()],
+            samplers=[],
+            fallback_sampler=sampler,
+            logits_processors=[],
+            _token_context=[],
+        )
+        _run_verify_cycle(batch, state)
+        assert [item[0] for item in state.queue] == [1, 2, 3]
+        assert state.stats.accepts == 2
+        assert state.stats.full_accepts == 1
+
+        state = make_state()
+        target_cache = _Cache()
+        batch = SimpleNamespace(
+            model=_Model([1, 9, 3]),
+            prompt_cache=[target_cache],
+            samplers=[],
+            fallback_sampler=sampler,
+            logits_processors=[],
+            _token_context=[],
+        )
+        _run_verify_cycle(batch, state)
+        assert [item[0] for item in state.queue] == [1, 9]
+        assert target_cache.trimmed == [2]
+        assert state.stats.accepts == 1
+        assert state.stats.rejects == 1
+
 
 # ---------------------------------------------------------------------------
 # ModelSettings — mtp_enabled field + mutual exclusion
@@ -444,13 +578,19 @@ class TestModelSettingsMtp:
         assert s.mtp_enabled is False
 
     def test_mtp_enabled_roundtrip(self):
-        original = ModelSettings(mtp_enabled=True)
+        original = ModelSettings(mtp_enabled=True, mtp_draft_depth=3)
         restored = ModelSettings.from_dict(original.to_dict())
         assert restored.mtp_enabled is True
+        assert restored.mtp_draft_depth == 3
 
     def test_legacy_settings_dict_defaults_mtp_off(self):
         s = ModelSettings.from_dict({"display_name": "qwen3.6"})
         assert s.mtp_enabled is False
+        assert s.mtp_draft_depth == 1
+
+    def test_invalid_mtp_draft_depth_rejected(self):
+        with pytest.raises(ValueError, match="mtp_draft_depth"):
+            ModelSettings(mtp_draft_depth=0)
 
     def test_mutual_exclusion_with_dflash(self):
         with pytest.raises(ValueError, match="speculative-decoding"):

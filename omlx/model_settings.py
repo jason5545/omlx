@@ -76,6 +76,9 @@ class ModelSettings:
             decoding. Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually
             exclusive with dflash_enabled and turboquant_kv_enabled. Concurrent requests on
             the same model fall back to standard continuous batching automatically.
+        mtp_draft_depth: Native MTP draft tokens attempted per verify cycle (1-8).
+            Depth >1 requires model patches that return MTP hidden state; unsupported
+            models automatically stop at depth 1.
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
             "gemma4_assistant" model.
@@ -141,6 +144,7 @@ class ModelSettings:
     # uses MTP draft+verify path for single-request decoding. Compatible model_types:
     # qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with dflash and turboquant.
     mtp_enabled: bool = False
+    mtp_draft_depth: int = 1
 
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm f96138e+).
     # Target = Gemma4 VLM body, drafter = "gemma-4-26B-A4B-it-assistant"
@@ -179,6 +183,12 @@ class ModelSettings:
                 "mtp_enabled and turboquant_kv_enabled cannot both be True; "
                 "TurboQuant patches the attention path that MTP relies on"
             )
+        try:
+            self.mtp_draft_depth = int(self.mtp_draft_depth or 1)
+        except (TypeError, ValueError):
+            self.mtp_draft_depth = 1
+        if self.mtp_draft_depth < 1 or self.mtp_draft_depth > 8:
+            raise ValueError("mtp_draft_depth must be between 1 and 8")
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
         # or with TurboQuant (which mutates the same cache objects).

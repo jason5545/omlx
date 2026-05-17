@@ -48,6 +48,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_draft_quant_activation_bits",
     "dflash_draft_quant_group_size",
     "mtp_enabled",
+    "mtp_draft_depth",
     "specprefill_enabled",
     "specprefill_draft_model",
     "specprefill_keep_pct",

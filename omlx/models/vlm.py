@@ -131,12 +131,14 @@ class VLMModelAdapter(nn.Module):
         hidden_states: mx.array,
         next_token_ids: mx.array,
         mtp_cache: List[Any],
+        return_hidden: bool = False,
     ) -> Any:
         """Delegate Native MTP head inference to the wrapped language model."""
         return self._language_model.mtp_forward(
             hidden_states,
             next_token_ids,
             mtp_cache,
+            return_hidden=return_hidden,
         )
 
     def set_pending_embeddings(
