@@ -10,8 +10,8 @@ from dataclasses import dataclass
 class AdaptiveDepthPolicy:
     max_depth: int = 3
     min_depth: int = 1
-    start_depth: int = 1
-    increase_after: int = 3
+    start_depth: int = 3
+    increase_after: int = 1
     decrease_after: int = 2
 
     def __post_init__(self) -> None:
