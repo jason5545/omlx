@@ -340,6 +340,16 @@ class ThinkingBudgetProcessor:
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""
         if self._forcing:
+            # Native MTP applies the same stateful logits processor to several
+            # speculative verify rows in one cycle.  Rows after the first may
+            # contain draft tokens that were never emitted.  Only advance the
+            # forced close sequence after the expected forced token actually
+            # appears in the accepted token history.
+            if (
+                self._force_idx < len(self._force_sequence)
+                and token_id != self._force_sequence[self._force_idx]
+            ):
+                return
             self._force_idx += 1
             if self._force_idx >= len(self._force_sequence):
                 self._in_thinking = False
