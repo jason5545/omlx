@@ -2282,7 +2282,7 @@ class Scheduler:
                     trailing_token_ids=trailing_ids,
                 )
                 logits_processors.append(processor)
-                logger.debug(
+                logger.info(
                     "Thinking budget processor attached: budget=%d needs_think_prefix=%s",
                     sampling_params.thinking_budget,
                     getattr(request, "needs_think_prefix", False),
