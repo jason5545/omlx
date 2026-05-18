@@ -2370,12 +2370,26 @@ async def create_chat_completion(
                 merged_ct_kwargs[k] = v
     _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
+    # Resolve the thinking budget before message extraction so historical
+    # reasoning can be handled conservatively when a per-turn budget is active.
+    thinking_budget = _resolve_thinking_budget(
+        request, request.model, request_policy=request_policy
+    )
+
     # Extract messages - different engines need different content handling.
     # Templates that expose message.reasoning_content natively (Qwen 3.6+)
     # get reasoning as a separate field; others fall back to <think> inlined
     # in content.
     _entry = get_engine_pool().get_entry(resolved_model)
-    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+    # Do not auto-preserve historical reasoning when a thinking budget is
+    # active. Each new turn may think up to the budget, but prior reasoning
+    # should not be replayed into the prompt unless the model setting or
+    # request explicitly asks for preserve_thinking=True.
+    native_reasoning = bool(
+        _entry
+        and _entry.preserve_thinking_default is True
+        and merged_ct_kwargs.get("preserve_thinking") is True
+    )
     is_vlm = isinstance(engine, VLMBatchedEngine)
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
@@ -2481,9 +2495,6 @@ async def create_chat_completion(
         chat_kwargs["seed"] = request.seed
 
     # Add thinking budget if applicable
-    thinking_budget = _resolve_thinking_budget(
-        request, request.model, request_policy=request_policy
-    )
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
 
@@ -2501,6 +2512,7 @@ async def create_chat_completion(
     if (
         _entry is not None
         and _entry.preserve_thinking_default is True
+        and thinking_budget is None
         and merged_ct_kwargs.get("enable_thinking") is not False
         and "preserve_thinking" not in merged_ct_kwargs
     ):

@@ -313,6 +313,14 @@ def _apply_reasoning_reconstruction(
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
         text = _extract_text_from_content_list(content)
+    # Some clients persist streamed reasoning even when the turn is aborted,
+    # and our malformed-thinking recovery can also duplicate the same text in
+    # both reasoning_content and content. Feeding those historical drafts back
+    # into Qwen's template makes later "continue" prompts resume thinking
+    # instead of answering. Treat reasoning-only / duplicate-reasoning turns as
+    # empty assistant content for prompt reconstruction.
+    if not text.strip() or text.strip() == reasoning.strip():
+        return "", None
     if native:
         return text, reasoning
     return f"<think>\n{reasoning}\n</think>\n\n{text}", None
