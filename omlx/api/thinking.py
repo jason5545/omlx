@@ -331,12 +331,10 @@ class ThinkingBudgetProcessor:
         if self._forcing:
             return self._force_next_token(logits, mx)
 
-        if self._in_thinking:
-            self._thinking_tokens += 1
-            if self._thinking_tokens >= self._budget:
-                self._forcing = True
-                self._force_idx = 0
-                return self._force_next_token(logits, mx)
+        if self._in_thinking and self._thinking_tokens >= self._budget:
+            self._forcing = True
+            self._force_idx = 0
+            return self._force_next_token(logits, mx)
 
         return logits
 
@@ -380,6 +378,10 @@ class ThinkingBudgetProcessor:
         # Detect re-entry into thinking (rare but possible)
         if not self._in_thinking and self._think_start_id and token_id == self._think_start_id:
             self._in_thinking = True
+            return
+
+        if self._in_thinking:
+            self._thinking_tokens += 1
 
     def _force_next_token(self, logits, mx):
         """Force the next token in the close-think + trailing sequence."""
