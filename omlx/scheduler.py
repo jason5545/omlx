@@ -2259,11 +2259,13 @@ class Scheduler:
             ),
         )
 
-        # Add thinking budget processor for reasoning models
+        # Add thinking budget processor for reasoning models.  Do not rely
+        # solely on ``needs_think_prefix`` here: prefix/boundary cache can
+        # trim the prompt down to a suffix, so the open-think marker may no
+        # longer be visible even though the chat template enabled thinking.
         if (
             sampling_params.thinking_budget is not None
             and request is not None
-            and getattr(request, "needs_think_prefix", False)
             and not getattr(request, "is_harmony_model", False)
         ):
             think_end_ids = self._resolve_think_end_token_ids()
@@ -2280,6 +2282,11 @@ class Scheduler:
                     trailing_token_ids=trailing_ids,
                 )
                 logits_processors.append(processor)
+                logger.debug(
+                    "Thinking budget processor attached: budget=%d needs_think_prefix=%s",
+                    sampling_params.thinking_budget,
+                    getattr(request, "needs_think_prefix", False),
+                )
 
         # Add grammar constraint processor for structured output.
         # Phase awareness (thinking vs output) is handled by the compiled
