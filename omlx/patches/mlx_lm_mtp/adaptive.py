@@ -13,6 +13,7 @@ class AdaptiveDepthPolicy:
     start_depth: int = 3
     increase_after: int = 1
     decrease_after: int = 2
+    _disable_decrease: bool = False  # experimental: keep depth=max_depth
 
     def __post_init__(self) -> None:
         if self.max_depth < 1:
@@ -45,19 +46,24 @@ class AdaptiveDepthPolicy:
                 action = "increase"
         else:
             self._full_accept_streak = 0
-            rejected_at = accepted_depths + 1
-            if rejected_at <= max(1, previous_depth // 2):
-                self._early_reject_streak += 1
+            if self._disable_decrease:
+                if self.current_depth < self.max_depth:
+                    self.current_depth += 1
+                    action = "increase"
             else:
-                self._early_reject_streak = 0
+                rejected_at = accepted_depths + 1
+                if rejected_at <= max(1, previous_depth // 2):
+                    self._early_reject_streak += 1
+                else:
+                    self._early_reject_streak = 0
 
-            if (
-                self._early_reject_streak >= self.decrease_after
-                and self.current_depth > self.min_depth
-            ):
-                self.current_depth -= 1
-                self._early_reject_streak = 0
-                action = "decrease"
+                if (
+                    self._early_reject_streak >= self.decrease_after
+                    and self.current_depth > self.min_depth
+                ):
+                    self.current_depth -= 1
+                    self._early_reject_streak = 0
+                    action = "decrease"
 
         return {
             "previous_depth": previous_depth,

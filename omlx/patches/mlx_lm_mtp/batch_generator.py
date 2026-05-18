@@ -70,7 +70,6 @@ from .speculative_sampling import (
     acceptance_probability,
     residual_sample,
     sparse_distribution_from_logits as _spec_sparse_dist,
-    sparse_distributions_from_logits as _spec_sparse_dists,
 )
 
 logger = logging.getLogger(__name__)
@@ -345,10 +344,70 @@ def _sparse_distribution_from_logits(
 
 
 def _sparse_distributions_from_logits(
-    logits: Any, sampler: Any
+    logits: Any, sampler: Any, *, stats: Optional["_MtpStats"] = None
 ) -> Optional[list[SparseDistribution]]:
+    """Build sparse target distributions with fine-grained timing."""
+    import time
+
     temp, top_k, top_p = _read_sampler_params(sampler)
-    return _spec_sparse_dists(logits, temp, top_k, top_p)
+    if temp <= 0.0 or top_k <= 0:
+        return None
+
+    import mlx.core as mx
+    import numpy as np
+
+    rows = logits.reshape(-1, logits.shape[-1]).astype(mx.float32)
+    if temp > 0:
+        rows = rows * (1.0 / temp)
+
+    t0 = time.perf_counter()
+    top_idx = mx.argpartition(-rows, kth=top_k - 1, axis=-1)[:, :top_k]
+    top_vals = mx.take_along_axis(rows, top_idx, axis=-1)
+    order = mx.argsort(-top_vals, axis=-1)
+    top_idx = mx.take_along_axis(top_idx, order, axis=-1)
+    top_vals = mx.take_along_axis(top_vals, order, axis=-1)
+    if stats:
+        stats.target_argpart_ms += (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    log_total = mx.logsumexp(rows, axis=-1)
+    top_probs = mx.exp(top_vals - log_total[:, None])
+    if stats:
+        stats.target_logsumexp_ms += (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    mx.eval(top_idx, top_probs)
+    if stats:
+        stats.target_eval_sync_ms += (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    token_rows = np.asarray(top_idx, dtype=np.int64)
+    prob_rows = np.asarray(top_probs, dtype=np.float64)
+    if stats:
+        stats.target_host_ms += (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    if 0.0 < top_p < 1.0:
+        cum_before = np.concatenate((np.zeros((prob_rows.shape[0], 1)), np.cumsum(prob_rows[:, :-1], axis=1)), axis=1)
+        keep = cum_before < top_p
+        keep[:, 0] = True
+        prob_rows = np.where(keep, prob_rows, 0.0)
+    row_sums = prob_rows.sum(axis=1)
+    bad = (~np.isfinite(row_sums)) | (row_sums <= 0)
+    if np.any(bad):
+        prob_rows[bad, :] = 0.0
+        prob_rows[bad, 0] = 1.0
+        row_sums = prob_rows.sum(axis=1)
+    prob_rows = prob_rows / row_sums[:, None]
+
+    distributions: list[SparseDistribution] = []
+    for row_idx in range(token_rows.shape[0]):
+        keep = prob_rows[row_idx] > 0
+        distributions.append(SparseDistribution(token_rows[row_idx, keep], prob_rows[row_idx, keep], int(rows.shape[-1])))
+    if stats:
+        stats.target_post_ms += (time.perf_counter() - t0) * 1000
+
+    return distributions
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +446,12 @@ class _MtpStats:
     # Fine-grained timing
     target_dist_ms: float = 0.0  # building _sparse_distributions_from_logits
     target_eval_count: int = 0  # mx.eval() in target dist building
+    target_proc_ms: float = 0.0  # logit processors per row
+    target_argpart_ms: float = 0.0  # argpartition + take_along + argsort
+    target_logsumexp_ms: float = 0.0  # logsumexp + exp
+    target_eval_sync_ms: float = 0.0  # mx.eval() call itself
+    target_host_ms: float = 0.0  # np.asarray host transfer
+    target_post_ms: float = 0.0  # top-p / row postprocess
     draft_dist_ms: float = 0.0  # cumulative time in draft dist building
     draft_eval_count: int = 0  # mx.eval() in draft dist building
     accept_walk_ms: float = 0.0  # per-depth acceptance loop
@@ -394,6 +459,18 @@ class _MtpStats:
     cache_snapshot_ms: float = 0.0  # pre-backbone snapshot
     cache_rollback_ms: float = 0.0  # rollback after reject
     cache_commit_ms: float = 0.0  # post-accept cache ops
+    cache_full_accept_cycles: int = 0  # cycles where all drafts accepted
+    cache_reject_cycles: int = 0  # cycles with rejection
+    cache_full_accept_ms: float = 0.0  # cache time during full-accept cycles
+    cache_reject_ms: float = 0.0  # cache time during reject cycles
+    cache_trim_token_ms: float = 0.0  # trim_token_buffer overhead
+    cache_replay_ms: float = 0.0  # fallback backbone replay after reject
+    cache_spec_rollback_ms: float = 0.0  # rollback_speculative_cache path
+    cache_fallback_replay_count: int = 0  # fallback replay invocations
+    cache_spec_rollback_count: int = 0  # gdn_states-based rollback invocations
+    cache_mtp_trim_ms: float = 0.0  # trim MTP cache
+    cache_layer_count: int = 0  # number of cache layers
+    gdn_layer_count: int = 0  # layers with GDN/SSM (conv+delta)
 
 
 @dataclass
@@ -743,20 +820,32 @@ def _draft_block_from(
     *,
     depth: int,
 ) -> List[Tuple[Any, Any, Any, int]]:
-    """Draft up to ``depth`` tokens using native MTP hidden state chaining."""
+    """Draft up to ``depth`` tokens using native MTP hidden state chaining.
+
+    Draft distribution building is deferred to the end so all per-position
+    logits are converted to sparse distributions with a single ``mx.eval()``
+    instead of one per draft token.
+    """
     import time
 
     import mlx.core as mx
 
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
-    drafts: List[Tuple[Any, Any, Any, int]] = []
     current_hidden = hidden_at_position
     current_token = _ensure_uint32(next_main_tok)
     processor_context = prev_buf
     base_offset = state.position
 
-    for depth_index in range(max(1, int(depth))):
+    # First pass: run MTP head forwards, select draft tokens via argmax
+    # so we don't need mx.eval() per position.  Collect logits for batched
+    # distribution building at the end.
+    collected_logits: list = []
+    draft_tokens: list = []
+    draft_ids: list[int] = []
+    actual_depth = max(1, int(depth))
+
+    for depth_index in range(actual_depth):
         t0 = time.perf_counter()
         with mx.stream(_get_generation_stream()):
             mtp_logits, mtp_hidden = _call_mtp_head(
@@ -778,36 +867,50 @@ def _draft_block_from(
             prev_with_current = None
         t_mtp_done = time.perf_counter()
         state.stats.mtp_head_ms += (t_mtp_done - t0) * 1000
-        sparse_dist = _sparse_distribution_from_logits(mtp_logits_2d, sampler)
-        if sparse_dist is not None:
-            draft_id = sparse_dist.sample()
-            draft_tok = mx.array([draft_id], dtype=mx.uint32)
+
+        # Use argmax for next-MTP-forward token selection (deterministic,
+        # no mx.eval needed).  The actual draft distribution for acceptance
+        # is built in batch below.
+        draft_id = int(mx.argmax(mtp_logits_2d, axis=-1).tolist()[0])
+        draft_tok_1 = mx.array([draft_id], dtype=mx.uint32)
+        collected_logits.append(mtp_logits_2d)
+        draft_tokens.append(draft_tok_1)
+        draft_ids.append(draft_id)
+
+        if depth_index >= actual_depth - 1 or mtp_hidden is None:
+            break
+        current_hidden = mtp_hidden[:, -1:, :]
+        current_token = draft_tok_1
+        processor_context = prev_with_current
+
+    # Second pass: build all sparse distributions in one batch (single mx.eval)
+    t_dist = time.perf_counter()
+    combined_logits = mx.concatenate([lt.reshape(1, -1) for lt in collected_logits], axis=0)
+    sparse_dists = _sparse_distributions_from_logits(combined_logits, sampler)
+    state.stats.draft_dist_ms += (time.perf_counter() - t_dist) * 1000
+    state.stats.draft_eval_count += 1  # single batched mx.eval
+    state.stats.mx_eval_count += 1  # count in total
+
+    # Assemble draft entries
+    drafts: List[Tuple[Any, Any, Any, int]] = []
+    for idx, draft_id in enumerate(draft_ids):
+        if sparse_dists is not None and idx < len(sparse_dists):
+            draft_accept_lp = sparse_dists[idx]
             draft_lp_1d = None
-            draft_accept_lp_1d = sparse_dist
-            state.stats.draft_dist_ms += (time.perf_counter() - t_mtp_done) * 1000
-            state.stats.draft_eval_count += 1
         else:
-            draft_lp_2d = _logprobs(mtp_logits_2d)
-            draft_tok = sampler(draft_lp_2d)
+            # Fallback: full-vocab (should not happen with top_k>0)
+            draft_lp_2d = _logprobs(combined_logits[idx : idx + 1])
             draft_accept_lp_2d = _accept_lp_for(sampler, draft_lp_2d)
-            draft_id = int(draft_tok.tolist()[0])
             draft_lp_1d = draft_lp_2d.squeeze(0)
-            draft_accept_lp_1d = draft_accept_lp_2d.squeeze(0)
-            state.stats.draft_dist_ms += (time.perf_counter() - t_mtp_done) * 1000
+            draft_accept_lp = draft_accept_lp_2d.squeeze(0)
         drafts.append(
             (
-                _ensure_uint32(draft_tok),
+                _ensure_uint32(draft_tokens[idx]),
                 draft_lp_1d,
-                draft_accept_lp_1d,
+                draft_accept_lp,
                 draft_id,
             )
         )
-
-        if depth_index >= depth - 1 or mtp_hidden is None:
-            break
-        current_hidden = mtp_hidden[:, -1:, :]
-        current_token = _ensure_uint32(draft_tok)
-        processor_context = prev_with_current
 
     return drafts
 
@@ -954,8 +1057,11 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         "accept_by_depth=%s draft_by_depth=%s "
         "emits[init=%d,draft=%d,bonus=%d,verify=%d] "
         "timing[backbone=%.1fms mtp=%.1fms sample=%.1fms "
-        "tdist=%.1fms ddist=%.1fms walk=%.1fms "
-        "cache=%.1fms snap=%.1fms rollback=%.1fms commit=%.1fms "
+        "tdist=%.1fms(tproc=%.1f argp=%.1f lse=%.1f eval=%.1f host=%.1f post=%.1f) "
+        "ddist=%.1fms walk=%.1fms "
+        "cache=%.1fms(full=%.1f/%d rej=%.1f/%d rollback=%.1f commit=%.1f "
+        "replay=%.1f spec_rb=%.1f trimtok=%.1f mtptrim=%.1f "
+        "layers=%d gdn=%d fb_replay=%d spec_rb_count=%d) "
         "evals[target=%d draft=%d total=%d]]",
         uid,
         finish_reason,
@@ -978,12 +1084,29 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         stats.mtp_head_ms,
         stats.sample_ms,
         stats.target_dist_ms,
+        stats.target_proc_ms,
+        stats.target_argpart_ms,
+        stats.target_logsumexp_ms,
+        stats.target_eval_sync_ms,
+        stats.target_host_ms,
+        stats.target_post_ms,
         stats.draft_dist_ms,
         stats.accept_walk_ms,
         stats.cache_ops_ms,
-        stats.cache_snapshot_ms,
+        stats.cache_full_accept_ms,
+        stats.cache_full_accept_cycles,
+        stats.cache_reject_ms,
+        stats.cache_reject_cycles,
         stats.cache_rollback_ms,
         stats.cache_commit_ms,
+        stats.cache_replay_ms,
+        stats.cache_spec_rollback_ms,
+        stats.cache_trim_token_ms,
+        stats.cache_mtp_trim_ms,
+        stats.cache_layer_count,
+        stats.gdn_layer_count,
+        stats.cache_fallback_replay_count,
+        stats.cache_spec_rollback_count,
         stats.target_eval_count,
         stats.draft_eval_count,
         stats.mx_eval_count,
@@ -1049,8 +1172,9 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
             logits_2d = _apply_processors(procs, prev_contexts[idx], logits_2d)
         processed_logits.append(logits_2d)
     combined_logits = mx.concatenate(processed_logits, axis=0)
+    state.stats.target_proc_ms += (time.perf_counter() - t0) * 1000
     t1 = time.perf_counter()
-    sparse_targets = _sparse_distributions_from_logits(combined_logits, sampler)
+    sparse_targets = _sparse_distributions_from_logits(combined_logits, sampler, stats=state.stats)
     state.stats.target_dist_ms += (time.perf_counter() - t1) * 1000
     # Count mx.eval() inside _batched_top_k_from_logits (1 eval)
     state.stats.target_eval_count += 1
@@ -1123,9 +1247,8 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         break
     state.stats.accept_walk_ms += (time.perf_counter() - t2) * 1000
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
-    # Count mx.eval() in draft dist building (draft_count evals happened
-    # inside _draft_block_from called at end of PREVIOUS cycle)
-    state.stats.mx_eval_count += draft_count
+    # All mx.eval() in _draft_block_from is batched into 1 call per cycle
+    state.stats.mx_eval_count += 0  # draft evals counted inside _draft_block_from
 
     prev_depth = draft_count
     state.stats.cycles += 1
@@ -1133,10 +1256,21 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     state.stats.accepts += accepted_count
     if accepted_count < draft_count:
         state.stats.rejects += 1
+        state.stats.cache_reject_cycles += 1
     else:
         state.stats.full_accepts += 1
+        state.stats.cache_full_accept_cycles += 1
 
     state.position += 1  # the main (confirmed) token advances position
+
+    # Count cache layers once (first cycle only)
+    if state.stats.cache_layer_count == 0 and gen_batch.prompt_cache:
+        state.stats.cache_layer_count = len(gen_batch.prompt_cache)
+        gdn_count = 0
+        for c in gen_batch.prompt_cache:
+            if hasattr(c, "rollback_state"):
+                gdn_count += 1
+        state.stats.gdn_layer_count = gdn_count
 
     if state.adaptive_policy is not None:
         decision = state.adaptive_policy.observe(
@@ -1166,10 +1300,11 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         state.stats.max_depth = max(state.stats.max_depth, state.draft_depth)
 
     if accepted_count == draft_count:
-        t0 = time.perf_counter()
+        t_cache = time.perf_counter()
         _clear_rollback(gen_batch.prompt_cache)
-        state.stats.cache_commit_ms += (time.perf_counter() - t0) * 1000
-        state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
+        state.stats.cache_commit_ms += (time.perf_counter() - t_cache) * 1000
+        state.stats.cache_full_accept_ms += (time.perf_counter() - t_cache) * 1000
+        state.stats.cache_ops_ms += (time.perf_counter() - t_cache) * 1000
 
         bonus_tok = mx.array([target_ids[draft_count]], dtype=mx.uint32)
         bonus_lp_1d = (
@@ -1194,7 +1329,8 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         return
 
     # Reject path
-    t0 = time.perf_counter()
+    t_cache = time.perf_counter()
+    t_rollback = time.perf_counter()
     if not _rollback_after_reject(
         gen_batch.model,
         gen_batch.prompt_cache,
@@ -1205,22 +1341,64 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         if procs is not None:
             _trim_token_buffer(gen_batch, draft_count - accepted_count)
         raise _MtpStepFallback("cache layer rejects rollback")
+    state.stats.cache_rollback_ms += (time.perf_counter() - t_rollback) * 1000
+
+    t_trim = time.perf_counter()
     if procs is not None:
         _trim_token_buffer(gen_batch, draft_count - accepted_count)
+    state.stats.cache_trim_token_ms += (time.perf_counter() - t_trim) * 1000
+
+    t_mtp = time.perf_counter()
     mtp_trim = max(0, draft_count - (accepted_count + 1))
     if not _trim_mtp_cache(state.mtp_cache, mtp_trim):
         raise _MtpStepFallback("MTP cache rejects rollback")
+    state.stats.cache_mtp_trim_ms += (time.perf_counter() - t_mtp) * 1000
 
     if accepted_count > 0:
-        replay_tokens = mx.concatenate(state.draft_toks[:accepted_count])
-        with mx.stream(_get_generation_stream()):
-            replay_logits, replay_hidden, _ = _call_backbone(
-                gen_batch.model,
-                replay_tokens[None, :],
-                gen_batch.prompt_cache,
-            )
-            mx.eval(replay_logits, replay_hidden)
-    state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
+        # Prefer model's native rollback_speculative_cache (mlx-vlm / MTPLX) to
+        # fix GDN state from captured gdn_states without a full backbone replay.
+        # Fall back to traditional backbone replay when the API is unavailable.
+        can_rollback_speculative = (
+            gdn_states is not None
+            and hasattr(gen_batch.model, "rollback_speculative_cache")
+        )
+        if can_rollback_speculative:
+            t_spec = time.perf_counter()
+            try:
+                gen_batch.model.rollback_speculative_cache(
+                    gen_batch.prompt_cache, gdn_states,
+                    accepted=accepted_count, block_size=draft_count + 1,
+                )
+                state.stats.cache_spec_rollback_ms += (time.perf_counter() - t_spec) * 1000
+                state.stats.cache_spec_rollback_count += 1
+            except Exception:
+                # If the speculative rollback fails, fall back to backbone replay.
+                t_replay = time.perf_counter()
+                replay_tokens = mx.concatenate(state.draft_toks[:accepted_count])
+                with mx.stream(_get_generation_stream()):
+                    replay_logits, replay_hidden, _ = _call_backbone(
+                        gen_batch.model,
+                        replay_tokens[None, :],
+                        gen_batch.prompt_cache,
+                    )
+                    mx.eval(replay_logits, replay_hidden)
+                state.stats.cache_replay_ms += (time.perf_counter() - t_replay) * 1000
+                state.stats.cache_fallback_replay_count += 1
+        else:
+            t_replay = time.perf_counter()
+            replay_tokens = mx.concatenate(state.draft_toks[:accepted_count])
+            with mx.stream(_get_generation_stream()):
+                replay_logits, replay_hidden, _ = _call_backbone(
+                    gen_batch.model,
+                    replay_tokens[None, :],
+                    gen_batch.prompt_cache,
+                )
+                mx.eval(replay_logits, replay_hidden)
+            state.stats.cache_replay_ms += (time.perf_counter() - t_replay) * 1000
+            state.stats.cache_fallback_replay_count += 1
+
+    state.stats.cache_reject_ms += (time.perf_counter() - t_cache) * 1000
+    state.stats.cache_ops_ms += (time.perf_counter() - t_cache) * 1000
 
     if rejection_correction is None:
         raise _MtpStepFallback("reject path missing correction token")
