@@ -1189,9 +1189,41 @@ def _resolve_thinking_budget(
     model_id: str | None,
     request_policy: dict[str, Any] | None = None,
 ) -> int | None:
-    """Resolve thinking budget: request param > model settings > None."""
+    """Resolve thinking budget from request / policy / model settings.
+
+    Priority: request ``thinking_budget`` > request ``reasoning_effort`` >
+    ``chat_template_kwargs["reasoning_effort"]`` > sub-key policy >
+    model settings > Anthropic ``thinking.budget_tokens``.
+    """
     if request_policy and _bool_or_none(request_policy.get("enable_thinking")) is False:
         return None
+
+    # Explicit token budget
+    req_budget = getattr(request, 'thinking_budget', None)
+    if req_budget is not None:
+        return req_budget
+
+    # reasoning_effort from request body (vendor extension — Pi Agent sends this)
+    effort_value: str | None = None
+    req_effort = getattr(request, 'reasoning_effort', None)
+    if req_effort:
+        effort_value = req_effort
+
+    # chat_template_kwargs.reasoning_effort
+    if not effort_value:
+        ct_kwargs = getattr(request, 'chat_template_kwargs', None) or {}
+        ct_effort = ct_kwargs.get("reasoning_effort")
+        if ct_effort:
+            effort_value = ct_effort
+
+    if effort_value:
+        from .api.thinking import parse_reasoning_effort, resolve_effort_to_budget
+        effort = parse_reasoning_effort(effort_value)
+        if effort is not None:
+            model_type = _get_model_type_for_effort(model_id)
+            return resolve_effort_to_budget(effort, model_type)
+
+    # Sub-key policy thinking_budget_tokens
     policy_budget = (
         _positive_int_or_none(request_policy.get("thinking_budget_tokens"))
         if request_policy
@@ -1199,20 +1231,55 @@ def _resolve_thinking_budget(
     )
     if policy_budget is not None:
         return policy_budget
-    # Check request-level override (OpenAI format)
-    req_budget = getattr(request, 'thinking_budget', None)
-    # For Anthropic: check thinking.budget_tokens
-    if req_budget is None and hasattr(request, 'thinking') and request.thinking:
-        req_budget = getattr(request.thinking, 'budget_tokens', None)
-    if req_budget is not None:
-        return req_budget
-    # Check model settings
+
+    # Model settings
     resolved = resolve_model_id(model_id)
     if resolved and _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(resolved)
         if ms.thinking_budget_enabled and ms.thinking_budget_tokens:
             return ms.thinking_budget_tokens
+
+    # Anthropic thinking.budget_tokens
+    if hasattr(request, 'thinking') and request.thinking:
+        req_budget = getattr(request.thinking, 'budget_tokens', None)
+        if req_budget is not None:
+            return req_budget
+
     return None
+
+
+def _get_model_type_for_effort(model_id: str | None) -> str | None:
+    """Return a model-type key for effort profile lookup."""
+    if not model_id:
+        return None
+    pool = _server_state.engine_pool
+    if pool is None:
+        return None
+    resolved = pool.resolve_model_id(model_id, _server_state.settings_manager)
+    entry = pool.get_entry(resolved)
+    if entry is None:
+        return None
+    cmt = getattr(entry, "config_model_type", "") or ""
+    return cmt.lower() if cmt else None
+
+
+def _resolve_soft_pressure_from_request(
+    request,
+    model_id: str | None,
+) -> tuple[float | None, float]:
+    """Resolve soft-pressure params when ``reasoning_effort`` was used."""
+    effort_str = getattr(request, 'reasoning_effort', None)
+    if not effort_str:
+        ct_kwargs = getattr(request, 'chat_template_kwargs', None) or {}
+        effort_str = ct_kwargs.get("reasoning_effort")
+    if not effort_str:
+        return None, 0.0
+    from .api.thinking import parse_reasoning_effort, resolve_effort_soft_pressure
+    effort = parse_reasoning_effort(effort_str)
+    if effort is None:
+        return None, 0.0
+    model_type = _get_model_type_for_effort(model_id)
+    return resolve_effort_soft_pressure(effort, model_type)
 
 
 def resolve_model_id(model_id: str | None) -> str | None:
@@ -2373,8 +2440,11 @@ async def create_chat_completion(
     # Resolve the thinking budget before message extraction so historical
     # reasoning can be handled conservatively when a per-turn budget is active.
     thinking_budget = _resolve_thinking_budget(
-        request, request.model, request_policy=request_policy
+        request, request.model, request_policy=request_policy,
     )
+    thinking_soft_start_ratio, thinking_soft_max_bias = _resolve_soft_pressure_from_request(
+        request, resolved_model,
+    ) if thinking_budget is not None else (None, 0.0)
 
     # Extract messages - different engines need different content handling.
     # Templates that expose message.reasoning_content natively (Qwen 3.6+)
@@ -2497,6 +2567,9 @@ async def create_chat_completion(
     # Add thinking budget if applicable
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
+        if thinking_soft_start_ratio is not None:
+            chat_kwargs["thinking_soft_start_ratio"] = thinking_soft_start_ratio
+            chat_kwargs["thinking_soft_max_bias"] = thinking_soft_max_bias
 
     # Auto-set enable_thinking in chat template kwargs when a thinking
     # budget is active (from request or model settings).  Some chat
@@ -3791,10 +3864,16 @@ async def create_anthropic_message(
 
     # Add thinking budget if applicable
     thinking_budget = _resolve_thinking_budget(
-        request, request.model, request_policy=request_policy
+        request, request.model, request_policy=request_policy,
     )
+    thinking_soft_start_ratio, thinking_soft_max_bias = _resolve_soft_pressure_from_request(
+        request, resolved_model or request.model,
+    ) if thinking_budget is not None else (None, 0.0)
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
+        if thinking_soft_start_ratio is not None:
+            chat_kwargs["thinking_soft_start_ratio"] = thinking_soft_start_ratio
+            chat_kwargs["thinking_soft_max_bias"] = thinking_soft_max_bias
 
     # Auto-set enable_thinking in chat template kwargs when a thinking
     # budget is active but enable_thinking was not already set (e.g. via
@@ -4238,10 +4317,16 @@ async def create_response(
 
     # Add thinking budget if applicable
     thinking_budget = _resolve_thinking_budget(
-        request, request.model, request_policy=request_policy
+        request, request.model, request_policy=request_policy,
     )
+    thinking_soft_start_ratio, thinking_soft_max_bias = _resolve_soft_pressure_from_request(
+        request, resolved_model or request.model,
+    ) if thinking_budget is not None else (None, 0.0)
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
+        if thinking_soft_start_ratio is not None:
+            chat_kwargs["thinking_soft_start_ratio"] = thinking_soft_start_ratio
+            chat_kwargs["thinking_soft_max_bias"] = thinking_soft_max_bias
 
     # Auto-set enable_thinking when thinking budget is active.
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:

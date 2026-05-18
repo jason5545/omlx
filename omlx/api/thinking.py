@@ -7,11 +7,23 @@ interfaces for separating reasoning content from regular response content.
 
 Used by reasoning models like DeepSeek R1, Qwen3/3.5, MiniMax that wrap
 their chain-of-thought reasoning in <think>...</think> tags.
+
+Reasoning effort abstraction
+----------------------------
+``ReasoningEffort`` maps high-level effort levels (``low`` / ``medium`` /
+``high`` / ``xhigh`` / ``native`` / ``off``) to concrete token budgets via
+per-model-type ``ReasoningEffortProfile`` entries.  The profile also controls
+soft-pressure behaviour so the model can close thinking naturally before the
+hard budget is reached, rather than being cut off abruptly.
 """
 
+import logging
 import re
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
 
+logger = logging.getLogger(__name__)
 
 # Tags used for thinking blocks
 _OPEN_TAG = "<think>"
@@ -253,12 +265,201 @@ class ThinkingParser:
         return False
 
 
+class ReasoningEffort(str, Enum):
+    """High-level reasoning depth, analogous to OpenAI's ``reasoning_effort``.
+
+    Values:
+        OFF:    Thinking disabled entirely (no budget, no ``<think>``).
+        LOW:    Shallow thinking (~256 tokens).
+        MEDIUM: Moderate thinking (~512 tokens).
+        HIGH:   Deep thinking (~1024 tokens).
+        XHIGH:  Maximum thinking (~2048 tokens).
+        NATIVE: No budget — the model thinks as long as it wants.
+    """
+    OFF = "off"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    NATIVE = "native"
+
+
+@dataclass
+class ReasoningEffortProfile:
+    """Per-effort token budget and soft-pressure parameters.
+
+    The budget is the hard cap after which ``</think>`` is force-injected.
+    The soft-pressure range (``soft_start_ratio`` to 1.0) applies a
+    gradually increasing logit bias toward ``</think>`` so the model can
+    close thinking naturally before the hard cut.
+
+    Attributes:
+        budget: Token budget for this effort level.
+        soft_start_ratio: Fraction of budget where soft pressure begins
+            (e.g. 0.75 → bias starts at 75 % of budget). ``None`` disables
+            soft pressure for this level (hard-close only).
+        soft_max_bias: Logit bias strength at budget edge (default 5.0).
+    """
+    budget: int
+    soft_start_ratio: float | None = 0.75
+    soft_max_bias: float = 5.0
+
+
+# ---------------------------------------------------------------------------
+# Default per-model-type effort profiles.
+# These are conservative for Qwen-style dense models; larger / MoE models
+# (DeepSeek, GLM) may benefit from higher budgets.
+# ---------------------------------------------------------------------------
+DEFAULT_EFFORT_PROFILES: Dict[str, Dict[str, ReasoningEffortProfile]] = {
+    # Qwen 3.5 / 3.6 family — dense 27B model
+    "qwen3_5": {
+        "low":    ReasoningEffortProfile(budget=256),
+        "medium": ReasoningEffortProfile(budget=512),
+        "high":   ReasoningEffortProfile(budget=1024),
+        "xhigh":  ReasoningEffortProfile(budget=2048),
+    },
+    "qwen3_6": {
+        "low":    ReasoningEffortProfile(budget=256),
+        "medium": ReasoningEffortProfile(budget=512),
+        "high":   ReasoningEffortProfile(budget=1024),
+        "xhigh":  ReasoningEffortProfile(budget=2048),
+    },
+    # Qwen 4 family — larger context, may need more thinking depth
+    "qwen4": {
+        "low":    ReasoningEffortProfile(budget=512),
+        "medium": ReasoningEffortProfile(budget=1024),
+        "high":   ReasoningEffortProfile(budget=2048),
+        "xhigh":  ReasoningEffortProfile(budget=4096),
+    },
+    # DeepSeek V3 / V4 family — MoE models
+    "deepseek_v3": {
+        "low":    ReasoningEffortProfile(budget=512),
+        "medium": ReasoningEffortProfile(budget=1024),
+        "high":   ReasoningEffortProfile(budget=2048),
+        "xhigh":  ReasoningEffortProfile(budget=4096),
+    },
+    "deepseek_v4": {
+        "low":    ReasoningEffortProfile(budget=512),
+        "medium": ReasoningEffortProfile(budget=1024),
+        "high":   ReasoningEffortProfile(budget=2048),
+        "xhigh":  ReasoningEffortProfile(budget=4096),
+    },
+    # GLM-4 / GLM-5 family
+    "glm4": {
+        "low":    ReasoningEffortProfile(budget=256),
+        "medium": ReasoningEffortProfile(budget=512),
+        "high":   ReasoningEffortProfile(budget=1024),
+        "xhigh":  ReasoningEffortProfile(budget=2048),
+    },
+    "glm5": {
+        "low":    ReasoningEffortProfile(budget=512),
+        "medium": ReasoningEffortProfile(budget=1024),
+        "high":   ReasoningEffortProfile(budget=2048),
+        "xhigh":  ReasoningEffortProfile(budget=4096),
+    },
+}
+
+# Catch-all default for unknown model types
+_DEFAULT_EFFORT_PROFILE: Dict[str, ReasoningEffortProfile] = {
+    "low":    ReasoningEffortProfile(budget=256),
+    "medium": ReasoningEffortProfile(budget=512),
+    "high":   ReasoningEffortProfile(budget=1024),
+    "xhigh":  ReasoningEffortProfile(budget=2048),
+}
+
+
+def resolve_effort_to_budget(
+    effort: ReasoningEffort,
+    model_type: str | None = None,
+    custom_profile: Dict[str, int] | None = None,
+) -> int | None:
+    """Resolve a reasoning effort level to a concrete token budget.
+
+    Args:
+        effort: The effort level.
+        model_type: Model type key (e.g. ``"qwen3_6"``) for per-model defaults.
+        custom_profile: Per-model override mapping from effort name to budget
+            (e.g. ``{"low": 128, "high": 512}``).  When provided, this takes
+            precedence over the built-in default profiles.
+
+    Returns:
+        Token budget integer, or ``None`` for ``OFF`` / ``NATIVE``.
+    """
+    if effort in (ReasoningEffort.OFF, ReasoningEffort.NATIVE):
+        return None
+
+    effort_key = effort.value  # "low", "medium", "high", "xhigh"
+
+    # 1. Custom per-model profile
+    if custom_profile and effort_key in custom_profile:
+        return custom_profile[effort_key]
+
+    # 2. Built-in per-model-type profile
+    profiles = DEFAULT_EFFORT_PROFILES.get(model_type or "", {})
+    if effort_key in profiles:
+        return profiles[effort_key].budget
+
+    # 3. Global default
+    return _DEFAULT_EFFORT_PROFILE.get(effort_key, ReasoningEffortProfile(budget=512)).budget
+
+
+def resolve_effort_soft_pressure(
+    effort: ReasoningEffort,
+    model_type: str | None = None,
+) -> tuple[float | None, float]:
+    """Return ``(soft_start_ratio, soft_max_bias)`` for an effort level.
+
+    Returns ``(None, 0.0)`` when soft pressure is disabled.
+    """
+    if effort in (ReasoningEffort.OFF, ReasoningEffort.NATIVE):
+        return None, 0.0
+
+    effort_key = effort.value
+    profiles = DEFAULT_EFFORT_PROFILES.get(model_type or "", {})
+    profile = profiles.get(effort_key, _DEFAULT_EFFORT_PROFILE.get(effort_key))
+    if profile is None:
+        return None, 0.0
+    return profile.soft_start_ratio, profile.soft_max_bias
+
+
+def parse_reasoning_effort(value: str | None) -> ReasoningEffort | None:
+    """Parse a string into a ReasoningEffort enum value.
+
+    Accepts case-insensitive names and common aliases:
+    ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, ``"native"``,
+    ``"off"``, ``"none"``, ``"disabled"``, ``"minimal"``, ``"maximum"``.
+
+    Returns ``None`` if the value is unrecognised or empty.
+    """
+    if not value:
+        return None
+    value = value.strip().lower()
+    # Direct enum match
+    try:
+        return ReasoningEffort(value)
+    except ValueError:
+        pass
+    # Common aliases
+    aliases: Dict[str, ReasoningEffort] = {
+        "none":     ReasoningEffort.OFF,
+        "disabled": ReasoningEffort.OFF,
+        "minimal":  ReasoningEffort.LOW,
+        "maximum":  ReasoningEffort.XHIGH,
+    }
+    return aliases.get(value)
+
+
 class ThinkingBudgetProcessor:
     """Logits processor that enforces a thinking token budget.
 
     Counts tokens generated while in thinking mode.  When the budget is
     exceeded, forces the close-think token(s) one at a time, then becomes
     a no-op for the rest of generation.
+
+    When a soft-pressure zone is configured (``soft_start_ratio``), a
+    gradually increasing logit bias is applied toward the ``</think>``
+    token(s) before the hard budget, giving the model a chance to close
+    thinking naturally rather than being abruptly cut off.
 
     Handles both single-token and multi-token close-think sequences, and
     supports alternative think markers (e.g. ``<longcat_think>``).
@@ -267,6 +468,9 @@ class ThinkingBudgetProcessor:
         think_end_token_ids: Token ID(s) for the close-think tag.
         budget: Maximum number of thinking tokens before forcing close.
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
+        soft_start_ratio: Fraction of budget where soft pressure begins
+            (e.g. 0.75). ``None`` disables soft pressure.
+        soft_max_bias: Maximum logit bias at the budget edge.
     """
 
     def __init__(
@@ -276,6 +480,9 @@ class ThinkingBudgetProcessor:
         think_start_token_id: Optional[int] = None,
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
+        *,
+        soft_start_ratio: float | None = 0.75,
+        soft_max_bias: float = 5.0,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -286,6 +493,17 @@ class ThinkingBudgetProcessor:
         )
         self._budget = budget
         self._think_start_id = think_start_token_id
+
+        # Soft-pressure: apply increasing bias toward </think> in the zone
+        # [budget * soft_start_ratio, budget].  None disables soft pressure.
+        self._soft_start: int | None
+        self._soft_max_bias: float
+        if soft_start_ratio is not None and soft_max_bias > 0 and budget > 0:
+            self._soft_start = max(1, int(budget * soft_start_ratio))
+            self._soft_max_bias = soft_max_bias
+        else:
+            self._soft_start = None
+            self._soft_max_bias = 0.0
 
         # State
         self._thinking_tokens: int = 0
@@ -320,7 +538,7 @@ class ThinkingBudgetProcessor:
         if not self._external_accept_sync:
             self.sync_accepted_tokens(tokens)
 
-        # If state changed by _update_state, handle immediately
+        # Re-check flags — _update_state may have set them
         if self._done:
             return logits
         if self._suppress_end:
@@ -329,10 +547,19 @@ class ThinkingBudgetProcessor:
         if self._forcing:
             return self._force_next_token(logits, mx)
 
+        # Hard budget exceeded → force close sequence
         if self._in_thinking and self._thinking_tokens >= self._budget:
             self._forcing = True
             self._force_idx = 0
             return self._force_next_token(logits, mx)
+
+        # Soft-pressure zone: apply gradual bias toward </think>
+        if (
+            self._in_thinking
+            and self._soft_start is not None
+            and self._thinking_tokens >= self._soft_start
+        ):
+            return self._apply_soft_pressure(logits, mx)
 
         return logits
 
@@ -409,6 +636,26 @@ class ThinkingBudgetProcessor:
         forced = mx.full(logits.shape, float("-inf"))
         forced[..., target_id] = 0.0
         return forced
+
+    def _apply_soft_pressure(self, logits, mx):
+        """Apply gradually increasing logit bias toward close-think tokens.
+
+        The bias scales linearly from 0 at ``_soft_start`` to
+        ``_soft_max_bias`` at ``_budget``.  This encourages the model to
+        close thinking naturally rather than being abruptly cut off.
+        The bias is applied to every end-token ID so both ``</think>`` and
+        alternate end markers (e.g. ``</longcat_think>``) are nudged.
+        """
+        if self._soft_start is None or self._budget <= self._soft_start:
+            return logits
+        # Linear interpolation: 0 → soft_max_bias
+        progress = (self._thinking_tokens - self._soft_start) / (
+            self._budget - self._soft_start
+        )
+        bias = self._soft_max_bias * min(progress, 1.0)
+        for tid in self._end_id_set:
+            logits[..., tid] = logits[..., tid] + bias
+        return logits
 
     def _suppress_end_tokens(self, logits, mx):
         """Suppress duplicate </think> tokens after forced close."""

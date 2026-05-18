@@ -248,6 +248,8 @@ class ChatCompletionRequest(BaseModel):
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = None
+    # Reasoning effort level (vendor extension): "off", "low", "medium", "high", "xhigh", "native"
+    reasoning_effort: Optional[str] = None
     # SpecPrefill: per-request enable/disable (None = use model setting)
     specprefill: Optional[bool] = None
     # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)

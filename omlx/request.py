@@ -73,6 +73,11 @@ class SamplingParams:
     # Thinking budget (None = unlimited thinking)
     thinking_budget: Optional[int] = None
 
+    # Soft-pressure zone: encourage model to close thinking naturally
+    # before the hard budget is reached.  ``None`` disables.
+    thinking_soft_start_ratio: Optional[float] = None  # e.g. 0.75
+    thinking_soft_max_bias: float = 0.0  # Logit bias at budget edge
+
     # Compiled grammar for constrained decoding (xgrammar CompiledGrammar).
     # Typed as Any to avoid a hard dependency on xgrammar at import time.
     compiled_grammar: Any = None

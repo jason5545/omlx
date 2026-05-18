@@ -497,6 +497,8 @@ class BatchedEngine(BaseEngine):
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
+            thinking_soft_start_ratio=kwargs.get("thinking_soft_start_ratio"),
+            thinking_soft_max_bias=kwargs.get("thinking_soft_max_bias", 0.0),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
@@ -566,6 +568,8 @@ class BatchedEngine(BaseEngine):
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
+            thinking_soft_start_ratio=kwargs.get("thinking_soft_start_ratio"),
+            thinking_soft_max_bias=kwargs.get("thinking_soft_max_bias", 0.0),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )

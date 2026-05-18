@@ -2280,12 +2280,17 @@ class Scheduler:
                     think_start_token_id=think_start_id,
                     leading_token_ids=leading_ids,
                     trailing_token_ids=trailing_ids,
+                    soft_start_ratio=sampling_params.thinking_soft_start_ratio,
+                    soft_max_bias=sampling_params.thinking_soft_max_bias,
                 )
                 logits_processors.append(processor)
                 logger.info(
-                    "Thinking budget processor attached: budget=%d needs_think_prefix=%s",
+                    "Thinking budget processor attached: budget=%d needs_think_prefix=%s soft_start=%s",
                     sampling_params.thinking_budget,
                     getattr(request, "needs_think_prefix", False),
+                    "%.0f%%" % (sampling_params.thinking_soft_start_ratio * 100)
+                    if sampling_params.thinking_soft_start_ratio
+                    else "off",
                 )
 
         # Add grammar constraint processor for structured output.
