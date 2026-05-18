@@ -106,7 +106,8 @@ def apply() -> bool:
         original_init(self, *args, **kwargs)
         if _is_mtp_eligible(self):
             try:
-                _post_init_mtp(self)
+                init_input_len = len(self.tokens[0]) if hasattr(self, 'tokens') and self.tokens else 0
+                _post_init_mtp(self, init_input_len=init_input_len)
                 logger.info(
                     "MTP path activated for uid=%s (model has mtp_forward, batch=1)",
                     getattr(self, "uids", ["?"])[0],
@@ -468,6 +469,11 @@ class _MtpStats:
     cache_spec_rollback_ms: float = 0.0  # rollback_speculative_cache path
     cache_fallback_replay_count: int = 0  # fallback replay invocations
     cache_spec_rollback_count: int = 0  # gdn_states-based rollback invocations
+    # Position diagnostics
+    init_input_len: int = 0  # len(tokens[0]) at init (may be 1 for VLM/cache-resume)
+    true_base_offset: int = 0  # rope base position at last cycle
+    state_position: int = 0  # state.position at last cycle
+    total_emitted_tokens: int = 0  # init+draft+bonus+verify
     cache_mtp_trim_ms: float = 0.0  # trim MTP cache
     cache_layer_count: int = 0  # number of cache layers
     gdn_layer_count: int = 0  # layers with GDN/SSM (conv+delta)
@@ -835,7 +841,20 @@ def _draft_block_from(
     current_hidden = hidden_at_position
     current_token = _ensure_uint32(next_main_tok)
     processor_context = prev_buf
-    base_offset = state.position
+
+    # Compute the absolute sequence position for MTP-head RoPE.
+    # state.position tracks the confirmed main-token position (increments
+    # 1 per cycle).  Bonus and accepted draft tokens emitted along the way
+    # advance the sequence beyond the main-token position, so we add them.
+    base_offset = state.position + (
+        state.stats.draft_emits + state.stats.bonus_emits + state.stats.verify_emits
+    )
+    state.stats.true_base_offset = base_offset
+    state.stats.state_position = state.position
+    state.stats.total_emitted_tokens = (
+        state.stats.init_emits + state.stats.draft_emits
+        + state.stats.bonus_emits + state.stats.verify_emits
+    )
 
     # First pass: run MTP head forwards, select draft tokens via argmax
     # so we don't need mx.eval() per position.  Collect logits for batched
@@ -920,7 +939,7 @@ def _draft_block_from(
 # emitted tokens; stash a draft for the first verify cycle.
 # ---------------------------------------------------------------------------
 
-def _post_init_mtp(gen_batch: Any) -> None:
+def _post_init_mtp(gen_batch: Any, *, init_input_len: int = 0) -> None:
     """Bridge from standard ``__init__``'s ``_step()`` into PR 990's cycle 1.
 
     State on entry (after standard ``__init__``):
@@ -973,7 +992,15 @@ def _post_init_mtp(gen_batch: Any) -> None:
     state.mtp_cache = gen_batch.model.make_mtp_cache()
     state.draft_depth = _resolve_mtp_draft_depth(gen_batch)
     state.stats.max_depth = state.draft_depth
-    state.position = len(gen_batch.tokens[0])  # main_tok is already in cache
+    # state.position: logical sequence position for the NEXT backbone forward.
+    # At post-init time, the standard _step() has already run (cache includes
+    # prompt + 1 sampled token), and we consumed that token via another
+    # backbone forward.  So the cache is at position=init_input_len, and the
+    # next main token should be at position=init_input_len+1.
+    state.position = init_input_len + 1 if init_input_len else (
+        len(gen_batch.tokens[0]) if hasattr(gen_batch, 'tokens') and gen_batch.tokens else 0
+    )
+    state.stats.init_input_len = init_input_len
     gen_batch._omlx_mtp_state = state
 
     if _adaptive_depth_enabled(gen_batch):
@@ -1062,6 +1089,7 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         "cache=%.1fms(full=%.1f/%d rej=%.1f/%d rollback=%.1f commit=%.1f "
         "replay=%.1f spec_rb=%.1f trimtok=%.1f mtptrim=%.1f "
         "layers=%d gdn=%d fb_replay=%d spec_rb_count=%d) "
+        "pos[input=%d state=%d emitted=%d rope_base=%d] "
         "evals[target=%d draft=%d total=%d]]",
         uid,
         finish_reason,
@@ -1107,6 +1135,10 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         stats.gdn_layer_count,
         stats.cache_fallback_replay_count,
         stats.cache_spec_rollback_count,
+        stats.init_input_len,
+        stats.state_position,
+        stats.total_emitted_tokens,
+        stats.true_base_offset,
         stats.target_eval_count,
         stats.draft_eval_count,
         stats.mx_eval_count,
