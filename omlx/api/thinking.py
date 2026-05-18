@@ -300,6 +300,11 @@ class ThinkingBudgetProcessor:
         self._recent_tokens: List[int] = []
         # Flat set for fast single-token suppression check
         self._end_id_set = set(think_end_token_ids)
+        # Native MTP calls logits processors on speculative verify rows.  In
+        # that path the caller syncs accepted tokens explicitly so draft rows
+        # do not advance the budget state.
+        self._external_accept_sync: bool = False
+        self._accepted_up_to: int | None = None
 
     def __call__(self, tokens, logits):
         """mlx-lm logits processor: (tokens, logits) -> logits."""
@@ -312,15 +317,8 @@ class ThinkingBudgetProcessor:
         if self._suppress_end:
             return self._suppress_end_tokens(logits, mx)
 
-        # In new mlx-lm API, tokens is the full history list.
-        # Accept each genuinely generated token exactly once (see grammar.py).
-        n = len(tokens)
-        if not hasattr(self, "_accepted_up_to"):
-            self._accepted_up_to = n  # skip prompt tokens
-        elif n > self._accepted_up_to:
-            for i in range(self._accepted_up_to, n):
-                self._update_state(int(tokens[i]))
-            self._accepted_up_to = n
+        if not self._external_accept_sync:
+            self.sync_accepted_tokens(tokens)
 
         # If state changed by _update_state, handle immediately
         if self._done:
@@ -337,6 +335,28 @@ class ThinkingBudgetProcessor:
             return self._force_next_token(logits, mx)
 
         return logits
+
+    def sync_accepted_tokens(self, tokens, *, external: bool = False) -> None:
+        """Advance state from real emitted history, skipping prompt tokens.
+
+        The standard mlx-lm path passes the accepted history directly to
+        ``__call__``. Native MTP, however, applies processors to speculative
+        verify/draft rows before acceptance is known. The MTP patch calls this
+        method with ``gen_batch.tokens[0]`` so only emitted tokens count toward
+        the thinking budget.
+        """
+        n = len(tokens)
+        if self._accepted_up_to is None or n < self._accepted_up_to:
+            self._accepted_up_to = n
+            if external:
+                self._external_accept_sync = True
+            return
+        if n > self._accepted_up_to:
+            for i in range(self._accepted_up_to, n):
+                self._update_state(int(tokens[i]))
+            self._accepted_up_to = n
+        if external:
+            self._external_accept_sync = True
 
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""

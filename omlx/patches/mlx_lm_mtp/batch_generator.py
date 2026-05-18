@@ -567,10 +567,13 @@ def _proc_list(gen_batch: Any) -> Optional[List[Any]]:
     return None
 
 
-def _apply_processors(processors, prev_tokens, logits_2d):
+def _apply_processors(processors, prev_tokens, logits_2d, accepted_tokens=None):
     if not processors:
         return logits_2d
     for proc in processors:
+        sync = getattr(proc, "sync_accepted_tokens", None)
+        if sync is not None and accepted_tokens is not None:
+            sync(accepted_tokens, external=True)
         logits_2d = proc(prev_tokens, logits_2d)
     return logits_2d
 
@@ -880,7 +883,7 @@ def _draft_block_from(
                 [processor_context, _ensure_uint32(current_token)]
             )
             mtp_logits_2d = _apply_processors(
-                procs, prev_with_current, mtp_logits_2d
+                procs, prev_with_current, mtp_logits_2d, gen_batch.tokens[0]
             )
         else:
             prev_with_current = None
@@ -984,7 +987,9 @@ def _post_init_mtp(gen_batch: Any, *, init_input_len: int = 0) -> None:
         )
 
     next_main_logits = logits[:, -1, :]  # (1, vocab) — distribution after main_tok
-    next_main_logits = _apply_processors(procs, prev_buf, next_main_logits)
+    next_main_logits = _apply_processors(
+        procs, prev_buf, next_main_logits, gen_batch.tokens[0]
+    )
     next_main_lp = _logprobs(next_main_logits)
     next_main_tok = sampler(next_main_lp)  # (1,)
 
@@ -1201,7 +1206,9 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     for idx in range(draft_count + 1):
         logits_2d = logits[:, idx, :]
         if procs is not None:
-            logits_2d = _apply_processors(procs, prev_contexts[idx], logits_2d)
+            logits_2d = _apply_processors(
+                procs, prev_contexts[idx], logits_2d, gen_batch.tokens[0]
+            )
         processed_logits.append(logits_2d)
     combined_logits = mx.concatenate(processed_logits, axis=0)
     state.stats.target_proc_ms += (time.perf_counter() - t0) * 1000
