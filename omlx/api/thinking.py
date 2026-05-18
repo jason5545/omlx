@@ -24,6 +24,7 @@ _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 # Handle case where <think> is missing but </think> is present
 # (scheduler prepends <think>\n but the tag may be split)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
+_LEADING_CLOSE_TAG_PATTERN = re.compile(r'^(?:\s*</think>\s*)+')
 
 
 def extract_thinking(text: str) -> Tuple[str, str]:
@@ -63,7 +64,8 @@ def extract_thinking(text: str) -> Tuple[str, str]:
 
     if thinking_parts:
         thinking = "\n".join(thinking_parts).strip()
-        return (thinking, remaining.strip())
+        remaining = _LEADING_CLOSE_TAG_PATTERN.sub("", remaining).strip()
+        return (thinking, remaining)
 
     # Handle partial: content before </think> without <think> tag
     if '</think>' in text and '<think>' not in text:
@@ -71,6 +73,7 @@ def extract_thinking(text: str) -> Tuple[str, str]:
         if match:
             thinking = match.group(1).strip()
             remaining = text[match.end():].strip()
+            remaining = _LEADING_CLOSE_TAG_PATTERN.sub("", remaining).strip()
             return (thinking, remaining)
 
     # Malformed: <think> opened but never closed. Drop the open tag and
