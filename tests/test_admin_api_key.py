@@ -671,6 +671,7 @@ class TestRuntimeCacheObservability:
         mock_settings = MagicMock()
         mock_settings.base_path = Path("/tmp/omlx-base")
         mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
 
         shared_ssd_stats = {
             "num_files": 999,
@@ -760,6 +761,7 @@ class TestRuntimeCacheObservability:
                 "last_tokens_to_next_block": 0,
                 "num_files": 3,
                 "total_size_bytes": 4096,
+                "max_size_bytes": 0,
                 "hot_cache_max_bytes": 0,
                 "hot_cache_size_bytes": 0,
                 "hot_cache_entries": 0,
@@ -776,6 +778,7 @@ class TestRuntimeCacheObservability:
                 "last_tokens_to_next_block": 0,
                 "num_files": 7,
                 "total_size_bytes": 8192,
+                "max_size_bytes": 0,
                 "hot_cache_max_bytes": 0,
                 "hot_cache_size_bytes": 0,
                 "hot_cache_entries": 0,
@@ -791,6 +794,7 @@ class TestRuntimeCacheObservability:
         mock_settings = MagicMock()
         mock_settings.base_path = Path("/tmp/omlx-base")
         mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
 
         bad_scheduler = MagicMock()
         bad_scheduler.get_ssd_cache_stats.side_effect = RuntimeError("boom")
@@ -849,6 +853,7 @@ class TestRuntimeCacheObservability:
         mock_settings = MagicMock()
         mock_settings.base_path = Path("/tmp/omlx-base")
         mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
 
         scheduler = MagicMock()
         scheduler.get_ssd_cache_stats.return_value = {
