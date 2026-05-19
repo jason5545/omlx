@@ -433,7 +433,9 @@ def parse_reasoning_effort(value: str | None) -> ReasoningEffort | None:
     """
     if not value:
         return None
-    value = value.strip().lower()
+    if isinstance(value, ReasoningEffort):
+        return value
+    value = str(value).strip().lower()
     # Direct enum match
     try:
         return ReasoningEffort(value)
@@ -643,8 +645,8 @@ class ThinkingBudgetProcessor:
         The bias scales linearly from 0 at ``_soft_start`` to
         ``_soft_max_bias`` at ``_budget``.  This encourages the model to
         close thinking naturally rather than being abruptly cut off.
-        The bias is applied to every end-token ID so both ``</think>`` and
-        alternate end markers (e.g. ``</longcat_think>``) are nudged.
+        For multi-token close tags, bias only the next token in the close
+        sequence instead of every token in the sequence.
         """
         if self._soft_start is None or self._budget <= self._soft_start:
             return logits
@@ -653,9 +655,23 @@ class ThinkingBudgetProcessor:
             self._budget - self._soft_start
         )
         bias = self._soft_max_bias * min(progress, 1.0)
-        for tid in self._end_id_set:
+        for tid in self._soft_pressure_target_ids():
             logits[..., tid] = logits[..., tid] + bias
         return logits
+
+    def _soft_pressure_target_ids(self) -> List[int]:
+        """Return close-token IDs to bias for the next decode step."""
+        if len(self._think_end_ids) <= 1:
+            return list(self._end_id_set)
+
+        # If the model has already started a multi-token close marker,
+        # continue nudging the next expected token in that sequence.
+        max_prefix = min(len(self._recent_tokens), len(self._think_end_ids) - 1)
+        for prefix_len in range(max_prefix, 0, -1):
+            if self._recent_tokens[-prefix_len:] == self._think_end_ids[:prefix_len]:
+                return [self._think_end_ids[prefix_len]]
+
+        return [self._think_end_ids[0]]
 
     def _suppress_end_tokens(self, logits, mx):
         """Suppress duplicate </think> tokens after forced close."""

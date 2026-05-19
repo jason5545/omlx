@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAS_MLX = False
 
-from omlx.api.thinking import ThinkingBudgetProcessor
+from omlx.api.thinking import ReasoningEffort, ThinkingBudgetProcessor
 from omlx.model_settings import ModelSettings
 
 
@@ -46,12 +46,13 @@ class TestThinkingBudgetProcessor:
 
     NEWLINE_ID = 99  # Dummy \n token ID
 
-    def _make_processor(self, budget: int = 5, end_ids=None, trailing_ids=None):
+    def _make_processor(self, budget: int = 5, end_ids=None, trailing_ids=None, **kwargs):
         return ThinkingBudgetProcessor(
             think_end_token_ids=end_ids or [self.THINK_END_ID],
             budget=budget,
             think_start_token_id=self.THINK_START_ID,
             trailing_token_ids=trailing_ids,
+            **kwargs,
         )
 
     # --- Budget enforcement ---
@@ -186,6 +187,30 @@ class TestThinkingBudgetProcessor:
         proc(_make_tokens(10, 50, 51), _make_logits())
         assert proc._done
 
+    def test_soft_pressure_biases_next_multi_token_end_id(self):
+        """Soft pressure should nudge only the next token of a multi-token close tag."""
+        end_ids = [50, 51, 52]
+        proc = self._make_processor(
+            budget=5,
+            end_ids=end_ids,
+            soft_start_ratio=0.5,
+            soft_max_bias=2.0,
+        )
+
+        proc(_make_tokens(10), _make_logits())
+        proc(_make_tokens(10, 20), _make_logits())
+        proc(_make_tokens(10, 20, 30), _make_logits())
+
+        logits = proc(_make_tokens(10, 20, 30, 40), _make_logits())
+        assert logits[0, 50].item() > 0.0
+        assert logits[0, 51].item() == 0.0
+        assert logits[0, 52].item() == 0.0
+
+        logits = proc(_make_tokens(10, 20, 30, 40, 50), _make_logits())
+        assert logits[0, 50].item() == 0.0
+        assert logits[0, 51].item() > 0.0
+        assert logits[0, 52].item() == 0.0
+
     # --- Edge cases ---
 
     def test_zero_budget(self):
@@ -268,6 +293,58 @@ class TestResolveThinkingBudget:
         req.thinking = thinking
         result = resolve(req, None)
         assert result == 2048
+
+    def test_anthropic_budget_tokens_override_model_settings(self):
+        from omlx import server
+
+        class Settings:
+            thinking_budget_enabled = True
+            thinking_budget_tokens = 512
+
+        class SettingsManager:
+            def get_settings(self, model_id):
+                return Settings()
+
+        req = MagicMock(spec=[])
+        thinking = MagicMock(spec=[])
+        thinking.budget_tokens = 2048
+        req.thinking = thinking
+
+        with patch.object(server._server_state, "settings_manager", SettingsManager()):
+            result = server._resolve_thinking_budget(req, "model-id")
+
+        assert result == 2048
+
+    def test_responses_reasoning_effort_resolves_budget(self):
+        from omlx.api.responses_models import ResponsesRequest
+        from omlx.server import _get_request_reasoning_effort, _resolve_thinking_budget
+
+        req = ResponsesRequest(model="test", reasoning={"effort": "low"})
+
+        assert _get_request_reasoning_effort(req) is ReasoningEffort.LOW
+        assert _resolve_thinking_budget(req, None) == 256
+
+    def test_reasoning_effort_off_disables_template_thinking(self):
+        from omlx.server import _apply_reasoning_effort_chat_template_overrides
+
+        req = MagicMock(spec=[])
+        req.reasoning_effort = "off"
+        merged = {"preserve_thinking": True}
+
+        _apply_reasoning_effort_chat_template_overrides(merged, req, set())
+
+        assert merged == {"enable_thinking": False}
+
+    def test_reasoning_effort_native_enables_template_thinking(self):
+        from omlx.server import _apply_reasoning_effort_chat_template_overrides
+
+        req = MagicMock(spec=[])
+        req.reasoning_effort = "native"
+        merged = {}
+
+        _apply_reasoning_effort_chat_template_overrides(merged, req, set())
+
+        assert merged == {"enable_thinking": True}
 
     def test_returns_none_when_disabled(self):
         resolve = self._import_resolve()

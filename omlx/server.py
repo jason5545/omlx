@@ -1191,37 +1191,26 @@ def _resolve_thinking_budget(
 ) -> int | None:
     """Resolve thinking budget from request / policy / model settings.
 
-    Priority: request ``thinking_budget`` > request ``reasoning_effort`` >
+    Priority: request ``thinking_budget`` /
+    Anthropic ``thinking.budget_tokens`` >
+    request ``reasoning_effort`` / Responses ``reasoning.effort`` >
     ``chat_template_kwargs["reasoning_effort"]`` > sub-key policy >
-    model settings > Anthropic ``thinking.budget_tokens``.
+    model settings.
     """
     if request_policy and _bool_or_none(request_policy.get("enable_thinking")) is False:
         return None
 
-    # Explicit token budget
-    req_budget = getattr(request, 'thinking_budget', None)
+    # Explicit token budgets
+    req_budget = _get_request_thinking_budget(request)
     if req_budget is not None:
         return req_budget
 
-    # reasoning_effort from request body (vendor extension — Pi Agent sends this)
-    effort_value: str | None = None
-    req_effort = getattr(request, 'reasoning_effort', None)
-    if req_effort:
-        effort_value = req_effort
+    effort = _get_request_reasoning_effort(request)
+    if effort is not None:
+        from .api.thinking import resolve_effort_to_budget
 
-    # chat_template_kwargs.reasoning_effort
-    if not effort_value:
-        ct_kwargs = getattr(request, 'chat_template_kwargs', None) or {}
-        ct_effort = ct_kwargs.get("reasoning_effort")
-        if ct_effort:
-            effort_value = ct_effort
-
-    if effort_value:
-        from .api.thinking import parse_reasoning_effort, resolve_effort_to_budget
-        effort = parse_reasoning_effort(effort_value)
-        if effort is not None:
-            model_type = _get_model_type_for_effort(model_id)
-            return resolve_effort_to_budget(effort, model_type)
+        model_type = _get_model_type_for_effort(model_id)
+        return resolve_effort_to_budget(effort, model_type)
 
     # Sub-key policy thinking_budget_tokens
     policy_budget = (
@@ -1239,13 +1228,67 @@ def _resolve_thinking_budget(
         if ms.thinking_budget_enabled and ms.thinking_budget_tokens:
             return ms.thinking_budget_tokens
 
-    # Anthropic thinking.budget_tokens
-    if hasattr(request, 'thinking') and request.thinking:
-        req_budget = getattr(request.thinking, 'budget_tokens', None)
-        if req_budget is not None:
-            return req_budget
-
     return None
+
+
+def _get_request_thinking_budget(request) -> int | None:
+    """Return explicit per-request thinking budget, if present."""
+    req_budget = getattr(request, 'thinking_budget', None)
+    if req_budget is not None:
+        return req_budget
+    thinking = getattr(request, 'thinking', None)
+    if thinking:
+        return getattr(thinking, 'budget_tokens', None)
+    return None
+
+
+def _get_request_reasoning_effort(request):
+    """Parse reasoning effort from supported request shapes."""
+    effort_value = getattr(request, 'reasoning_effort', None)
+
+    if not effort_value:
+        reasoning = getattr(request, 'reasoning', None)
+        if isinstance(reasoning, dict):
+            effort_value = reasoning.get("effort") or reasoning.get("reasoning_effort")
+        elif reasoning is not None:
+            effort_value = (
+                getattr(reasoning, "effort", None)
+                or getattr(reasoning, "reasoning_effort", None)
+            )
+
+    if not effort_value:
+        ct_kwargs = getattr(request, 'chat_template_kwargs', None) or {}
+        if isinstance(ct_kwargs, dict):
+            effort_value = ct_kwargs.get("reasoning_effort")
+
+    if not effort_value:
+        return None
+
+    from .api.thinking import parse_reasoning_effort
+
+    return parse_reasoning_effort(effort_value)
+
+
+def _apply_reasoning_effort_chat_template_overrides(
+    merged_ct_kwargs: dict[str, Any],
+    request,
+    forced_keys: set[str] | None = None,
+) -> None:
+    """Apply template-level thinking toggles implied by reasoning_effort."""
+    if forced_keys and "enable_thinking" in forced_keys:
+        return
+
+    effort = _get_request_reasoning_effort(request)
+    if effort is None:
+        return
+
+    from .api.thinking import ReasoningEffort
+
+    if effort is ReasoningEffort.OFF:
+        merged_ct_kwargs["enable_thinking"] = False
+        merged_ct_kwargs.pop("preserve_thinking", None)
+    else:
+        merged_ct_kwargs["enable_thinking"] = True
 
 
 def _get_model_type_for_effort(model_id: str | None) -> str | None:
@@ -1268,16 +1311,11 @@ def _resolve_soft_pressure_from_request(
     model_id: str | None,
 ) -> tuple[float | None, float]:
     """Resolve soft-pressure params when ``reasoning_effort`` was used."""
-    effort_str = getattr(request, 'reasoning_effort', None)
-    if not effort_str:
-        ct_kwargs = getattr(request, 'chat_template_kwargs', None) or {}
-        effort_str = ct_kwargs.get("reasoning_effort")
-    if not effort_str:
-        return None, 0.0
-    from .api.thinking import parse_reasoning_effort, resolve_effort_soft_pressure
-    effort = parse_reasoning_effort(effort_str)
+    effort = _get_request_reasoning_effort(request)
     if effort is None:
         return None, 0.0
+    from .api.thinking import resolve_effort_soft_pressure
+
     model_type = _get_model_type_for_effort(model_id)
     return resolve_effort_soft_pressure(effort, model_type)
 
@@ -2435,6 +2473,9 @@ async def create_chat_completion(
         for k, v in request.chat_template_kwargs.items():
             if k not in forced_keys:
                 merged_ct_kwargs[k] = v
+    _apply_reasoning_effort_chat_template_overrides(
+        merged_ct_kwargs, request, forced_keys
+    )
     _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
     # Resolve the thinking budget before message extraction so historical
@@ -3811,6 +3852,9 @@ async def create_anthropic_message(
                 merged_ct_kwargs["enable_thinking"] = True
             elif thinking_type == "disabled":
                 merged_ct_kwargs["enable_thinking"] = False
+    _apply_reasoning_effort_chat_template_overrides(
+        merged_ct_kwargs, request, forced_keys
+    )
     _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
     logger.debug(
@@ -4220,6 +4264,9 @@ async def create_response(
         # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+    _apply_reasoning_effort_chat_template_overrides(
+        merged_ct_kwargs, request, forced_keys
+    )
     _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
     # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
