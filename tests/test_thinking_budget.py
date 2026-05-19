@@ -351,3 +351,30 @@ class TestResolveThinkingBudget:
         req = MagicMock(spec=[])
         result = resolve(req, None)
         assert result is None
+
+
+class TestHistoricalReasoningPreservation:
+    """Test prompt replay rules for historical assistant reasoning."""
+
+    class Entry:
+        preserve_thinking_default = True
+
+    def _should_preserve(self, merged, budget):
+        from omlx.server import _should_replay_historical_reasoning
+
+        return _should_replay_historical_reasoning(self.Entry(), merged, budget)
+
+    def test_auto_preserves_without_budget_when_template_supports_it(self):
+        assert self._should_preserve({}, None) is True
+
+    def test_budget_disables_auto_preserve(self):
+        assert self._should_preserve({}, 1024) is False
+
+    def test_explicit_preserve_wins_even_with_budget(self):
+        assert self._should_preserve({"preserve_thinking": True}, 1024) is True
+
+    def test_explicit_disable_blocks_auto_preserve(self):
+        assert self._should_preserve({"preserve_thinking": False}, None) is False
+
+    def test_enable_thinking_false_blocks_auto_preserve(self):
+        assert self._should_preserve({"enable_thinking": False}, None) is False

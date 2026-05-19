@@ -292,6 +292,7 @@ def _apply_reasoning_reconstruction(
     content: Any,
     reasoning: str | None,
     native: bool,
+    preserve: bool = True,
 ) -> tuple[Any, str | None]:
     """Reconstruct reasoning on a historical assistant message.
 
@@ -302,8 +303,11 @@ def _apply_reasoning_reconstruction(
     * ``native=True`` — template understands ``message.reasoning_content``
       as a top-level field (Qwen 3.6+).  Content stays clean and reasoning
       travels separately.
-    * ``native=False`` — template only parses ``<think>...</think>`` embedded
-      in content.  Reasoning is inlined into content as a fallback.
+    * ``native=False`` with ``preserve=True`` — template only parses
+      ``<think>...</think>`` embedded in content.  Reasoning is inlined into
+      content as a fallback.
+    * ``preserve=False`` — visible assistant content is kept, but historical
+      reasoning is not replayed into the prompt.
 
     Returns ``(new_content, reasoning_out)`` where ``reasoning_out`` is the
     string to attach as a ``reasoning_content`` field, or ``None`` to skip.
@@ -321,6 +325,8 @@ def _apply_reasoning_reconstruction(
     # empty assistant content for prompt reconstruction.
     if not text.strip() or text.strip() == reasoning.strip():
         return "", None
+    if not preserve:
+        return text, None
     if native:
         return text, reasoning
     return f"<think>\n{reasoning}\n</think>\n\n{text}", None
@@ -331,6 +337,7 @@ def extract_text_content(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     native_reasoning_content: bool = False,
+    preserve_reasoning_content: bool = True,
 ) -> List[dict]:
     """
     Extract text content from OpenAI-format messages.
@@ -363,7 +370,11 @@ def extract_text_content(
         # <think>...</think> in content.
         reasoning = getattr(msg, "reasoning_content", None)
         content, reasoning_out = _apply_reasoning_reconstruction(
-            role, content, reasoning, native_reasoning_content
+            role,
+            content,
+            reasoning,
+            native_reasoning_content,
+            preserve_reasoning_content,
         )
 
         # Normalize "developer" role to "system" (OpenAI API compatibility)
@@ -512,6 +523,7 @@ def extract_multimodal_content(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     native_reasoning_content: bool = False,
+    preserve_reasoning_content: bool = True,
 ) -> List[dict]:
     """
     Extract content from messages, preserving image_url parts for VLM.
@@ -538,7 +550,11 @@ def extract_multimodal_content(
         # Reconstruct reasoning (see extract_text_content).
         reasoning = getattr(msg, "reasoning_content", None)
         content, reasoning_out = _apply_reasoning_reconstruction(
-            role, content, reasoning, native_reasoning_content
+            role,
+            content,
+            reasoning,
+            native_reasoning_content,
+            preserve_reasoning_content,
         )
 
         if role == "developer":

@@ -447,15 +447,31 @@ class TestExtractTextContentReasoningReconstruction:
         assert result[0]["role"] == "assistant"
         assert result[0]["content"] == "<think>\nR\n</think>\n\nA"
 
-    def test_reasoning_with_none_content(self):
-        """reasoning_content with content=None should still emit the <think> block."""
+    def test_reasoning_with_none_content_is_dropped(self):
+        """reasoning-only assistant history should not be replayed."""
         messages = [
             Message(role="assistant", reasoning_content="R", content=None),
         ]
         result = extract_text_content(messages)
-        # Non-empty content after reconstruction keeps the message alive.
+        assert result == []
+
+    def test_duplicate_reasoning_content_is_dropped(self):
+        """Duplicate content/reasoning assistant history should not be replayed."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content="R"),
+        ]
+        result = extract_text_content(messages)
+        assert result == []
+
+    def test_visible_content_kept_when_reasoning_replay_disabled(self):
+        """Budgeted turns can keep answer text without replaying old reasoning."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content="A"),
+        ]
+        result = extract_text_content(messages, preserve_reasoning_content=False)
         assert len(result) == 1
-        assert result[0]["content"] == "<think>\nR\n</think>\n\n"
+        assert result[0]["content"] == "A"
+        assert "reasoning_content" not in result[0]
 
     def test_reasoning_with_content_list(self):
         """reasoning_content + list content should extract text parts and prefix <think>."""
@@ -513,17 +529,35 @@ class TestExtractTextContentNativeReasoningContent:
         # No <think> tag in content
         assert "<think>" not in result[0]["content"]
 
-    def test_native_mode_with_none_content(self):
-        """None content + reasoning_content still emits the field (and empty content)."""
+    def test_native_mode_with_none_content_is_dropped(self):
+        """Native mode also drops reasoning-only assistant history."""
         messages = [
             Message(role="assistant", reasoning_content="R", content=None),
         ]
         result = extract_text_content(messages, native_reasoning_content=True)
+        assert result == []
+
+    def test_native_mode_duplicate_reasoning_content_is_dropped(self):
+        """Native mode drops duplicate content/reasoning assistant history."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content="R"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert result == []
+
+    def test_native_mode_visible_content_kept_when_reasoning_replay_disabled(self):
+        """Disabling replay wins over native reasoning field support."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content="A"),
+        ]
+        result = extract_text_content(
+            messages,
+            native_reasoning_content=True,
+            preserve_reasoning_content=False,
+        )
         assert len(result) == 1
-        # Empty content but message survives because reasoning_content exists.
-        # Note: _drop_void_assistant_messages may still drop this; verify it's
-        # retained via the reasoning_content presence.
-        assert result[0]["reasoning_content"] == "R"
+        assert result[0]["content"] == "A"
+        assert "reasoning_content" not in result[0]
 
     def test_native_mode_with_list_content(self):
         """List content gets flattened to text; reasoning kept separate."""
@@ -1224,6 +1258,37 @@ class TestConvertAnthropicToInternalNativeReasoning:
         assert result[0]["content"] == "Let me check."
         assert result[0]["reasoning_content"] == "deliberating"
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert "<think>" not in result[0]["content"]
+
+    def test_reasoning_replay_disabled_keeps_visible_text(self):
+        """Budgeted requests can drop historical thinking but keep answer text."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking",
+                            thinking="step by step",
+                            signature="",
+                        ),
+                        ContentBlockText(text="Answer"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            native_reasoning_content=True,
+            preserve_reasoning_content=False,
+        )
+
+        assert len(result) == 1
+        assert result[0]["content"] == "Answer"
+        assert "reasoning_content" not in result[0]
         assert "<think>" not in result[0]["content"]
 
     def test_native_mode_no_thinking_no_field(self):

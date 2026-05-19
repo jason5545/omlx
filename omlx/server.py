@@ -454,6 +454,24 @@ def _apply_request_chat_template_overrides(
         merged_ct_kwargs.pop("preserve_thinking", None)
 
 
+def _should_replay_historical_reasoning(
+    entry: Any,
+    merged_ct_kwargs: dict[str, Any],
+    thinking_budget: int | None,
+) -> bool:
+    """Decide whether echoed assistant reasoning should be replayed."""
+    if merged_ct_kwargs.get("preserve_thinking") is True:
+        return True
+    if not (entry and entry.preserve_thinking_default is True):
+        return False
+    if thinking_budget is not None:
+        return False
+    return (
+        merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
@@ -2496,11 +2514,14 @@ async def create_chat_completion(
     # active. Each new turn may think up to the budget, but prior reasoning
     # should not be replayed into the prompt unless the model setting or
     # request explicitly asks for preserve_thinking=True.
-    native_reasoning = bool(
-        _entry
-        and _entry.preserve_thinking_default is True
-        and merged_ct_kwargs.get("preserve_thinking") is True
+    replay_reasoning = _should_replay_historical_reasoning(
+        _entry, merged_ct_kwargs, thinking_budget
     )
+    native_reasoning = bool(
+        replay_reasoning and _entry and _entry.preserve_thinking_default is True
+    )
+    if native_reasoning and "preserve_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["preserve_thinking"] = True
     is_vlm = isinstance(engine, VLMBatchedEngine)
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
@@ -2512,6 +2533,7 @@ async def create_chat_completion(
             max_tool_result_tokens,
             engine.tokenizer,
             native_reasoning_content=native_reasoning,
+            preserve_reasoning_content=replay_reasoning,
         )
     else:
         messages = extract_text_content(
@@ -2519,6 +2541,7 @@ async def create_chat_completion(
             max_tool_result_tokens,
             engine.tokenizer,
             native_reasoning_content=native_reasoning,
+            preserve_reasoning_content=replay_reasoning,
         )
 
     # Detect and strip partial mode at the API boundary — exactly once,
@@ -3857,6 +3880,13 @@ async def create_anthropic_message(
     )
     _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
+    thinking_budget = _resolve_thinking_budget(
+        request, request.model, request_policy=request_policy,
+    )
+    thinking_soft_start_ratio, thinking_soft_max_bias = _resolve_soft_pressure_from_request(
+        request, resolved_model or request.model,
+    ) if thinking_budget is not None else (None, 0.0)
+
     logger.debug(
         f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
         f"has_tokenizer={engine.tokenizer is not None}"
@@ -3866,7 +3896,14 @@ async def create_anthropic_message(
     # Harmony models need special handling to preserve tool format
     is_vlm = isinstance(engine, VLMBatchedEngine)
     _entry = get_engine_pool().get_entry(resolved_model)
-    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+    replay_reasoning = _should_replay_historical_reasoning(
+        _entry, merged_ct_kwargs, thinking_budget
+    )
+    native_reasoning = bool(
+        replay_reasoning and _entry and _entry.preserve_thinking_default is True
+    )
+    if native_reasoning and "preserve_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["preserve_thinking"] = True
     if engine.model_type == "gpt_oss":
         messages = convert_anthropic_to_internal_harmony(
             request, max_tool_result_tokens, engine.tokenizer
@@ -3876,6 +3913,7 @@ async def create_anthropic_message(
             request, max_tool_result_tokens, engine.tokenizer,
             preserve_images=is_vlm,
             native_reasoning_content=native_reasoning,
+            preserve_reasoning_content=replay_reasoning,
         )
 
     # Apply model-specific message extraction (e.g. Gemma 4 converts
@@ -3907,12 +3945,6 @@ async def create_anthropic_message(
     }
 
     # Add thinking budget if applicable
-    thinking_budget = _resolve_thinking_budget(
-        request, request.model, request_policy=request_policy,
-    )
-    thinking_soft_start_ratio, thinking_soft_max_bias = _resolve_soft_pressure_from_request(
-        request, resolved_model or request.model,
-    ) if thinking_budget is not None else (None, 0.0)
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
         if thinking_soft_start_ratio is not None:
@@ -3932,6 +3964,7 @@ async def create_anthropic_message(
     if (
         _entry is not None
         and _entry.preserve_thinking_default is True
+        and thinking_budget is None
         and merged_ct_kwargs.get("enable_thinking") is not False
         and "preserve_thinking" not in merged_ct_kwargs
     ):
