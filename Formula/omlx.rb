@@ -9,10 +9,18 @@ class Omlx < Formula
 
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
+  depends_on "cmake" => :build
   depends_on "rust" => :build
   depends_on arch: :arm64
   depends_on :macos
   depends_on "python@3.11"
+
+  # MLX 0.31.2 with the small-M qmv fast path retuned for Native MTP verify.
+  resource "mlx" do
+    url "https://github.com/ml-explore/mlx.git",
+        tag:      "v0.31.2",
+        revision: "68cf2fddd8de5edd8ab3d926391772b2e2cedad8"
+  end
 
   # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
   # mlx-lm. Fetch source separately so we can patch the pin before install.
@@ -40,6 +48,15 @@ class Omlx < Formula
     # not need Homebrew's dylib ID rewrite, and building from source fails on
     # macOS 15+ due to PyO3 linker errors (missing Python symbols at link time).
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
+
+    # Install patched MLX before omlx so the resolver keeps this build instead
+    # of pulling the stock PyPI wheel.
+    mlx_qmv_patch = Pathname(__dir__).parent/"patches/mlx/small_m_qmv_bn16.patch"
+    odie "MLX qmv patch not found: #{mlx_qmv_patch}" unless mlx_qmv_patch.exist?
+    resource("mlx").stage do
+      system "patch", "-p1", "-i", mlx_qmv_patch
+      system({ "PYPI_RELEASE" => "1" }, libexec/"bin/pip", "install", ".")
+    end
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s

@@ -1,0 +1,63 @@
+diff --git a/mlx/backend/metal/kernels/quantized.h b/mlx/backend/metal/kernels/quantized.h
+index d4a5d28..63bac95 100644
+--- a/mlx/backend/metal/kernels/quantized.h
++++ b/mlx/backend/metal/kernels/quantized.h
+@@ -759,7 +759,7 @@ METAL_FUNC void qmv_fast_impl(
+     uint simd_gid [[simdgroup_index_in_threadgroup]],
+     uint simd_lid [[thread_index_in_simdgroup]]) {
+   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+-  constexpr int num_simdgroups = 2;
++  constexpr int num_simdgroups = 4;
+   constexpr int results_per_simdgroup = 4;
+   constexpr int pack_factor = get_pack_factor<bits, 32>();
+   constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+@@ -786,6 +786,7 @@ METAL_FUNC void qmv_fast_impl(
+   x += tid.x * in_vec_size + simd_lid * values_per_thread;
+   y += tid.x * out_vec_size + out_row;
+ 
++#pragma clang loop unroll_count(4)
+   for (int k = 0; k < in_vec_size; k += block_size) {
+     U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+ 
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index c8d5a31..017225d 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -248,15 +248,15 @@ void qmv(
+     const std::string& mode) {
+   int B = out.size() / M / N;
+ 
+-  int bn = 8;
++  bool fast = N % 16 == 0 && K % 512 == 0;
++  int bn = fast ? 16 : 8;
+   int bk = 32;
+-  MTL::Size group_dims(bk, 2, 1);
++  MTL::Size group_dims(bk, fast ? 4 : 2, 1);
+   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+ 
+   std::string kname;
+   kname.reserve(64);
+   std::string type_string = get_type_string(x.dtype());
+-  bool fast = N % bn == 0 && K % 512 == 0;
+ 
+   concatenate(
+       kname,
+@@ -975,15 +975,15 @@ void gather_qmv(
+     const std::string& mode) {
+   int B = out.size() / M / N;
+ 
+-  int bn = 8;
++  bool fast = N % 16 == 0 && K % 512 == 0;
++  int bn = fast ? 16 : 8;
+   int bk = 32;
+-  MTL::Size group_dims(bk, 2, 1);
++  MTL::Size group_dims(bk, fast ? 4 : 2, 1);
+   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+ 
+   std::string kname;
+   kname.reserve(64);
+   std::string type_string = get_type_string(x.dtype());
+-  bool fast = N % bn == 0 && K % 512 == 0;
+   concatenate(
+       kname,
+       mode + (fast ? "_gather_qmv_fast_" : "_gather_qmv_"),
