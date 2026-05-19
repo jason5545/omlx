@@ -35,7 +35,18 @@ class PiIntegration(Integration):
 
     @staticmethod
     def _is_reasoning_model(model: str | None) -> bool:
-        return bool(re.search(r"\b(thinking|o1|o3|r1)\b", (model or "").lower()))
+        value = (model or "").lower()
+        return bool(
+            re.search(
+                r"(^|[^a-z0-9])("
+                r"thinking|reasoning|"
+                r"o[134]|r1|"
+                r"qwen[-_.]?3|qwen3|"
+                r"deepseek|glm[-_.]?[45]|glm[45]"
+                r")([^a-z0-9]|$)",
+                value,
+            )
+        )
 
     def configure(
         self,
@@ -54,12 +65,17 @@ class PiIntegration(Integration):
                 "api": "openai-completions",
                 "apiKey": api_key or "omlx",
                 "authHeader": True,
+                "compat": {
+                    "supportsReasoningEffort": True,
+                    "maxTokensField": "max_tokens",
+                },
             }
             if model:
+                reasoning = self._is_reasoning_model(model)
                 model_entry: dict = {
                     "id": model,
                     "name": model,
-                    "reasoning": self._is_reasoning_model(model),
+                    "reasoning": reasoning,
                     "input": ["text", "image"] if model_type == "vlm" else ["text"],
                     "cost": {
                         "input": 0,
@@ -68,6 +84,15 @@ class PiIntegration(Integration):
                         "cacheWrite": 0,
                     },
                 }
+                if reasoning:
+                    # Pi represents "off" by omitting reasoningEffort unless
+                    # a string mapping is present. oMLX accepts "off" and uses
+                    # it to disable template thinking. Pi also hides xhigh
+                    # unless it is explicitly mapped.
+                    model_entry["thinkingLevelMap"] = {
+                        "off": "off",
+                        "xhigh": "xhigh",
+                    }
                 if context_window:
                     model_entry["contextWindow"] = context_window
                 if max_tokens:
@@ -83,10 +108,18 @@ class PiIntegration(Integration):
         self._write_json_config(self.MODELS_PATH, update_models)
         self._write_json_config(self.SETTINGS_PATH, update_settings)
 
-    def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
+    def launch(
+        self,
+        port: int,
+        api_key: str,
+        model: str,
+        host: str = "127.0.0.1",
+        **kwargs,
+    ) -> None:
         context_window = kwargs.pop("context_window", None)
         max_tokens = kwargs.pop("max_tokens", None)
         model_type = kwargs.pop("model_type", None)
+        extra_args = kwargs.pop("extra_args", None) or []
         self.configure(
             port,
             api_key,
@@ -101,5 +134,6 @@ class PiIntegration(Integration):
         args = ["pi"]
         if model:
             args.extend(["--model", f"omlx/{model}"])
+        args.extend(extra_args)
 
         os.execvpe("pi", args, env)

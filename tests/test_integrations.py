@@ -682,7 +682,14 @@ class TestPiIntegration:
         assert provider["api"] == "openai-completions"
         assert provider["apiKey"] == "test-key"
         assert provider["authHeader"] is True
+        assert provider["compat"]["supportsReasoningEffort"] is True
+        assert provider["compat"]["maxTokensField"] == "max_tokens"
         assert provider["models"][0]["id"] == "qwen3.5"
+        assert provider["models"][0]["reasoning"] is True
+        assert provider["models"][0]["thinkingLevelMap"] == {
+            "off": "off",
+            "xhigh": "xhigh",
+        }
         assert provider["models"][0]["input"] == ["text"]
 
         settings_config = json.loads(settings_path.read_text())
@@ -746,6 +753,55 @@ class TestPiIntegration:
         assert model_config["input"] == ["text", "image"]
         assert model_config["contextWindow"] == 32768
         assert model_config["maxTokens"] == 8192
+
+    def test_configure_non_reasoning_model(self, tmp_path):
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(port=8000, api_key="key", model="llama-3.1-8b")
+
+        model_config = json.loads(models_path.read_text())["providers"]["omlx"][
+            "models"
+        ][0]
+        assert model_config["reasoning"] is False
+        assert "thinkingLevelMap" not in model_config
+
+    def test_launch_forwards_extra_args(self, tmp_path):
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+            patch("omlx.integrations.pi.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.pi.os.execvpe", side_effect=fake_execvpe),
+        ):
+            pi.launch(
+                port=8000,
+                api_key="key",
+                model="qwen3.5",
+                extra_args=["--thinking", "high"],
+            )
+
+        assert captured["binary"] == "pi"
+        assert captured["argv"] == [
+            "pi",
+            "--model",
+            "omlx/qwen3.5",
+            "--thinking",
+            "high",
+        ]
 
     def test_configure_preserves_existing(self, tmp_path):
         models_path = tmp_path / "models.json"
