@@ -55,7 +55,9 @@ class Omlx < Formula
     odie "MLX qmv patch not found: #{mlx_qmv_patch}" unless mlx_qmv_patch.exist?
     resource("mlx").stage do
       system "patch", "-p1", "-i", mlx_qmv_patch
-      system({ "PYPI_RELEASE" => "1" }, libexec/"bin/pip", "install", ".")
+      ENV["PYPI_RELEASE"] = "1"
+      system libexec/"bin/pip", "install", "."
+      ENV.delete "PYPI_RELEASE"
     end
 
     # Install omlx (with optional grammar extra for structured output)
