@@ -12,7 +12,7 @@ class AdaptiveDepthPolicy:
     min_depth: int = 1
     start_depth: int = 1
     increase_after: int = 3
-    decrease_after: int = 2
+    decrease_after: int = 1
 
     def __post_init__(self) -> None:
         if self.max_depth < 1:
@@ -49,8 +49,11 @@ class AdaptiveDepthPolicy:
                 action = "increase"
         else:
             self._full_accept_streak = 0
-            rejected_at = accepted_depths + 1
-            if rejected_at <= max(1, previous_depth // 2):
+            # Only late-tail rejects get a pass. If a block misses before its
+            # final drafted token, the extra width is mostly buying rollback
+            # work instead of throughput.
+            rejected_before_tail = accepted_depths <= attempted_depth - 2
+            if rejected_before_tail:
                 self._early_reject_streak += 1
             else:
                 self._early_reject_streak = 0
