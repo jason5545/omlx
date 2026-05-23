@@ -42,6 +42,19 @@ to regain speed.
 The current install has normal text output in the direct API test. No garbage
 was observed in the latest tests.
 
+The previous client-path collapse into single-digit tok/s is no longer the
+active problem. A later Voco sub-key request on the current repaired code hit
+the expected speed range:
+
+```text
+Request policy active: client=voco source=api-sub-key ...
+Chat completion: 49 tokens in 1.92s (25.6 tok/s), prompt: 195
+MTP[...] cycles=14 adaptive<=3 draft_accept=34/42 (81.0%)
+accept_by_depth=[13, 12, 9, 0]
+draft_by_depth=[14, 13, 12, 0]
+fb_replay=0 spec_rb_count=4
+```
+
 ## What partially recovered speed
 
 The May 19 fast behavior depended on a more aggressive adaptive MTP policy.
@@ -86,15 +99,18 @@ rollback path, and the runtime is no longer stuck almost entirely at D1/D2.
 
 ## What is still not fully recovered
 
-Jason previously saw about `25.2 tok/s` from a direct glue/script path. The
-current direct API test reaches about `23-24 tok/s` warmed. That is better than
-the broken state, but not fully back to the best observed number.
+The only remaining goal is to get the repaired path consistently back to
+`25.2 tok/s` or higher, without garbage output and without disabling native MTP.
 
-The user-facing client path is still the important unresolved case. Jason saw
-Voco / PI-agent style calls drop to very low single-digit speeds earlier, while
-the direct script could be much faster. The latest tests in this note were
-direct API calls with the `none` API key, not the full Voco or PI-agent client
-workflow.
+Jason previously saw about `25.2 tok/s` from a direct glue/script path. The
+current 140-token direct API test reaches about `23-24 tok/s` warmed. A shorter
+Voco sub-key request reached `25.6 tok/s`, so the client single-digit issue
+should not be treated as the active regression anymore.
+
+The open question is narrower now: why the representative direct/API benchmark
+does not reliably stay above `25.2 tok/s`, and whether the remaining gap is
+benchmark-shape variance, TTFT amortization, lazy MTP activation cost, or another
+small per-cycle cost.
 
 ## Direct API repro used
 
@@ -126,6 +142,21 @@ Request shape:
 }
 ```
 
+Note: the OpenAI chat request schema does not currently expose `top_k` as a
+request-level field. In this setup the effective MTPLX sampler contract is
+coming from the model artifact's `mtplx_runtime.json`, which currently contains:
+
+```json
+{
+  "temperature": 0.6,
+  "top_k": 20,
+  "top_p": 0.95
+}
+```
+
+So `top_k=0` is a valid general failure mode to guard against, but it is not the
+current explanation for this model's latest direct/Voco measurements.
+
 ## Important negative result
 
 I tried removing the per-cycle `mx.eval(logits)` profiling barrier in the MTP
@@ -144,7 +175,7 @@ Good current behavior:
 VLM+MTP enabled and active ...
 MTP path activated ... (model has mtp_forward, batch=1)
 MTP[...] adaptive<=3 ... fb_replay=0 ... spec_rb_count>0
-Chat completion: ... 23-24 tok/s ...
+Chat completion: ... target >=25.2 tok/s ...
 ```
 
 Bad lines that should not appear:
@@ -158,7 +189,14 @@ fb_replay>0
 
 ## Remaining places to investigate
 
-1. Compare the May 19 post-init MTP activation path against the current lazy
+1. Standardize the benchmark shape before chasing code.
+
+   The current evidence mixes a 140-token direct API benchmark at `23-24 tok/s`
+   and a shorter Voco sub-key request at `25.6 tok/s`. Use one representative
+   prompt length, output length, sampler contract, streaming mode, and warm/cold
+   state before declaring the remaining delta real.
+
+2. Compare the May 19 post-init MTP activation path against the current lazy
    activation path.
 
    Current code lazily activates MTP in `GenerationBatch.next()` to avoid cache
@@ -167,28 +205,35 @@ fb_replay>0
    There may be room for a safe singleton-only fast path, but it must preserve
    the later batch-reshape reconciliation safety.
 
-2. Reproduce with the actual Voco / PI-agent request shape.
+3. Quantify `_post_init_mtp` cost and how much it affects short benchmarks.
 
-   The direct API path is now okay-ish. The customer-facing pain was client
-   calls becoming single-digit tok/s. Need capture the exact request body,
-   headers/sub-key policy, streaming mode, prompt length, and whether grammar or
-   tool processors are enabled.
+   Lazy activation may mostly affect TTFT, not steady-state tok/s. On a short
+   49-140 token completion, that one-time cost can still move the reported
+   average. Measure it before changing the activation boundary.
 
-3. Check whether client defaults are accidentally disabling the MTPLX sampler
-   contract.
+4. Keep checking the MTPLX sampler contract, but do not assume it is currently
+   broken.
 
-   The direct test explicitly used `temperature=0.6`, `top_p=0.95`, `top_k=20`,
-   and `enable_thinking=false`. MTPLX speed/acceptance is sensitive to sampler
-   shape. If a client sends `top_k=0`, different temperature, thinking enabled,
-   grammar constraints, or a much longer prompt, the MTP path can look active
-   but fail to deliver the same speed.
+   This model's `mtplx_runtime.json` already provides `temperature=0.6`,
+   `top_p=0.95`, and `top_k=20`, so current direct/Voco measurements should be
+   on the sparse acceptance path. A future cleanup may still wire request-level
+   `top_k` into OpenAI chat handling, but that is not the main path to recovering
+   the last `1-2 tok/s` here.
 
-4. Keep stock MLX while testing speed.
+5. Treat grammar/tools as a guardrail, not the current target.
+
+   If a future slow log lacks `MTP path activated` or says grammar-constrained
+   decoding is active, then inspect `tools`, `response_format`, and
+   `structured_outputs`. That was a plausible explanation for old client-path
+   slowdowns, but the single-digit client issue is already fixed and should not
+   drive this pass.
+
+6. Keep stock MLX while testing speed.
 
    Speed experiments should not resurrect the local MLX qmv patch, because that
    path explains the no-garbage regression.
 
-5. Do not use "disable MTP" as the answer.
+7. Do not use "disable MTP" as the answer.
 
    It is fine to run no-MTP as a baseline measurement, but the target fix is
-   VLM + Native MTP with normal text output and acceptable throughput.
+   VLM + Native MTP with normal text output and `25.2 tok/s+` throughput.
