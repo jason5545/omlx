@@ -3,6 +3,12 @@
 from omlx.patches.mlx_lm_mtp.adaptive import AdaptiveDepthPolicy
 
 
+def test_default_policy_starts_shallow() -> None:
+    policy = AdaptiveDepthPolicy(max_depth=3, min_depth=1)
+
+    assert policy.current_depth == 1
+
+
 def test_mid_depth_reject_holds_depth() -> None:
     policy = AdaptiveDepthPolicy(max_depth=3, min_depth=1, start_depth=3)
 
@@ -22,15 +28,19 @@ def test_late_tail_reject_holds_depth() -> None:
     assert result["action"] == "hold"
 
 
-def test_single_full_accept_restores_depth() -> None:
-    policy = AdaptiveDepthPolicy(max_depth=3, min_depth=1, start_depth=3)
-    policy.observe(attempted_depth=3, accepted_depths=0)
-    policy.observe(attempted_depth=3, accepted_depths=0)
+def test_increase_requires_three_consecutive_full_accepts() -> None:
+    policy = AdaptiveDepthPolicy(max_depth=3, min_depth=1)
 
-    first_full = policy.observe(attempted_depth=2, accepted_depths=2)
+    first_full = policy.observe(attempted_depth=1, accepted_depths=1)
+    second_full = policy.observe(attempted_depth=1, accepted_depths=1)
+    third_full = policy.observe(attempted_depth=1, accepted_depths=1)
 
-    assert first_full["next_depth"] == 3
-    assert first_full["action"] == "increase"
+    assert first_full["next_depth"] == 1
+    assert first_full["action"] == "hold"
+    assert second_full["next_depth"] == 1
+    assert second_full["action"] == "hold"
+    assert third_full["next_depth"] == 2
+    assert third_full["action"] == "increase"
 
 
 def test_repeated_first_token_reject_reaches_min_depth() -> None:
