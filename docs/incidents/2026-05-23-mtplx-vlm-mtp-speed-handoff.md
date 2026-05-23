@@ -4,6 +4,15 @@ This note records the current working state and the remaining questions for the
 Qwen3.6 MTPLX VLM native-MTP speed regression. It is written as a handoff for
 another reviewer, not as a final root-cause report.
 
+## Reviewer boundary
+
+The next reviewer's role is read-only review and advice only.
+
+They should inspect this note, code, git history, and logs as needed, then give
+their analysis, hypotheses, and suggested next steps. They should not modify
+files, change settings, reinstall packages, restart services, clear logs, or run
+commands that mutate the repo or machine state.
+
 ## Current installed state
 
 - Repo: `/Users/jianruicheng/GitHub/omlx`
@@ -183,4 +192,3 @@ fb_replay>0
 
    It is fine to run no-MTP as a baseline measurement, but the target fix is
    VLM + Native MTP with normal text output and acceptable throughput.
-
