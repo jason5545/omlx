@@ -784,7 +784,7 @@ def _adaptive_depth_enabled(gen_batch: Any) -> bool:
 
 def _make_adaptive_policy(gen_batch: Any) -> AdaptiveDepthPolicy:
     max_d = _resolve_mtp_draft_depth(gen_batch)
-    return AdaptiveDepthPolicy(max_depth=max_d, min_depth=1, start_depth=max_d)
+    return AdaptiveDepthPolicy(max_depth=max_d, min_depth=1, start_depth=min(max_d, 2))
 
 
 def _trim_token_buffer(gen_batch: Any, n: int) -> None:
