@@ -22,30 +22,22 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_PATCHED = False
-
 
 def apply_mlx_vlm_mtp_patch() -> bool:
     """Apply the mlx-vlm MTP sanitize monkey-patches.
 
     Returns True on success (or if already applied), False if the
-    sub-step refused (mlx-vlm not importable, etc.).
+    sub-step refused (mlx-vlm not importable, etc.). Idempotency is
+    handled by each sub-patcher via class-level flags — no module-wide
+    cache flag, keeping behavior consistent with mlx_lm_mtp.
     """
-    global _PATCHED
-    if _PATCHED:
-        return True
-
-    from . import qwen35_moe_vlm_model, qwen35_vlm_model, qwen35_vlm_runtime
+    from . import qwen35_moe_vlm_model, qwen35_vlm_model
 
     if not qwen35_vlm_model.apply():
         logger.debug("Qwen3.5 VLM MTP sanitize patch did not apply")
     if not qwen35_moe_vlm_model.apply():
         logger.debug("Qwen3.5 MoE VLM MTP sanitize patch did not apply")
-    if not qwen35_vlm_runtime.apply():
-        logger.debug("Qwen3.5 VLM MTP runtime patch did not apply")
 
-    _PATCHED = True
-    logger.info("mlx-vlm MTP patch applied")
     return True
 
 
