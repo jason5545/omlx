@@ -28,19 +28,30 @@ def test_late_tail_reject_holds_depth() -> None:
     assert result["action"] == "hold"
 
 
-def test_increase_requires_three_consecutive_full_accepts() -> None:
+def test_increase_requires_two_consecutive_full_accepts() -> None:
     policy = AdaptiveDepthPolicy(max_depth=3, min_depth=1)
 
     first_full = policy.observe(attempted_depth=1, accepted_depths=1)
     second_full = policy.observe(attempted_depth=1, accepted_depths=1)
-    third_full = policy.observe(attempted_depth=1, accepted_depths=1)
 
     assert first_full["next_depth"] == 1
     assert first_full["action"] == "hold"
-    assert second_full["next_depth"] == 1
-    assert second_full["action"] == "hold"
-    assert third_full["next_depth"] == 2
-    assert third_full["action"] == "increase"
+    assert second_full["next_depth"] == 2
+    assert second_full["action"] == "increase"
+
+
+def test_depth_three_requires_deeper_confidence() -> None:
+    policy = AdaptiveDepthPolicy(max_depth=3, min_depth=1, start_depth=2)
+
+    for _ in range(4):
+        result = policy.observe(attempted_depth=2, accepted_depths=2)
+        assert result["next_depth"] == 2
+        assert result["action"] == "hold"
+
+    result = policy.observe(attempted_depth=2, accepted_depths=2)
+
+    assert result["next_depth"] == 3
+    assert result["action"] == "increase"
 
 
 def test_repeated_first_token_reject_reaches_min_depth() -> None:

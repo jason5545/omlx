@@ -782,13 +782,6 @@ def _adaptive_depth_enabled(gen_batch: Any) -> bool:
     return bool(getattr(gen_batch.model, "_omlx_mtp_adaptive_depth", False))
 
 
-def _sync_backbone_logits_for_profiling() -> bool:
-    import os
-
-    env = os.environ.get("OMLX_MTP_SYNC_BACKBONE_LOGITS")
-    return env is not None and env.strip().lower() in ("1", "true", "yes")
-
-
 def _make_adaptive_policy(gen_batch: Any) -> AdaptiveDepthPolicy:
     max_d = _resolve_mtp_draft_depth(gen_batch)
     return AdaptiveDepthPolicy(max_depth=max_d, min_depth=1, start_depth=1)
@@ -1342,10 +1335,10 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
                 gen_batch._token_context[0].update_and_fetch(draft_tok)
             )
 
-    # --- backbone forward ---
-    # Keep the default decode path lazy. Profiling can force a barrier here
-    # to split backbone_ms / sample_ms cleanly, but doing it every verify
-    # cycle adds a sync to the hot path.
+    # --- backbone forward (materialized before sampling) ---
+    # Keep backbone_ms / sample_ms attribution stable. A previous lazy variant
+    # only moved this wait into target_dist_ms and did not improve wall-clock
+    # throughput on Qwen3.6 MTPLX.
     t0 = time.perf_counter()
     with mx.stream(_get_generation_stream()):
         logits, hidden, gdn_states = _call_backbone(
@@ -1354,8 +1347,7 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
             gen_batch.prompt_cache,
             n_confirmed=1,
         )
-    if _sync_backbone_logits_for_profiling():
-        mx.eval(logits)
+    mx.eval(logits)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
