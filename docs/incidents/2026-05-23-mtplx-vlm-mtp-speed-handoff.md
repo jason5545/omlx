@@ -1,8 +1,8 @@
 # 2026-05-23 MTPLX VLM MTP speed handoff
 
-This note records the current working state and the remaining questions for the
-Qwen3.6 MTPLX VLM native-MTP speed regression. It is written as a handoff for
-another reviewer, not as a final root-cause report.
+This note records the current working state and the resolved path for the
+Qwen3.6 MTPLX VLM native-MTP speed regression. Older investigation notes remain
+below so future work does not repeat the same failed fixes.
 
 ## Reviewer boundary
 
@@ -17,14 +17,63 @@ commands that mutate the repo or machine state.
 
 - Repo: `/Users/jianruicheng/GitHub/omlx`
 - Installed Homebrew formula: `jason5545/omlx/omlx`
-- Installed version after the latest repair: `HEAD-14b59c0`
+- Installed version after the latest repair: `HEAD-d4f614b`
 - Important commits now on `origin/main`:
   - `1ce1d62 fix: use stock MLX wheel in Homebrew formula`
   - `1211026 fix: restore May 19 MTP adaptive depth`
   - `68a8b00 fix: restore May 19 adaptive fallback policy`
   - `14b59c0 Revert "perf: avoid profiling sync in MTP verify loop"`
+  - `d4f614b perf(mtp): gate deep adaptive drafts`
 
 The service is healthy on `127.0.0.1:8000`.
+
+## 2026-05-24 known-good checkpoint
+
+This is the state Jason accepted as usable. Do not casually revert this policy
+while chasing small speed changes.
+
+Installed and pushed commit:
+
+```text
+d4f614b perf(mtp): gate deep adaptive drafts
+```
+
+The working adaptive-depth behavior is:
+
+- Start adaptive MTP at `depth=2`, not `depth=3`.
+- Let `depth=2` be the normal fast lane.
+- Enter `depth=3` only after repeated depth-2 full accepts and a healthy recent
+  accept window.
+- If `depth=3` rejects early, immediately drop back to `depth=2`.
+- Keep some stickiness at `depth=2` so one miss does not collapse straight to
+  `depth=1`.
+
+Known-good long Voco run after this policy:
+
+```text
+2026-05-24 11:06:28
+Chat completion: 1397 tokens in 53.70s (27.1 tok/s), prompt: 7633
+MTP[8] finish=stop tokens=1398 cycles=547 adaptive<=3
+draft_accept=850/1195 (71.1%)
+full=324/547 rejects=223
+accept_by_depth=[462, 340, 48, 0]
+draft_by_depth=[547, 455, 71, 0]
+fb_replay=0 spec_rb_count=138
+```
+
+This meets the current target: VLM + Native MTP, normal text output, and better
+than `25.2 tok/s`.
+
+Do not roll back to the pure May 18/May 19 speed-first policy that starts at
+max depth and holds `depth=3` too long. On the current route, that produced:
+
+```text
+Chat completion: 356 tokens in 31.25s (20.7 tok/s), prompt: 10730
+draft_accept=192/451 (42.6%)
+```
+
+That version proved that more depth is not automatically more speed. The stable
+fix is the gated deep-draft policy in `d4f614b`.
 
 ## What is fixed
 
@@ -97,15 +146,17 @@ fb_replay=0 spec_rb_count=30
 This means the native-MTP path is active, rollback is the native speculative
 rollback path, and the runtime is no longer stuck almost entirely at D1/D2.
 
-## What is still not fully recovered
+## Earlier unresolved target
 
-The only remaining goal is to get the repaired path consistently back to
-`25.2 tok/s` or higher, without garbage output and without disabling native MTP.
+The earlier goal was to get the repaired path consistently back to `25.2 tok/s`
+or higher, without garbage output and without disabling native MTP. The
+`d4f614b` checkpoint above has now done that on a representative long Voco run.
 
 Jason previously saw about `25.2 tok/s` from a direct glue/script path. The
-current 140-token direct API test reaches about `23-24 tok/s` warmed. A shorter
-Voco sub-key request reached `25.6 tok/s`, so the client single-digit issue
-should not be treated as the active regression anymore.
+earlier 140-token direct API test reached about `23-24 tok/s` warmed. A shorter
+Voco sub-key request reached `25.6 tok/s`, and the later known-good long Voco
+run reached `27.1 tok/s`, so the client single-digit issue should not be
+treated as the active regression anymore.
 
 The open question is narrower now: why the representative direct/API benchmark
 does not reliably stay above `25.2 tok/s`, and whether the remaining gap is
