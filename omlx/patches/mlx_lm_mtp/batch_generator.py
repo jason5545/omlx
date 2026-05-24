@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, List, Optional, Tuple
@@ -1405,9 +1406,7 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
             target_dist = sparse_targets[depth_index]
             draft_dist = state.draft_accept_lps[depth_index]
             accept_prob = acceptance_probability(target_dist, draft_dist, draft_id)
-            accepted_now = (
-                float(mx.random.uniform(shape=()).item()) <= accept_prob
-            )
+            accepted_now = random.random() <= accept_prob
             correction = draft_id if accepted_now else _sparse_residual_sample(target_dist, draft_dist)
             target_lp_2d = None
         else:
@@ -1422,9 +1421,7 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
                 target_accept_lp[depth_index, draft_id].item()
                 - draft_accept_lp[draft_id].item()
             )
-            accepted_now = log_accept >= 0 or float(
-                mx.random.uniform(shape=()).item()
-            ) < math.exp(log_accept)
+            accepted_now = log_accept >= 0 or random.random() < math.exp(log_accept)
             correction = (
                 draft_id
                 if accepted_now
