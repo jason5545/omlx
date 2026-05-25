@@ -685,6 +685,7 @@ class VLMBatchedEngine(BaseEngine):
             maybe_apply_pre_load_patches(
                 self._model_name,
                 model_settings=self._model_settings,
+                for_vlm=True,
             )
             apply_mlx_vlm_mtp_patch()
             _patch_video_processor_bug()
