@@ -248,10 +248,16 @@ class BatchedEngine(BaseEngine):
         )
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
-        from ..utils.model_loading import apply_post_load_transforms
+        from ..utils.model_loading import apply_post_load_transforms, materialize_lazy_state
 
         self._model = apply_post_load_transforms(
             self._model, self._model_settings, model_path=self._model_name,
+        )
+
+        # Materialize lazy buffers on the loader thread so per-engine
+        # inference threads can read them (#1304).
+        await loop.run_in_executor(
+            get_mlx_executor(), materialize_lazy_state, self._model
         )
 
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
@@ -324,6 +330,16 @@ class BatchedEngine(BaseEngine):
                         set_mtp_active(False)
                         try:
                             draft_model, _ = load(specprefill_draft)
+                            # Materialize frozen buffers (RoPE freqs, etc.)
+                            # on the loader thread. mlx_lm.load only does
+                            # mx.eval(model.parameters()) and leaves siblings
+                            # lazy bound to this thread's stream. Without
+                            # this, the first score_tokens() call from
+                            # Scheduler.step on the per-engine executor
+                            # thread raises "no Stream(gpu, X) in current
+                            # thread". Same root cause and fix as e93c408
+                            # for the VLM MTP drafter.
+                            materialize_lazy_state(draft_model)
                             return draft_model
                         finally:
                             set_mtp_active(was_mtp)

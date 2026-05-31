@@ -32,8 +32,8 @@
                 base_path: '',
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk' },
                 model: { model_dirs: [''] },
-                memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced' },
-                scheduler: { max_concurrent_requests: 8 },
+                memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
+                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
@@ -379,6 +379,11 @@
             benchUploadDone: null,
             benchUploading: false,
             benchUploadSkipped: null,  // { features: [...] } when upload was skipped due to experimental features
+            // { bench_id, model_id } when the server reports a running bench
+            // that is NOT the one this tab is displaying. Drives the "another
+            // bench is running" banner + disables Start so the user doesn't
+            // race a 409 on the server.
+            benchOtherActive: null,
 
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
@@ -467,6 +472,17 @@
                     this.handleMainTabChange(value);
                 });
 
+                // When the user returns to this browser tab after looking
+                // elsewhere, re-check whether a different bench just started
+                // in another tab. Fires the banner without requiring an
+                // in-app tab switch.
+                document.addEventListener('visibilitychange', () => {
+                    if (document.visibilityState !== 'visible') return;
+                    if (this.mainTab === 'bench' && this.benchTab === 'throughput') {
+                        this.loadBenchState();
+                    }
+                });
+
                 this.$watch('hfMlxOnly', () => {
                     this.hfRecommended = { trending: [], popular: [] };
                     this.hfRecommendedLoaded = false;
@@ -545,6 +561,7 @@
                 }
                 if (value === 'bench') {
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
+                    await this.loadBenchState();
                     await this.loadAccState();
                 }
             },
@@ -676,7 +693,7 @@
                             : '';
 
                         // Normalize memory guard tier to one of the known values.
-                        const validTiers = ['safe', 'balanced', 'aggressive'];
+                        const validTiers = ['safe', 'balanced', 'aggressive', 'custom'];
                         if (!validTiers.includes(this.globalSettings.memory.memory_guard_tier)) {
                             this.globalSettings.memory.memory_guard_tier = 'balanced';
                         }
@@ -714,6 +731,7 @@
                 if (!s.server.port) errors.push('Port');
                 if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
                 if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
+                if (!s.scheduler.embedding_batch_size) errors.push('Embedding Batch Size');
                 if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
                 if (!s.sampling.max_context_window) errors.push('Max Context Window');
                 if (!s.sampling.max_tokens) errors.push('Max Tokens');
@@ -751,7 +769,9 @@
                             model_fallback: this.globalSettings.model.model_fallback,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
                             memory_guard_tier: this.globalSettings.memory.memory_guard_tier,
+                            memory_guard_custom_ceiling_gb: this.globalSettings.memory.memory_guard_custom_ceiling_gb,
                             max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
+                            embedding_batch_size: this.globalSettings.scheduler.embedding_batch_size,
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
@@ -2511,10 +2531,24 @@
                                 total: data.total,
                             };
                         } else if (data.type === 'result') {
+                            // SSE replay-on-subscribe re-delivers every event on
+                            // every reconnect (incl. page refresh), so append-only
+                            // arrays must dedupe. Single rows are keyed by
+                            // (pp, tg); batch rows by batch_size.
                             if (data.data.test_type === 'single') {
-                                this.benchSingleResults = [...this.benchSingleResults, data.data];
+                                const exists = this.benchSingleResults.some(
+                                    r => r.pp === data.data.pp && r.tg === data.data.tg
+                                );
+                                if (!exists) {
+                                    this.benchSingleResults = [...this.benchSingleResults, data.data];
+                                }
                             } else if (data.data.test_type === 'batch') {
-                                this.benchBatchResults = [...this.benchBatchResults, data.data];
+                                const exists = this.benchBatchResults.some(
+                                    r => r.batch_size === data.data.batch_size
+                                );
+                                if (!exists) {
+                                    this.benchBatchResults = [...this.benchBatchResults, data.data];
+                                }
                             }
                         } else if (data.type === 'done') {
                             // Benchmark tests done, uploading starts
@@ -2527,7 +2561,13 @@
                             };
                             this.loadModels();
                         } else if (data.type === 'upload') {
-                            this.benchUploadResults = [...this.benchUploadResults, data.data];
+                            // Dedupe on replay: upload entries are unique by context_length.
+                            const exists = this.benchUploadResults.some(
+                                r => r.context_length === data.data.context_length
+                            );
+                            if (!exists) {
+                                this.benchUploadResults = [...this.benchUploadResults, data.data];
+                            }
                         } else if (data.type === 'upload_done') {
                             this.benchUploadDone = data.data;
                             this.benchUploading = false;
@@ -2698,6 +2738,88 @@
                 }
             },
 
+            async loadBenchState() {
+                // Discover an in-progress throughput run on tab/page load so
+                // a second tab (or a refresh) can attach to its SSE stream
+                // and replay the run's full event history.
+                //
+                // Three cases:
+                //   1. No active run → clear any stale banner state.
+                //   2. Active run, this tab is already attached → no-op.
+                //   3. Active run, this tab is fresh → auto-attach.
+                //   4. Active run, this tab is displaying a *different*
+                //      completed bench → show banner; let the user decide
+                //      whether to clobber their result view.
+                try {
+                    const resp = await fetch('/admin/api/bench/active');
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+
+                    if (!data.running || !data.bench_id) {
+                        this.benchOtherActive = null;
+                        return;
+                    }
+
+                    // Already attached to this bench — nothing to do.
+                    if (this.benchBenchId === data.bench_id && this.benchEventSource) {
+                        return;
+                    }
+
+                    // We have completed results from a DIFFERENT bench on
+                    // screen — don't silently swap them out. Show a banner
+                    // so the user can explicitly accept the new bench.
+                    const hasStaleResults = !this.benchRunning
+                        && this.benchBenchId
+                        && this.benchBenchId !== data.bench_id
+                        && (this.benchSingleResults.length > 0
+                            || this.benchBatchResults.length > 0);
+                    if (hasStaleResults) {
+                        this.benchOtherActive = {
+                            bench_id: data.bench_id,
+                            model_id: data.model_id,
+                        };
+                        return;
+                    }
+
+                    // Fresh slate: attach.
+                    this.benchBenchId = data.bench_id;
+                    this.benchModelId = data.model_id;
+                    this.benchRunning = true;
+                    this.benchOtherActive = null;
+                    this.connectBenchSSE(data.bench_id);
+                } catch (err) {
+                    console.error('Failed to load bench state:', err);
+                }
+            },
+
+            // User clicked "View live" on the banner — clear the stale
+            // result display, attach to the active run. The replay-on-
+            // subscribe stream re-delivers every event so the new bench
+            // populates its table from the start.
+            acceptOtherBench() {
+                if (!this.benchOtherActive) return;
+                const other = this.benchOtherActive;
+                this.benchOtherActive = null;
+                this.benchBenchId = other.bench_id;
+                this.benchModelId = other.model_id;
+                this.benchRunning = true;
+                this.benchSingleResults = [];
+                this.benchBatchResults = [];
+                this.benchUploadResults = [];
+                this.benchUploadDone = null;
+                this.benchUploadSkipped = null;
+                this.benchProgress = null;
+                this.benchError = '';
+                this.connectBenchSSE(other.bench_id);
+            },
+
+            dismissOtherBench() {
+                // Hide for now; the banner reappears next loadBenchState if
+                // the run is still active. Use case: user wants to keep
+                // reviewing their previous result for a moment.
+                this.benchOtherActive = null;
+            },
+
             // Bench sub-tab
             setBenchTab(tab) {
                 if (!DASHBOARD_BENCH_TABS.has(tab)) return;
@@ -2706,6 +2828,7 @@
                 this.syncTabStateToUrl();
                 if (tab === 'throughput') {
                     this.loadBenchDeviceInfo();
+                    this.loadBenchState();
                 }
             },
 
@@ -2821,8 +2944,18 @@
                                 this.accCurrentModel = data.model_id || this.accCurrentModel;
                                 break;
                             case 'result':
-                                data.data._showCategories = false;
-                                this.accAllResults.push(data.data);
+                                // Dedupe on replay: accuracy results are unique by
+                                // (model_id, benchmark).
+                                {
+                                    const exists = this.accAllResults.some(
+                                        r => r.model_id === data.data.model_id
+                                          && r.benchmark === data.data.benchmark
+                                    );
+                                    if (!exists) {
+                                        data.data._showCategories = false;
+                                        this.accAllResults.push(data.data);
+                                    }
+                                }
                                 break;
                             case 'done':
                                 this.accProgress = null;
@@ -3271,75 +3404,98 @@
                 }
             },
 
-            // Description shown next to the Memory guard tier dropdown.
-            // Names the tier and its real-time safety buffer; the line below
-            // (memoryGuardBreakdownHTML) shows the live numbers.
+            // Description text shown next to the Memory guard tier dropdown.
+            // safe / balanced / aggressive get a "free + inactive + N% of
+            // active (via macOS reclaim_method)" sentence. custom shows the
+            // user-supplied ceiling.
             get memoryGuardTierDescription() {
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
                 const tierLabel = window.t('settings.resource.guard_tier.' + tier);
-                const buffer = { safe: 2, balanced: 1, aggressive: 0.5 }[tier] ?? 1;
-                const template = window.t('settings.resource.guard_tier.description_template');
-                return template
+                if (tier === 'custom') {
+                    const gb = Number(
+                        this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
+                    ).toFixed(1);
+                    return window
+                        .t('settings.resource.guard_tier.description_custom')
+                        .replace('{custom_gb}', gb);
+                }
+                const pct = { safe: 20, balanced: 50, aggressive: 80 }[tier] ?? 50;
+                const method = window.t(
+                    'settings.resource.guard_tier.reclaim_method.' + tier
+                );
+                return window
+                    .t('settings.resource.guard_tier.description_template')
                     .replace('{tier}', tierLabel)
-                    .replace('{buffer_gb}', Number(buffer).toFixed(1));
+                    .replace('{active_pct}', pct)
+                    .replace('{reclaim_method}', method);
             },
 
-            // Breakdown line under the tier description. Shows which side of
-            // min(static, dynamic) is binding right now and what the inputs
-            // are. Rendered via DOMPurify-sanitized x-html so the GB values
-            // can be wrapped in <strong>.
+            // Breakdown line. For ratio tiers: `Free X, inactive Y, active Z
+            // × N% = R → ceiling C`. For custom: `Custom ceiling X GB →
+            // effective ceiling C` (after clamp by static / metal cap).
             get memoryGuardBreakdownHTML() {
                 const sys = this.globalSettings.system || {};
-                const totalBytes = sys.total_memory_bytes || 0;
-                if (!totalBytes) return '';
                 const GB = 1024 ** 3;
-                const totalGB = totalBytes / GB;
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
-                const tierLabel = window.t('settings.resource.guard_tier.' + tier);
+                const fmt = (gb) => Number(gb).toFixed(1);
+                const bold = (gb) => `<strong>${fmt(gb)} GB</strong>`;
 
+                // Static / metal cap for the final clamp shown to the user.
+                const totalGB = (sys.total_memory_bytes || 0) / GB;
                 const staticReserveGB =
                     totalGB < 16
                         ? 4
-                        : ({ safe: 12, balanced: 8, aggressive: 6 }[tier] ?? 8);
-                const otherAppReserveGB =
-                    { safe: 2, balanced: 1, aggressive: 0.5 }[tier] ?? 1;
-                const staticCeiling = totalGB - staticReserveGB;
+                        : { safe: 12, balanced: 8, aggressive: 6, custom: 8 }[tier] ?? 8;
+                const staticCeiling = Math.max(0, totalGB - staticReserveGB);
+                const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
 
-                const availableBytes = sys.available_memory_bytes || 0;
-                const omlxFootprintBytes = sys.omlx_phys_footprint_bytes || 0;
-                const hasLiveData = availableBytes > 0 || omlxFootprintBytes > 0;
-                const dynamicCeiling = hasLiveData
-                    ? Math.max(
-                          0,
-                          (omlxFootprintBytes + availableBytes) / GB
-                              - otherAppReserveGB,
-                      )
-                    : staticCeiling;
+                // Helper: is the kernel iogpu.wired_limit_mb the smallest
+                // of the three candidates? When yes we swap "→ ceiling" for
+                // "/ effective ceiling X (kernel limit)" so the user knows
+                // why the value isn't what their tier math suggested.
+                const kernelBinds = (candidates, finalCeiling) =>
+                    metalCapGB > 0 &&
+                    Math.abs(metalCapGB - finalCeiling) < 1e-6 &&
+                    candidates.every((c) => c >= metalCapGB - 1e-6);
 
-                const fmt = (gb) => Number(gb).toFixed(1);
-                const bold = (gb) => `<strong>${fmt(gb)} GB</strong>`;
-                const totalDisplay = bold(totalGB);
-
-                if (hasLiveData && dynamicCeiling < staticCeiling) {
-                    const availableDisplay = bold(availableBytes / GB);
-                    const omlxUsageDisplay = bold(omlxFootprintBytes / GB);
-                    const bufferDisplay = bold(otherAppReserveGB);
+                if (tier === 'custom') {
+                    const custom = Number(
+                        this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
+                    );
+                    const candidates = [custom, staticCeiling];
+                    if (metalCapGB > 0) candidates.push(metalCapGB);
+                    const ceiling = Math.max(0, Math.min(...candidates));
+                    const tmpl = kernelBinds([custom, staticCeiling], ceiling)
+                        ? 'settings.resource.guard_tier.breakdown_custom_kernel_limit'
+                        : 'settings.resource.guard_tier.breakdown_custom';
                     return window
-                        .t('settings.resource.guard_tier.breakdown_dynamic')
-                        .replace('{total}', totalDisplay)
-                        .replace('{available}', availableDisplay)
-                        .replace('{omlx_usage}', omlxUsageDisplay)
-                        .replace('{buffer}', bufferDisplay)
-                        .replace('{tier}', tierLabel);
+                        .t(tmpl)
+                        .replace('{custom_gb}', bold(custom))
+                        .replace('{ceiling}', bold(ceiling));
                 }
-                const reserveDisplay = bold(staticReserveGB);
-                const ceilingDisplay = bold(staticCeiling);
+
+                const freeGB = (sys.free_memory_bytes || 0) / GB;
+                const inactiveGB = (sys.inactive_memory_bytes || 0) / GB;
+                const activeGB = (sys.active_memory_bytes || 0) / GB;
+                const ratio = { safe: 0.2, balanced: 0.5, aggressive: 0.8 }[tier] ?? 0.5;
+                const pct = Math.round(ratio * 100);
+                const reclaim = activeGB * ratio;
+                const omlxGB = (sys.omlx_phys_footprint_bytes || 0) / GB;
+                const dynamicCeiling = omlxGB + freeGB + inactiveGB + reclaim;
+                const candidates = [dynamicCeiling, staticCeiling];
+                if (metalCapGB > 0) candidates.push(metalCapGB);
+                const ceiling = Math.max(0, Math.min(...candidates));
+                const tmpl = kernelBinds([dynamicCeiling, staticCeiling], ceiling)
+                    ? 'settings.resource.guard_tier.breakdown_kernel_limit'
+                    : 'settings.resource.guard_tier.breakdown';
                 return window
-                    .t('settings.resource.guard_tier.breakdown_static')
-                    .replace('{total}', totalDisplay)
-                    .replace('{reserve}', reserveDisplay)
-                    .replace('{tier}', tierLabel)
-                    .replace('{ceiling}', ceilingDisplay);
+                    .t(tmpl)
+                    .replace('{free}', bold(freeGB))
+                    .replace('{inactive}', bold(inactiveGB))
+                    .replace('{active}', bold(activeGB))
+                    .replace(/{active_pct}/g, pct)
+                    .replace('{reclaim}', bold(reclaim))
+                    .replace('{ceiling}', bold(ceiling));
             },
 
             // Computed hot cache size in GB (for manual input)

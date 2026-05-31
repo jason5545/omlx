@@ -711,6 +711,13 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), _load_vlm_sync
         )
 
+        # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
+        # loader thread so per-engine inference threads can read them (#1304).
+        from ..utils.model_loading import materialize_lazy_state
+        await loop.run_in_executor(
+            get_mlx_executor(), materialize_lazy_state, self._vlm_model
+        )
+
         _fix_processor_none_pixels(self._processor)
 
         # Initialize vision feature cache
@@ -835,6 +842,8 @@ class VLMBatchedEngine(BaseEngine):
                     def _load_draft():
                         from ..patches.mlx_lm_mtp import set_mtp_active
 
+                        from ..utils.model_loading import materialize_lazy_state
+
                         was_mtp = False
                         try:
                             from ..patches.mlx_lm_mtp import is_mtp_active
@@ -850,8 +859,18 @@ class VLMBatchedEngine(BaseEngine):
                             )
                             if custom_loaded is not None:
                                 draft_model, _ = custom_loaded
-                                return draft_model
-                            draft_model, _ = mlx_lm_load(specprefill_draft)
+                            else:
+                                draft_model, _ = mlx_lm_load(specprefill_draft)
+                            # Materialize frozen buffers (RoPE freqs, etc.)
+                            # on the loader thread. mlx_lm.load only does
+                            # mx.eval(model.parameters()) and leaves siblings
+                            # lazy bound to this thread's stream. Without
+                            # this, the first score_tokens() call from
+                            # Scheduler.step on the per-engine executor
+                            # thread raises "no Stream(gpu, X) in current
+                            # thread". Same root cause and fix as e93c408
+                            # for the VLM MTP drafter.
+                            materialize_lazy_state(draft_model)
                             return draft_model
                         finally:
                             set_mtp_active(was_mtp)

@@ -26,10 +26,24 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry, ModelOwnershipError
+from .utils.compile_cache import (
+    clear_thread_compile_cache,
+    compile_cache_clear_available,
+)
 
 logger = logging.getLogger(__name__)
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+# Fallback only: used when the MLX compile-cache clear symbol is unavailable
+# (see omlx/utils/compile_cache.py). In that case a per-engine MLX worker
+# thread cannot exit safely (its thread_local ~CompilerCache would free
+# @mx.compile graphs' Python objects without the GIL -> crash), so close()
+# keeps the executor + stream alive here for the process lifetime instead of
+# shutting the thread down. With the clear symbol present (the normal path)
+# these stay empty and the worker threads shut down normally.
+_immortal_mlx_executors: list = []
+_immortal_mlx_streams: list = []
 
 
 def _init_mlx_thread() -> None:
@@ -133,12 +147,22 @@ class EngineCore:
         )
         self._owns_model = True
 
-        # Create scheduler
+        # Per-engine executor with dedicated mx.Stream (#1248).
+        # Each EngineCore gets its own thread + GPU stream so different
+        # models can run scheduler.step() concurrently.
+        self._mlx_stream = mx.new_thread_local_stream(mx.default_device())
+        self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"mlx-engine-{self._engine_id[:8]}",
+        )
+
+        # Create scheduler with per-engine stream
         scheduler_config = self.config.scheduler_config or SchedulerConfig()
         self.scheduler = Scheduler(
             model=model,
             tokenizer=tokenizer,
             config=scheduler_config,
+            stream=self._mlx_stream,
         )
 
         # Output collectors for low-latency streaming (vLLM pattern)
@@ -151,11 +175,6 @@ class EngineCore:
         self._task: Optional[asyncio.Task] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
-
-        # Global single-thread executor shared across ALL engines.
-        # mlx-lm uses a module-level Metal stream, so concurrent MLX calls
-        # from different engine threads cause segfaults. See issue #85.
-        self._mlx_executor = get_mlx_executor()
 
         logger.debug(f"Engine {self._engine_id} initialized")
 
@@ -698,9 +717,9 @@ class EngineCore:
 
         self._closed = True
 
-        # Both shutdown() and deep_reset() touch generation_stream (directly
+        # Both shutdown() and deep_reset() touch the engine stream (directly
         # or via _drain_pending_async_removes / _do_abort_request). The
-        # stream is bound to the MLX executor thread, so dispatch both
+        # stream is bound to the engine's executor thread, so dispatch both
         # through the executor; fall back to a direct call if the executor
         # is already shut down.
         for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
@@ -711,6 +730,29 @@ class EngineCore:
                     fn()
                 except RuntimeError:
                     pass
+
+        if self._mlx_executor is not None:
+            # MLX's @mx.compile cache is a C++ thread_local CompilerCache. If
+            # this worker thread exits with a non-empty cache, ~CompilerCache
+            # frees the cached graphs' Python objects from a thread-exit handler
+            # WITHOUT the GIL -> "PyThreadState_Get: GIL is released" crash for
+            # models with module-scope @mx.compile graphs (DeepSeek V4 unload,
+            # ml-explore/mlx #3280). Clear the cache ON this worker thread (GIL
+            # held) before the thread is torn down so the destructor runs on an
+            # empty cache, then shut down normally. See utils/compile_cache.py.
+            if compile_cache_clear_available():
+                try:
+                    self._mlx_executor.submit(clear_thread_compile_cache).result()
+                except RuntimeError:
+                    pass
+                self._mlx_executor.shutdown(wait=True)
+            else:
+                # Fallback: the clear symbol is unavailable, so do NOT exit the
+                # worker thread (that would run the unsafe destructor). Keep it
+                # alive for the process lifetime via the module-global registry.
+                _immortal_mlx_executors.append(self._mlx_executor)
+                _immortal_mlx_streams.append(self._mlx_stream)
+            self._mlx_executor = None
 
         # Clear output collectors
         for collector in self._output_collectors.values():

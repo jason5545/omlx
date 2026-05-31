@@ -361,7 +361,18 @@
                                             <option value="safe">{{ t('settings.resource.guard_tier.safe') }}</option>
                                             <option value="balanced">{{ t('settings.resource.guard_tier.balanced') }}</option>
                                             <option value="aggressive">{{ t('settings.resource.guard_tier.aggressive') }}</option>
+                                            <option value="custom">{{ t('settings.resource.guard_tier.custom') }}</option>
                                         </select>
+                                        <div x-show="globalSettings.memory.prefill_memory_guard && globalSettings.memory.memory_guard_tier === 'custom'"
+                                             class="flex items-center gap-1">
+                                            <input type="number"
+                                                   x-model.number="globalSettings.memory.memory_guard_custom_ceiling_gb"
+                                                   min="1"
+                                                   step="1"
+                                                   placeholder="{{ t('settings.resource.guard_tier.custom_input_placeholder') }}"
+                                                   class="w-20 px-2 py-1 text-xs border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
+                                            <span class="text-xs text-neutral-500">GB</span>
+                                        </div>
                                         <button type="button"
                                                 @click="globalSettings.memory.prefill_memory_guard = !globalSettings.memory.prefill_memory_guard"
                                                 :class="globalSettings.memory.prefill_memory_guard ? 'bg-black' : 'bg-neutral-200'"
@@ -449,6 +460,16 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.max_concurrent_requests_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.scheduler.max_concurrent_requests"
+                                           min="1"
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <!-- Embedding Batch Size -->
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.embedding_batch_size') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.embedding_batch_size_hint') }}</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.scheduler.embedding_batch_size"
                                            min="1"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
@@ -866,7 +887,7 @@
                                 {{ t('settings.models.table.type') }}
                                 <span x-show="sortBy === 'type'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
-                            <div class="hidden sm:flex w-20 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
+                            <div class="hidden sm:flex w-60 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
                                 {{ t('settings.models.table.size') }}
                                 <span x-show="sortBy === 'size'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>

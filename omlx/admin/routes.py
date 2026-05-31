@@ -212,10 +212,12 @@ class GlobalSettingsRequest(BaseModel):
 
     # Memory enforcement
     memory_prefill_memory_guard: bool | None = None
-    memory_guard_tier: str | None = None  # "safe" / "balanced" / "aggressive"
+    memory_guard_tier: str | None = None  # "safe" / "balanced" / "aggressive" / "custom"
+    memory_guard_custom_ceiling_gb: float | None = None  # only used when tier == "custom"
 
     # Scheduler settings
     max_concurrent_requests: int | None = None
+    embedding_batch_size: int | None = None
     chunked_prefill: bool | None = None
 
     # Cache settings
@@ -657,13 +659,16 @@ async def _reload_models() -> tuple[bool, str]:
 
 
 async def _apply_memory_guard_tier_runtime(
-    tier: str,
+    tier: str | None = None,
+    custom_ceiling_gb: float | None = None,
 ) -> tuple[bool, str]:
     """
-    Apply memory_guard_tier change at runtime.
+    Apply memory_guard_tier (and optionally custom ceiling) at runtime.
 
-    Pushes the new tier into the running ProcessMemoryEnforcer, which
+    Pushes both values into the running ProcessMemoryEnforcer, which
     recomputes static + dynamic ceilings on its next propagation tick.
+    `tier` and `custom_ceiling_gb` can be passed together (Custom tier
+    save) or independently.
 
     Returns:
         Tuple of (success, message)
@@ -671,20 +676,28 @@ async def _apply_memory_guard_tier_runtime(
     from ..server import _server_state
     from ..settings import VALID_MEMORY_GUARD_TIERS
 
-    value = (tier or "").strip().lower()
-    if value not in VALID_MEMORY_GUARD_TIERS:
-        return False, (
-            f"Invalid memory_guard_tier: '{tier}' "
-            f"(must be one of {sorted(VALID_MEMORY_GUARD_TIERS)})"
-        )
-
     enforcer = _server_state.process_memory_enforcer
     if enforcer is None:
         return False, "Process memory enforcer not initialized"
 
-    old = enforcer.memory_guard_tier
-    enforcer.memory_guard_tier = value
-    return True, f"Memory guard tier: {old} -> {value}"
+    changes = []
+    if tier is not None:
+        value = tier.strip().lower()
+        if value not in VALID_MEMORY_GUARD_TIERS:
+            return False, (
+                f"Invalid memory_guard_tier: '{tier}' "
+                f"(must be one of {sorted(VALID_MEMORY_GUARD_TIERS)})"
+            )
+        old_tier = enforcer.memory_guard_tier
+        enforcer.memory_guard_tier = value
+        changes.append(f"tier: {old_tier} -> {value}")
+    if custom_ceiling_gb is not None:
+        new_bytes = max(0, int(float(custom_ceiling_gb) * 1024**3))
+        enforcer.memory_guard_custom_ceiling_bytes = new_bytes
+        changes.append(f"custom_ceiling: {custom_ceiling_gb} GB")
+    if not changes:
+        return True, "(no change)"
+    return True, "Memory guard updated — " + ", ".join(changes)
 
 
 async def _apply_cache_settings_runtime(
@@ -1089,6 +1102,23 @@ def get_system_memory_info() -> dict:
     except Exception:
         pass
 
+    # Live macOS vm_stat layers so the admin dashboard can preview the
+    # tier-aware ceiling (free + inactive + active * ratio). Zero on
+    # non-macOS / call failure — JS falls back to available_bytes.
+    free_memory_bytes = 0
+    inactive_memory_bytes = 0
+    active_memory_bytes = 0
+    try:
+        from ..process_memory_enforcer import get_macos_vm_stats
+
+        vm = get_macos_vm_stats()
+        if vm is not None:
+            free_memory_bytes = int(vm.get("free", 0))
+            inactive_memory_bytes = int(vm.get("inactive", 0))
+            active_memory_bytes = int(vm.get("active", 0))
+    except Exception:
+        pass
+
     return {
         "total_bytes": total_bytes,
         "total_formatted": format_size(total_bytes),
@@ -1098,6 +1128,9 @@ def get_system_memory_info() -> dict:
         "omlx_phys_footprint_bytes": omlx_phys_footprint_bytes,
         "iogpu_wired_limit_bytes": iogpu_wired_limit_bytes,
         "omlx_wired_limit_request_bytes": omlx_wired_limit_request_bytes,
+        "free_memory_bytes": free_memory_bytes,
+        "inactive_memory_bytes": inactive_memory_bytes,
+        "active_memory_bytes": active_memory_bytes,
     }
 
 
@@ -1510,6 +1543,17 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
     binding on macOS arm64), or has neither API available.
     """
+    # Install the torch stub BEFORE any xgrammar import. If this lives
+    # inside the first try-block, a failure on the 0.1.34+ path can leave
+    # the fallback try-block importing xgrammar without the stub, which
+    # is guaranteed ImportError on stub-only (DMG) deployments.
+    try:
+        from omlx._torch_stub import install as _install_torch_stub
+
+        _install_torch_stub()
+    except Exception as e:  # pragma: no cover — defensive
+        logger.debug("torch stub install failed: %s", e)
+
     # Prefer the 0.1.34+ registry so newer parsers (qwen3_6, gemma4,
     # deepseek_v4, ...) are exposed.
     try:
@@ -2696,9 +2740,11 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "memory": {
             "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
             "memory_guard_tier": global_settings.memory.memory_guard_tier,
+            "memory_guard_custom_ceiling_gb": global_settings.memory.memory_guard_custom_ceiling_gb,
         },
         "scheduler": {
             "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
+            "embedding_batch_size": global_settings.scheduler.embedding_batch_size,
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
         },
         "cache": {
@@ -2764,6 +2810,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "auto_model_memory": memory_info["auto_limit_formatted"],
             "available_memory_bytes": memory_info["available_bytes"],
             "omlx_phys_footprint_bytes": memory_info["omlx_phys_footprint_bytes"],
+            "free_memory_bytes": memory_info["free_memory_bytes"],
+            "inactive_memory_bytes": memory_info["inactive_memory_bytes"],
+            "active_memory_bytes": memory_info["active_memory_bytes"],
             "iogpu_wired_limit_bytes": memory_info["iogpu_wired_limit_bytes"],
             "omlx_wired_limit_request_bytes": memory_info[
                 "omlx_wired_limit_request_bytes"
@@ -2811,6 +2860,8 @@ async def update_global_settings(
 
     # Track which settings were applied at runtime
     runtime_applied: list[str] = []
+    pending_embedding_batch_size: int | None = None
+    previous_embedding_batch_size: int | None = None
 
     # Apply server settings
     if request.host is not None:
@@ -2883,14 +2934,23 @@ async def update_global_settings(
         global_settings.model.model_fallback = request.model_fallback
         runtime_applied.append("model_fallback")
 
-    # Apply memory guard tier change (Live)
-    if request.memory_guard_tier is not None:
-        global_settings.memory.memory_guard_tier = (
-            request.memory_guard_tier
-        )
+    # Apply memory guard tier + custom ceiling change (Live)
+    if (
+        request.memory_guard_tier is not None
+        or request.memory_guard_custom_ceiling_gb is not None
+    ):
+        if request.memory_guard_tier is not None:
+            global_settings.memory.memory_guard_tier = (
+                request.memory_guard_tier
+            )
+        if request.memory_guard_custom_ceiling_gb is not None:
+            global_settings.memory.memory_guard_custom_ceiling_gb = float(
+                request.memory_guard_custom_ceiling_gb
+            )
         try:
             success, msg = await _apply_memory_guard_tier_runtime(
-                request.memory_guard_tier
+                tier=request.memory_guard_tier,
+                custom_ceiling_gb=request.memory_guard_custom_ceiling_gb,
             )
             if success:
                 runtime_applied.append("memory_guard_tier")
@@ -2922,6 +2982,15 @@ async def update_global_settings(
         global_settings.scheduler.max_concurrent_requests = (
             request.max_concurrent_requests
         )
+
+    # Apply embedding batch size setting (Live for loaded embedding engines)
+    if request.embedding_batch_size is not None:
+        if request.embedding_batch_size <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid embedding_batch_size: must be > 0",
+            )
+        pending_embedding_batch_size = request.embedding_batch_size
 
     # Apply chunked prefill setting (Live)
     if request.chunked_prefill is not None:
@@ -3204,16 +3273,33 @@ async def update_global_settings(
         global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
         runtime_applied.append("skip_api_key_verification")
 
+    if pending_embedding_batch_size is not None:
+        previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
+        global_settings.scheduler.embedding_batch_size = pending_embedding_batch_size
+
     # Validate settings
     errors = global_settings.validate()
     if errors:
+        if previous_embedding_batch_size is not None:
+            global_settings.scheduler.embedding_batch_size = previous_embedding_batch_size
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
     try:
         global_settings.save()
     except Exception as e:
+        if previous_embedding_batch_size is not None:
+            global_settings.scheduler.embedding_batch_size = previous_embedding_batch_size
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    if pending_embedding_batch_size is not None:
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            await pool.apply_embedding_batch_size(pending_embedding_batch_size)
+        runtime_applied.append("embedding_batch_size")
+        logger.info(f"Embedding batch size set to {pending_embedding_batch_size}")
 
     # Build response message
     message = "Settings saved successfully."
@@ -4556,6 +4642,8 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                     if (child / "config.json").exists():
                         _add_model(child, child.name)
 
+    # Sort case-insensitively by name for a stable, user-friendly order.
+    models.sort(key=lambda m: m["name"].lower())
     return {"models": models}
 
 
@@ -4995,17 +5083,28 @@ async def stream_accuracy_benchmark(
         )
 
     async def event_generator():
+        # Replay-then-attach: every subscriber starts at offset 0 of the
+        # run's event log and follows along live. Lets the HTML dashboard
+        # recover its view on page refresh and lets multiple consumers
+        # (e.g. browser + Swift app) share the same run.
+        seen = 0
         try:
             while True:
-                try:
-                    event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
-                except TimeoutError:
+                async with run.cond:
+                    while seen >= len(run.events) and not run.terminal:
+                        try:
+                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                        except TimeoutError:
+                            break
+                    new = list(run.events[seen:])
+                    seen = len(run.events)
+                    done = run.terminal
+
+                for ev in new:
+                    yield f"data: {json.dumps(ev)}\n\n"
+                if not new and not done:
                     yield ": keepalive\n\n"
-                    continue
-
-                yield f"data: {json.dumps(event)}\n\n"
-
-                if event.get("type") in ("done", "error"):
+                if done:
                     break
         except asyncio.CancelledError:
             pass
@@ -5026,6 +5125,27 @@ async def stream_accuracy_benchmark(
 # =============================================================================
 
 
+@router.get("/api/bench/active")
+async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
+    """Return the currently-running throughput benchmark, if any.
+
+    Symmetric to `/api/bench/accuracy/queue/status` — lets a fresh page
+    load or a second tab discover an in-flight run so it can attach to
+    the SSE stream. Combined with the replay-on-subscribe stream this
+    is what makes the multi-tab + page-refresh story actually work.
+    """
+    from .benchmark import get_active_run
+
+    run = get_active_run()
+    if run is None:
+        return {"running": False, "bench_id": None, "model_id": None}
+    return {
+        "running": True,
+        "bench_id": run.bench_id,
+        "model_id": run.request.model_id,
+    }
+
+
 @router.post("/api/bench/start")
 async def start_benchmark(
     request: Request,
@@ -5034,18 +5154,33 @@ async def start_benchmark(
     """Start a benchmark run.
 
     Validates the model, creates a benchmark run, and starts it
-    as an asyncio background task.
+    as an asyncio background task. Rejects with 409 if another
+    throughput bench is already running — two concurrent runs on
+    the same engine produce mutually-corrupted measurements.
     """
     from .benchmark import (
         BenchmarkRequest,
         cleanup_old_runs,
         create_run,
+        get_active_run,
         run_benchmark,
     )
 
     engine_pool = _get_engine_pool()
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    # One throughput bench at a time. The replay-on-subscribe stream lets
+    # clients attach to the already-running one if that's what they want.
+    active = get_active_run()
+    if active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A throughput benchmark is already running "
+                f"(bench_id={active.bench_id}, model_id={active.request.model_id})."
+            ),
+        )
 
     body = await request.json()
     try:
@@ -5103,19 +5238,28 @@ async def stream_benchmark(
         raise HTTPException(status_code=404, detail=f"Benchmark not found: {bench_id}")
 
     async def event_generator():
+        # Replay-then-attach: see /api/bench/accuracy/{id}/stream for the
+        # full rationale. The bench stream's terminal events are
+        # `upload_done` and `error` — `done` only marks the boundary
+        # between tests and upload.
+        seen = 0
         try:
             while True:
-                try:
-                    event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
-                except TimeoutError:
-                    # Send keepalive
+                async with run.cond:
+                    while seen >= len(run.events) and not run.terminal:
+                        try:
+                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                        except TimeoutError:
+                            break
+                    new = list(run.events[seen:])
+                    seen = len(run.events)
+                    done = run.terminal
+
+                for ev in new:
+                    yield f"data: {json.dumps(ev)}\n\n"
+                if not new and not done:
                     yield ": keepalive\n\n"
-                    continue
-
-                yield f"data: {json.dumps(event)}\n\n"
-
-                # Stop streaming on terminal events
-                if event.get("type") in ("upload_done", "error"):
+                if done:
                     break
         except asyncio.CancelledError:
             pass
@@ -5172,6 +5316,7 @@ async def get_benchmark_results(
         "status": run.status,
         "results": run.results,
         "error": run.error_message if run.error_message else None,
+        "upload_state": run.upload_state,
     }
 
 
