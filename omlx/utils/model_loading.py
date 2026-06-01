@@ -276,11 +276,16 @@ def maybe_apply_pre_load_patches(
             set_mtp_sidecar_expected,
         )
 
-        # Check for MTPLX-style mtp.safetensors sidecar. Keep the sidecar
+        # Check for MTPLX-style mtp.safetensors sidecar. Keep the active
         # expectation scoped to this load; the qwen model patch reads it
         # during TextModel.__init__ and stores an instance flag.
-        mtp_sidecar = mtp_enabled and (Path(model_name) / "mtp.safetensors").exists()
-        set_mtp_sidecar_expected(mtp_sidecar)
+        #
+        # The sidecar itself still matters when mtp_enabled=False on VLM
+        # loads because mlx-vlm may include every *.safetensors file in the
+        # strict load. In that case the MTPModule must exist as a binding site,
+        # while BatchGenerator stays inactive via set_mtp_active(False).
+        mtp_sidecar = (Path(model_name) / "mtp.safetensors").exists()
+        set_mtp_sidecar_expected(mtp_enabled and mtp_sidecar)
         if mtp_sidecar:
             logger.info("MTP sidecar detected: %s/mtp.safetensors", model_name)
 
@@ -335,9 +340,11 @@ def maybe_apply_pre_load_patches(
                 # strict load_weights to fail with "Missing N parameters"
                 # and silently downgrade the engine to LLM, dropping
                 # vision. Scan the index for actual mtp.* keys and skip
-                # attachment when they're absent.
+                # attachment when they're absent, except for MTPLX sidecar
+                # bundles where the sidecar is loaded as a separate shard.
                 has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
-                set_mtp_attach_enabled(has_mtp_weights)
+                has_attachable_mtp = has_mtp_weights or mtp_sidecar
+                set_mtp_attach_enabled(has_attachable_mtp)
 
                 # Sanitize-preservation patch runs unconditionally: the
                 # stock mlx-vlm Model.sanitize strips every ``mtp.*`` key,
@@ -358,12 +365,19 @@ def maybe_apply_pre_load_patches(
                             model_name,
                         )
                 if apply_mlx_vlm_mtp_runtime_patch():
-                    if not has_mtp_weights:
+                    if not has_attachable_mtp:
                         logger.info(
                             "mlx-vlm runtime MTP patch applied for %s "
                             "(config declares mtp heads but checkpoint "
                             "ships no mtp.* weights; MTPModule attachment "
                             "skipped to keep strict load_weights happy)",
+                            model_name,
+                        )
+                    elif mtp_sidecar and not has_mtp_weights:
+                        logger.info(
+                            "mlx-vlm runtime MTP patch applied for %s "
+                            "(mtp.safetensors sidecar present; head attached "
+                            "so strict load_weights can bind sidecar tensors)",
                             model_name,
                         )
                     elif mtp_enabled:
