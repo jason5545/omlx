@@ -19,7 +19,8 @@ hard budget is reached, rather than being cut off abruptly.
 
 import logging
 import re
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -490,6 +491,7 @@ class ThinkingBudgetProcessor:
         *,
         soft_start_ratio: float | None = 0.75,
         soft_max_bias: float = 5.0,
+        token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -500,6 +502,7 @@ class ThinkingBudgetProcessor:
         )
         self._budget = budget
         self._think_start_id = think_start_token_id
+        self._token_to_piece = token_to_piece
 
         # Soft-pressure: apply increasing bias toward </think> in the zone
         # [budget * soft_start_ratio, budget].  None disables soft pressure.
@@ -516,10 +519,11 @@ class ThinkingBudgetProcessor:
         self._thinking_tokens: int = 0
         self._in_thinking: bool = True  # Starts True (prompt ends with <think>)
         self._forcing: bool = False
+        self._waiting_utf8: bool = False
         self._force_idx: int = 0
         self._done: bool = False
         self._first_call: bool = True
-        # After forced sequence, suppress duplicate </think> tokens
+        # After forced sequence, suppress duplicate </think> tokens.
         self._suppress_end: bool = False
         # Sliding window for multi-token end detection
         self._recent_tokens: List[int] = []
@@ -530,6 +534,8 @@ class ThinkingBudgetProcessor:
         # do not advance the budget state.
         self._external_accept_sync: bool = False
         self._accepted_up_to: int | None = None
+        self._last_token_utf8_complete: bool = True
+        self._pending_utf8: bytes = b""
 
     def __call__(self, tokens, logits):
         """mlx-lm logits processor: (tokens, logits) -> logits."""
@@ -554,11 +560,19 @@ class ThinkingBudgetProcessor:
         if self._forcing:
             return self._force_next_token(logits, mx)
 
+        if self._waiting_utf8:
+            return logits
+
         # Hard budget exceeded → force close sequence
         if self._in_thinking and self._thinking_tokens >= self._budget:
-            self._forcing = True
-            self._force_idx = 0
-            return self._force_next_token(logits, mx)
+            if self._last_token_utf8_complete:
+                self._forcing = True
+                self._force_idx = 0
+                self._recent_tokens = []
+                return self._force_next_token(logits, mx)
+            self._waiting_utf8 = True
+            self._recent_tokens = []
+            return logits
 
         # Soft-pressure zone: apply gradual bias toward </think>
         if (
@@ -594,6 +608,16 @@ class ThinkingBudgetProcessor:
 
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""
+        self._last_token_utf8_complete = self._is_utf8_complete(token_id)
+
+        if self._done:
+            if self._think_start_id and token_id == self._think_start_id:
+                self._in_thinking = True
+                self._done = False
+                self._thinking_tokens = 0
+                self._recent_tokens = []
+            return
+
         if self._forcing:
             # Native MTP applies the same stateful logits processor to several
             # speculative verify rows in one cycle.  Rows after the first may
@@ -609,8 +633,8 @@ class ThinkingBudgetProcessor:
             if self._force_idx >= len(self._force_sequence):
                 self._in_thinking = False
                 self._forcing = False
-                # Don't set _done — enter suppression mode to prevent
-                # the model from generating a duplicate </think>.
+                # Stay active briefly to suppress a duplicate close marker
+                # after the forced sequence is accepted.
                 self._suppress_end = True
             return
 
@@ -629,13 +653,50 @@ class ThinkingBudgetProcessor:
                 self._done = True
                 return
 
+        if self._waiting_utf8:
+            if self._last_token_utf8_complete:
+                self._waiting_utf8 = False
+                self._forcing = True
+                self._force_idx = 0
+                self._recent_tokens = []
+            return
+
         # Detect re-entry into thinking (rare but possible)
         if not self._in_thinking and self._think_start_id and token_id == self._think_start_id:
             self._in_thinking = True
+            self._done = False
+            self._thinking_tokens = 0
+            self._recent_tokens = []
             return
 
         if self._in_thinking:
             self._thinking_tokens += 1
+
+    def _is_utf8_complete(self, token_id: int) -> bool:
+        """Best-effort UTF-8 boundary check for accepted token bytes."""
+        if self._token_to_piece is None:
+            return True
+        try:
+            piece = self._token_to_piece(token_id)
+        except Exception:
+            return True
+        if piece is None:
+            return True
+        if isinstance(piece, str):
+            self._pending_utf8 = b""
+            return True
+        self._pending_utf8 += piece
+        try:
+            self._pending_utf8.decode("utf-8")
+            self._pending_utf8 = b""
+            return True
+        except UnicodeDecodeError as exc:
+            if exc.reason == "unexpected end of data" or exc.end == len(
+                self._pending_utf8
+            ):
+                return False
+            self._pending_utf8 = b""
+            return True
 
     def _force_next_token(self, logits, mx):
         """Force the next token in the close-think + trailing sequence."""

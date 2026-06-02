@@ -15,7 +15,7 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
 
     private func makeServices(basePath: String, modelDir: String) -> AppServices {
         let cfg = AppConfig(
-            host: "127.0.0.1",
+            bindAddress: "127.0.0.1",
             port: 8080,
             apiKey: nil,
             basePath: basePath,
@@ -127,5 +127,23 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
         let diff = vm.storageDiff(services: services)
         XCTAssertFalse(diff.baseChanged)
         XCTAssertFalse(diff.dirChanged)
+    }
+
+    func testApplyConfigKeepsWildcardBindButUsesLoopbackEndpoint() {
+        let cfg = AppConfig(
+            bindAddress: "0.0.0.0",
+            port: 8080,
+            apiKey: nil,
+            basePath: "/Users/Fido/.omlx",
+            modelDir: "/Users/Fido/.omlx/models",
+            hfEndpoint: ""
+        )
+        let vm = ServerScreenVM()
+
+        vm.applyConfig(cfg)
+
+        XCTAssertEqual(vm.host, "0.0.0.0")
+        XCTAssertEqual(vm.appliedBindAddress, "0.0.0.0")
+        XCTAssertEqual(vm.effectiveHost, "127.0.0.1")
     }
 }

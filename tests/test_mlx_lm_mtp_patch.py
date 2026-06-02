@@ -502,6 +502,20 @@ class TestDeepseekV4Model:
         applied_again = deepseek_v4_model.apply()
         assert applied_again is True
 
+    def test_mtp_patch_materializes_backbone_and_mtp_cache(self):
+        """DeepSeek-V4 MTP override must keep the base Metal leak fix."""
+        import inspect
+
+        from omlx.patches.mlx_lm_mtp import deepseek_v4_model
+
+        call_source = inspect.getsource(
+            deepseek_v4_model._patch_deepseek_v4_model_call
+        )
+        model_source = inspect.getsource(deepseek_v4_model._patch_model)
+
+        assert "materialize_cache_arrays(cache)" in call_source
+        assert "materialize_cache_arrays(cache)" in model_source
+
 
 class TestBatchGeneratorDispatch:
     @pytest.fixture(autouse=True)

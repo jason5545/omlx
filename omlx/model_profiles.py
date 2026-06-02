@@ -32,6 +32,8 @@ UNIVERSAL_PROFILE_FIELDS = (
     "thinking_budget_enabled",
     "thinking_budget_tokens",
     "reasoning_parser",
+    "guided_grammar_enabled",
+    "guided_grammar",
     "max_tool_result_tokens",
     "chat_template_kwargs",
     "forced_ct_kwargs",
