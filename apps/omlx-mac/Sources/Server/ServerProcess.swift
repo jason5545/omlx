@@ -37,13 +37,14 @@ final class ServerProcess: @unchecked Sendable {
         case stopped
         case starting
         case running(pid: Int32)
+        case attached(pid: Int32?)
         case stopping
         case unresponsive(pid: Int32)
         case failed(message: String)
 
         var isRunningLike: Bool {
             switch self {
-            case .running, .unresponsive: return true
+            case .running, .attached, .unresponsive: return true
             default:                      return false
             }
         }
@@ -89,7 +90,7 @@ final class ServerProcess: @unchecked Sendable {
     enum ReconfigureError: Error { case serverIsLive }
     func reconfigure(bindAddress: String? = nil, port: Int? = nil, basePath: URL? = nil) throws {
         switch state {
-        case .running, .starting, .stopping, .unresponsive:
+        case .running, .attached, .starting, .stopping, .unresponsive:
             throw ReconfigureError.serverIsLive
         case .stopped, .failed:
             break
@@ -118,6 +119,8 @@ final class ServerProcess: @unchecked Sendable {
     private var autoRestartCount    = 0
     private var lastHealthyAt: Date?
     private var expectingExit       = false   // set by stop()/forceRestart() so terminationHandler doesn't trigger auto-restart
+    private var attachedExternally  = false
+    private var attachedOwnerPID: pid_t?
     private let logURL: URL
 
     init(
@@ -141,11 +144,15 @@ final class ServerProcess: @unchecked Sendable {
 
     var isRunning: Bool {
         if case .running = state { return true }
+        if case .attached = state { return true }
         if case .unresponsive = state { return true }
         return process?.isRunning == true
     }
 
-    var pid: Int32? { process?.processIdentifier }
+    var pid: Int32? {
+        if let processPID = process?.processIdentifier { return processPID }
+        return attachedOwnerPID
+    }
 
     /// Start the server. Returns .started on success, .alreadyRunning if
     /// already up, or .portConflict if the port is busy. Throws only on
@@ -153,7 +160,7 @@ final class ServerProcess: @unchecked Sendable {
     @discardableResult
     func start() throws -> StartResult {
         switch state {
-        case .running, .starting, .unresponsive:
+        case .running, .attached, .starting, .unresponsive:
             return .alreadyRunning
         default:
             break
@@ -165,6 +172,10 @@ final class ServerProcess: @unchecked Sendable {
                 pid: resolver.findOwnerPIDSync(),
                 isOMLX: resolver.isOMLXOnPortSync()
             )
+            if conflict.isOMLX {
+                attachExternal(pid: conflict.pid)
+                return .alreadyRunning
+            }
             update(.failed(message: "Port \(port) in use" +
                            (conflict.isOMLX ? " (oMLX server already running)" : "")))
             postPortConflict(conflict)
@@ -176,8 +187,35 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     /// Graceful stop: SIGTERM → wait ≤ stopGraceSeconds → SIGKILL.
-    func stop(timeout: TimeInterval? = nil) async {
+    func stop(timeout: TimeInterval? = nil, stopAttachedExternal: Bool = true) async {
         guard isRunning || state == .starting else { return }
+
+        if isAttachedToExternal {
+            guard stopAttachedExternal else {
+                cancelHealthLoop()
+                attachedExternally = false
+                attachedOwnerPID = nil
+                update(.stopped)
+                return
+            }
+            update(.stopping)
+            cancelHealthLoop()
+            let ownerPID = attachedOwnerPID ?? resolver.findOwnerPIDSync()
+            let stopped = await stopExternalOwner(pid: ownerPID)
+            attachedExternally = false
+            attachedOwnerPID = nil
+            if stopped {
+                update(.stopped)
+            } else {
+                let conflict = PortConflict(
+                    pid: resolver.findOwnerPIDSync(),
+                    isOMLX: resolver.isOMLXOnPortSync()
+                )
+                update(.failed(message: "Could not stop external oMLX on port \(port)"))
+                postPortConflict(conflict)
+            }
+            return
+        }
 
         update(.stopping)
         expectingExit = true
@@ -211,6 +249,28 @@ final class ServerProcess: @unchecked Sendable {
     /// then start() fresh.
     @discardableResult
     func forceRestart() async throws -> StartResult {
+        if isAttachedToExternal {
+            update(.stopping)
+            cancelHealthLoop()
+            let ownerPID = attachedOwnerPID ?? resolver.findOwnerPIDSync()
+            let stopped = await stopExternalOwner(pid: ownerPID)
+            attachedExternally = false
+            attachedOwnerPID = nil
+            autoRestartCount = 0
+            consecutiveFailures = 0
+            update(.stopped)
+            guard stopped else {
+                let conflict = PortConflict(
+                    pid: resolver.findOwnerPIDSync(),
+                    isOMLX: resolver.isOMLXOnPortSync()
+                )
+                update(.failed(message: "Could not restart external oMLX on port \(port)"))
+                postPortConflict(conflict)
+                return .portConflict(conflict)
+            }
+            return try start()
+        }
+
         expectingExit = true
         cancelHealthLoop()
         if let proc = process, proc.isRunning {
@@ -247,6 +307,8 @@ final class ServerProcess: @unchecked Sendable {
     // MARK: - Internal — spawn
 
     private func doStart() throws {
+        attachedExternally = false
+        attachedOwnerPID = nil
         try ensureDir(basePath)
         try ensureDir(logURL.deletingLastPathComponent())
 
@@ -284,6 +346,8 @@ final class ServerProcess: @unchecked Sendable {
     private func handleProcessExit(code: Int32) {
         let wasExpectingExit = expectingExit
         expectingExit = false
+        attachedExternally = false
+        attachedOwnerPID = nil
         process = nil
         closeLog()
 
@@ -365,19 +429,39 @@ final class ServerProcess: @unchecked Sendable {
                 lastHealthyAt = Date()
                 update(.running(pid: pid))
             }
-        case .running(let pid), .unresponsive(let pid):
+        case .attached(let pid):
             if await resolver.isHealthy() {
                 consecutiveFailures = 0
                 lastHealthyAt = Date()
-                if case .unresponsive = state {
-                    update(.running(pid: pid))
+                attachedOwnerPID = pid ?? attachedOwnerPID
+            } else {
+                consecutiveFailures += 1
+                if consecutiveFailures >= maxHealthFailures {
+                    update(.unresponsive(pid: attachedOwnerPID ?? pid ?? 0))
                 }
+            }
+        case .running(let pid):
+            if await resolver.isHealthy() {
+                consecutiveFailures = 0
+                lastHealthyAt = Date()
             } else {
                 consecutiveFailures += 1
                 if consecutiveFailures >= maxHealthFailures,
                    case .running = state {
                     update(.unresponsive(pid: pid))
                 }
+            }
+        case .unresponsive(let pid):
+            if await resolver.isHealthy() {
+                consecutiveFailures = 0
+                lastHealthyAt = Date()
+                if attachedExternally {
+                    update(.attached(pid: attachedOwnerPID ?? pid))
+                } else {
+                    update(.running(pid: pid))
+                }
+            } else {
+                consecutiveFailures += 1
             }
         default:
             return
@@ -396,6 +480,104 @@ final class ServerProcess: @unchecked Sendable {
             "--base-path", basePath.path,
             "--port", String(port),
         ]
+    }
+
+    private func attachExternal(pid: pid_t?) {
+        process = nil
+        closeLog()
+        expectingExit = false
+        attachedExternally = true
+        attachedOwnerPID = pid
+        consecutiveFailures = 0
+        autoRestartCount = 0
+        lastHealthyAt = Date()
+        update(.attached(pid: pid))
+        startHealthCheckLoop()
+    }
+
+    private var isAttachedToExternal: Bool {
+        process == nil && attachedExternally
+    }
+
+    private func stopExternalOwner(pid: pid_t?) async -> Bool {
+        if let pid, isHomebrewOMLXOwner(pid: pid) {
+            if await runBrewServices(action: "stop"),
+               await waitUntilPortFree(timeout: 12) {
+                return true
+            }
+        }
+
+        if let pid {
+            _ = await resolver.killExternal(pid, timeout: 8)
+        }
+        return await waitUntilPortFree(timeout: 8)
+    }
+
+    private func waitUntilPortFree(timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if !resolver.isPortInUseSync() { return true }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return !resolver.isPortInUseSync()
+    }
+
+    private func isHomebrewOMLXOwner(pid: pid_t) -> Bool {
+        guard let command = commandLine(for: pid) else { return false }
+        return command.contains("/opt/homebrew/")
+            && (command.contains("/omlx")
+                || command.contains("omlx.cli")
+                || command.contains("omlx serve"))
+    }
+
+    private func commandLine(for pid: pid_t) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-p", String(pid), "-o", "command="]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            return nil
+        }
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func runBrewServices(action: String) async -> Bool {
+        let candidates = [
+            "/opt/homebrew/bin/brew",
+            "/usr/local/bin/brew",
+        ]
+        guard let brew = candidates.first(where: {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }) else { return false }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: brew)
+        proc.arguments = ["services", action, "jason5545/omlx/omlx"]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            return false
+        }
+
+        let deadline = Date().addingTimeInterval(15)
+        while proc.isRunning && Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        if proc.isRunning {
+            proc.terminate()
+            return false
+        }
+        return proc.terminationStatus == 0
     }
 
     private func update(_ next: State) {

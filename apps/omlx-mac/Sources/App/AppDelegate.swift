@@ -358,7 +358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let group = DispatchGroup()
         group.enter()
         Task { @MainActor in
-            await server.stop(timeout: 8)
+            await server.stop(timeout: 8, stopAttachedExternal: false)
             group.leave()
         }
         _ = group.wait(timeout: .now() + 9)
