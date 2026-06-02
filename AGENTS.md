@@ -69,6 +69,69 @@ brew info --json=v2 jason5545/omlx/omlx | jq '.formulae[0] | {full_name,tap,tap_
 https://github.com/jason5545/omlx.git
 ```
 
+## Mac app 操作
+
+主要路徑：
+
+- Xcode project：`/Users/jianruicheng/GitHub/omlx/apps/omlx-mac/oMLX.xcodeproj`
+- scheme：`oMLX`
+- staged app：`/Users/jianruicheng/GitHub/omlx/apps/omlx-mac/build/Stage/oMLX.app`
+- 已部署 app：`/Applications/oMLX.app`
+- app server log：`~/Library/Application Support/oMLX/logs/server.log`
+
+Mac app 跟 Homebrew service 都預設使用 `127.0.0.1:8000`。新版 app 的正確行為是：
+
+- 如果 `8000` 上已經是健康的 oMLX server（`/health` 回 200），app 應 attach，而不是顯示 port conflict。
+- attached mode 仍可控制 server。`Stop`/`Restart` 如果辨識到 owner 是 Homebrew oMLX，應先走 `brew services stop jason5545/omlx/omlx`，因為 formula service 是 `keep_alive true`，單純 kill PID 會被 launchd 拉回來。
+- app 自己 Quit / relaunch 不應停掉 attached 的 Homebrew service。只有使用者明確按 Stop/Restart 時才控制外部 owner。
+- 如果 `8000` 被非 oMLX process 佔用，才應顯示 port conflict。
+
+重開 macOS app，但不要動 Homebrew service：
+
+```bash
+osascript -e 'tell application "oMLX" to quit'
+pkill -x oMLX   # 只有卡住時才用
+open /Applications/oMLX.app
+```
+
+build release app：
+
+```bash
+apps/omlx-mac/Scripts/build.sh release
+```
+
+如果 `packaging/_export` 不存在或 donor layers 不完整，才重建 donor：
+
+```bash
+apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+```
+
+`build.sh` 會 ad-hoc sign。要部署給 Jason 用時，必須再用 Jason 的 Apple Development cert 重簽 staged app：
+
+```text
+Apple Development: Jui Chen Chien (4L22S63983)
+TeamIdentifier=MW4GWYGX56
+```
+
+憑證通常只有 escalated shell 看得到；sandbox 內 `security find-identity` 可能會顯示 0 identities。
+
+重簽原則：
+
+- 先清掉 staged bundle 裡的 broken symlink（常見於 stripped dynlib links），否則 `codesign --strict` 可能回 `No such file or directory`。
+- 先簽 `Contents/Resources/Python` 裡的 embedded Mach-O（`.so`/`.dylib`/`.bundle`/可執行檔）。
+- 最後用 `--options runtime --entitlements apps/omlx-mac/Resources/oMLX.entitlements` 簽外層 `oMLX.app`。
+- 用 `codesign --verify --deep --strict --verbose=4` 驗 staged app 與 `/Applications/oMLX.app`。
+- Apple Development cert 未 notarize，`spctl --assess` 可能 rejected；這不等於 `codesign --verify` 失敗。
+
+部署：
+
+```bash
+rm -rf /Applications/oMLX.app
+ditto apps/omlx-mac/build/Stage/oMLX.app /Applications/oMLX.app
+xattr -dr com.apple.quarantine /Applications/oMLX.app
+codesign --verify --deep --strict --verbose=4 /Applications/oMLX.app
+```
+
 ## 追 upstream
 
 更新 upstream 時請先檢查差異，不要盲目覆蓋本地 patch：
