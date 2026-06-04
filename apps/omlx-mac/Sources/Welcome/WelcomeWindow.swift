@@ -278,9 +278,10 @@ final class WelcomeViewModel: ObservableObject {
         // clears the field — interpret that as "use the default for the
         // basePath I just picked" rather than persisting an empty string.
         let trimmedDir = modelDir.trimmingCharacters(in: .whitespaces)
-        config.modelDir = trimmedDir.isEmpty
+        let resolvedModelDir = trimmedDir.isEmpty
             ? AppConfig.defaultModelDir(forBasePath: resolvedBase)
             : trimmedDir
+        config.setModelDirs([resolvedModelDir])
         // hf_endpoint is set later from Downloads → "HF Mirror" — we don't
         // touch the existing value here so a returning user's mirror choice
         // survives a re-entry into the wizard.

@@ -178,12 +178,14 @@ brew audit --formula jason5545/omlx/omlx
   omlx/engine/vlm.py \
   omlx/engine_pool.py \
   omlx/models/vlm.py \
-  omlx/patches/gated_delta_advance.py \
   omlx/patches/mlx_lm_mtp/batch_generator.py \
+  omlx/patches/step3p7/__init__.py \
+  omlx/patches/step3p7/step3p7_model.py \
   omlx/patches/mlx_vlm_mtp/__init__.py \
   omlx/patches/mlx_vlm_mtp/qwen35_vlm_runtime.py \
   omlx/server.py \
-  omlx/settings.py
+  omlx/settings.py \
+  omlx/utils/model_loading.py
 ```
 
 Homebrew venv 通常沒有 `pytest`。如果沒有安裝，不要說已經跑過 pytest；改說 pytest 不在 venv。

@@ -39,15 +39,11 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
-from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
-from ..patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_patch
-from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
 )
-from ..utils.model_loading import maybe_apply_pre_load_patches
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
@@ -526,6 +522,7 @@ class VLMBatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        prefill_eviction_callback: Any | None = None,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -533,6 +530,7 @@ class VLMBatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
+        self._prefill_eviction_callback = prefill_eviction_callback
 
         self._vlm_model = None
         self._processor = None
@@ -682,12 +680,16 @@ class VLMBatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_vlm_sync():
-            maybe_apply_pre_load_patches(
-                self._model_name,
-                model_settings=self._model_settings,
-                for_vlm=True,
-            )
-            apply_mlx_vlm_mtp_patch()
+            try:
+                from ..utils.model_loading import maybe_apply_pre_load_patches
+
+                maybe_apply_pre_load_patches(
+                    self._model_name,
+                    model_settings=self._model_settings,
+                    for_vlm=True,
+                )
+            except Exception as e:
+                logger.debug(f"executor pre-load patches skipped: {e}")
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
             with (
@@ -714,6 +716,7 @@ class VLMBatchedEngine(BaseEngine):
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state
+
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
@@ -755,18 +758,12 @@ class VLMBatchedEngine(BaseEngine):
 
         # Apply post-load transforms (IndexCache, MTP draft depth, mtp.safetensors)
         from ..utils.model_loading import apply_post_load_transforms
-        apply_post_load_transforms(
-            self._adapter, self._model_settings, model_path=self._model_name,
-        )
 
-        # Patch mlx-vlm GatedDeltaNet to mirror mlx-lm fixes (cache.advance(S)
-        # + mx.contiguous on cache[0]) that mlx-vlm e41cd25 still lacks.
-        # Class-level monkey-patch — no-op when target classes are absent
-        # or already fixed upstream.
-        apply_gated_delta_advance_patch()
-        # Patch mlx-vlm Qwen3_5Attention to use plain RoPE on text-only
-        # inputs. Preserves mRoPE for genuine multimodal positions.
-        apply_qwen3_5_attention_patch()
+        apply_post_load_transforms(
+            self._adapter,
+            self._model_settings,
+            model_path=self._model_name,
+        )
 
         # Create scheduler config
         scheduler_config = (
@@ -780,6 +777,7 @@ class VLMBatchedEngine(BaseEngine):
             model_name=self._model_name,
             scheduler_config=scheduler_config,
             stream_interval=self._stream_interval,
+            prefill_eviction_callback=self._prefill_eviction_callback,
         )
 
         # Create engine with adapter as the "model"
@@ -1481,9 +1479,7 @@ class VLMBatchedEngine(BaseEngine):
                     # Fallback: whole-request entry (stored when per-image split
                     # is unsupported, e.g. Gemma 4 multi-image with per-image
                     # resize). Mirrors the store-side branch below.
-                    cached_whole = self._vision_cache.get(
-                        image_hash, self._model_name
-                    )
+                    cached_whole = self._vision_cache.get(image_hash, self._model_name)
 
                 if all(f is not None for f in cached_per_image):
                     # All images cached individually — combine and use
