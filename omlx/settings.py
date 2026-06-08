@@ -524,7 +524,18 @@ class NetworkSettings:
 class SamplingSettings:
     """Default sampling parameters for generation."""
 
+    # Fallback context length used by ``server.get_max_context_window``
+    # only when neither a per-model override nor a model-config
+    # discovered native context length is available. Default kept at
+    # 32768 so existing ``settings.json`` files carrying the historical
+    # default keep working unchanged after upgrade.
     max_context_window: int = 32768
+    # Optional operator policy cap. When set, the server returns
+    # ``min(native_context, max_context_window_policy)`` for models
+    # whose native context length is discovered. Unset (None) by
+    # default so no install behavior changes implicitly. Per-model
+    # overrides and the fallback default above are not affected.
+    max_context_window_policy: int | None = None
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
@@ -535,6 +546,7 @@ class SamplingSettings:
         """Convert to dictionary."""
         return {
             "max_context_window": self.max_context_window,
+            "max_context_window_policy": self.max_context_window_policy,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -547,6 +559,7 @@ class SamplingSettings:
         """Create from dictionary."""
         return cls(
             max_context_window=data.get("max_context_window", 32768),
+            max_context_window_policy=data.get("max_context_window_policy"),
             max_tokens=data.get("max_tokens", 32768),
             temperature=data.get("temperature", 1.0),
             top_p=data.get("top_p", 0.95),
@@ -647,7 +660,7 @@ class ClaudeCodeSettings:
 
 @dataclass
 class IntegrationSettings:
-    """Other integrations settings (Codex, OpenCode, OpenClaw, Hermes, Pi, Copilot)."""
+    """Other integrations settings."""
 
     codex_model: str | None = None
     opencode_model: str | None = None
@@ -656,6 +669,11 @@ class IntegrationSettings:
     pi_model: str | None = None
     copilot_model: str | None = None
     openclaw_tools_profile: str = "coding"
+    markitdown_enabled: bool = True
+    markitdown_expose_model: bool = True
+    markitdown_max_file_size_mb: int = 25
+    markitdown_max_files_per_request: int = 5
+    markitdown_pdf_processing_engine: str = "markitdown"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -667,6 +685,11 @@ class IntegrationSettings:
             "pi_model": self.pi_model,
             "copilot_model": self.copilot_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
+            "markitdown_enabled": self.markitdown_enabled,
+            "markitdown_expose_model": self.markitdown_expose_model,
+            "markitdown_max_file_size_mb": self.markitdown_max_file_size_mb,
+            "markitdown_max_files_per_request": self.markitdown_max_files_per_request,
+            "markitdown_pdf_processing_engine": self.markitdown_pdf_processing_engine,
         }
 
     @classmethod
@@ -680,6 +703,15 @@ class IntegrationSettings:
             pi_model=data.get("pi_model"),
             copilot_model=data.get("copilot_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
+            markitdown_enabled=data.get("markitdown_enabled", True),
+            markitdown_expose_model=data.get("markitdown_expose_model", True),
+            markitdown_max_file_size_mb=data.get("markitdown_max_file_size_mb", 25),
+            markitdown_max_files_per_request=data.get(
+                "markitdown_max_files_per_request", 5
+            ),
+            markitdown_pdf_processing_engine=data.get(
+                "markitdown_pdf_processing_engine", "markitdown"
+            ),
         )
 
 
@@ -910,6 +942,22 @@ class GlobalSettings:
                 self.logging.retention_days = int(retention_days)
             except ValueError:
                 logger.warning(f"Invalid OMLX_LOG_RETENTION_DAYS: {retention_days}")
+
+        # Integration settings
+        if markitdown_enabled := os.getenv("OMLX_MARKITDOWN_ENABLED"):
+            self.integrations.markitdown_enabled = (
+                markitdown_enabled.strip().lower() in {"1", "true", "yes", "on"}
+            )
+        if markitdown_expose_model := os.getenv("OMLX_MARKITDOWN_EXPOSE_MODEL"):
+            self.integrations.markitdown_expose_model = (
+                markitdown_expose_model.strip().lower() in {"1", "true", "yes", "on"}
+            )
+        if markitdown_pdf_processing_engine := os.getenv(
+            "OMLX_MARKITDOWN_PDF_PROCESSING_ENGINE"
+        ):
+            self.integrations.markitdown_pdf_processing_engine = (
+                markitdown_pdf_processing_engine.strip() or "markitdown"
+            )
 
     def _apply_cli_overrides(self, args: Any) -> None:
         """
@@ -1205,6 +1253,14 @@ class GlobalSettings:
             )
 
         # Sampling validation
+        if (
+            self.sampling.max_context_window_policy is not None
+            and self.sampling.max_context_window_policy <= 0
+        ):
+            errors.append(
+                "Invalid sampling max_context_window_policy: "
+                f"{self.sampling.max_context_window_policy} (must be > 0)"
+            )
         if self.sampling.max_tokens <= 0:
             errors.append(
                 f"Invalid sampling max_tokens: {self.sampling.max_tokens} (must be > 0)"
@@ -1235,6 +1291,14 @@ class GlobalSettings:
                 f"Invalid claude_code mode: '{self.claude_code.mode}' "
                 f"(must be one of {sorted(valid_modes)})"
             )
+
+        # Integration validation
+        if self.integrations.markitdown_max_file_size_mb <= 0:
+            errors.append("markitdown_max_file_size_mb must be > 0")
+        if self.integrations.markitdown_max_files_per_request <= 0:
+            errors.append("markitdown_max_files_per_request must be > 0")
+        if not str(self.integrations.markitdown_pdf_processing_engine or "").strip():
+            errors.append("markitdown_pdf_processing_engine must not be empty")
 
         # HuggingFace validation
         if self.huggingface.endpoint:

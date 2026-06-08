@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
+from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..settings import SubKeyEntry
 from ..utils.release_check import normalize_update_channel, select_latest_release
@@ -257,6 +258,7 @@ class GlobalSettingsRequest(BaseModel):
 
     # Sampling defaults
     sampling_max_context_window: int | None = None
+    sampling_max_context_window_policy: int | None = Field(default=None, ge=1)
     sampling_max_tokens: int | None = None
     sampling_temperature: float | None = None
     sampling_top_p: float | None = None
@@ -281,6 +283,11 @@ class GlobalSettingsRequest(BaseModel):
     integrations_openclaw_tools_profile: (
         Literal["minimal", "coding", "messaging", "full"] | None
     ) = None
+    markitdown_enabled: bool | None = None
+    markitdown_expose_model: bool | None = None
+    markitdown_max_file_size_mb: int | None = None
+    markitdown_max_files_per_request: int | None = None
+    markitdown_pdf_processing_engine: str | None = None
 
     # UI settings
     ui_language: str | None = None
@@ -832,6 +839,8 @@ async def _apply_cache_settings_runtime(
         pool._scheduler_config.hot_cache_max_size = (
             global_settings.cache.get_hot_cache_max_size_bytes()
         )
+    if hasattr(pool, "configure_hot_cache_budget"):
+        pool.configure_hot_cache_budget()
 
     # Unload all loaded models so they use new config when reloaded
     loaded_models = pool.get_loaded_model_ids()
@@ -846,6 +855,8 @@ async def _apply_cache_settings_runtime(
 
 def _apply_sampling_settings_runtime(
     max_context_window: int | None,
+    max_context_window_policy: int | None,
+    max_context_window_policy_set: bool,
     max_tokens: int | None,
     temperature: float | None,
     top_p: float | None,
@@ -867,6 +878,10 @@ def _apply_sampling_settings_runtime(
     if max_context_window is not None:
         _server_state.sampling.max_context_window = max_context_window
         changes.append(f"max_context_window={max_context_window}")
+
+    if max_context_window_policy_set:
+        _server_state.sampling.max_context_window_policy = max_context_window_policy
+        changes.append(f"max_context_window_policy={max_context_window_policy}")
 
     if max_tokens is not None:
         _server_state.sampling.max_tokens = max_tokens
@@ -1722,6 +1737,41 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             model_data["settings"] = asdict(settings)
 
         models.append(model_data)
+
+    global_settings = _get_global_settings() if _get_global_settings else None
+    if markitdown_model_visible(global_settings) and not any(
+        m.get("id") == MARKITDOWN_MODEL_ID for m in models
+    ):
+        models.append(
+            {
+                "id": MARKITDOWN_MODEL_ID,
+                "model_path": "builtin://markitdown",
+                "loaded": True,
+                "is_loading": False,
+                "estimated_size": 0,
+                "estimated_size_formatted": format_size(0),
+                "actual_size": 0,
+                "actual_size_formatted": None,
+                "pinned": False,
+                "is_default": False,
+                "engine_type": "markitdown",
+                "model_type": "markitdown",
+                "config_model_type": "markitdown",
+                "thinking_default": None,
+                "preserve_thinking_default": None,
+                "source_type": "builtin",
+                "source_repo_id": None,
+                "last_access": None,
+                "dflash_compatible": False,
+                "dflash_compatibility_reason": "",
+                "dflash_ssd_cache_available": False,
+                "mtp_compatible": False,
+                "mtp_compatibility_reason": "",
+                "is_paroquant": False,
+                "paroquant_reason": "",
+                "virtual": True,
+            }
+        )
 
     return {"models": models}
 
@@ -2891,6 +2941,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "sampling": {
             "max_context_window": global_settings.sampling.max_context_window,
+            "max_context_window_policy": (
+                global_settings.sampling.max_context_window_policy
+            ),
             "max_tokens": global_settings.sampling.max_tokens,
             "temperature": global_settings.sampling.temperature,
             "top_p": global_settings.sampling.top_p,
@@ -2919,6 +2972,11 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "pi_model": global_settings.integrations.pi_model,
             "copilot_model": global_settings.integrations.copilot_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
+            "markitdown_enabled": global_settings.integrations.markitdown_enabled,
+            "markitdown_expose_model": global_settings.integrations.markitdown_expose_model,
+            "markitdown_max_file_size_mb": global_settings.integrations.markitdown_max_file_size_mb,
+            "markitdown_max_files_per_request": global_settings.integrations.markitdown_max_files_per_request,
+            "markitdown_pdf_processing_engine": global_settings.integrations.markitdown_pdf_processing_engine,
         },
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
@@ -3271,6 +3329,11 @@ async def update_global_settings(
             request.sampling_max_context_window
         )
         sampling_changed = True
+    if "sampling_max_context_window_policy" in request.model_fields_set:
+        global_settings.sampling.max_context_window_policy = (
+            request.sampling_max_context_window_policy
+        )
+        sampling_changed = True
     if request.sampling_max_tokens is not None:
         global_settings.sampling.max_tokens = request.sampling_max_tokens
         sampling_changed = True
@@ -3292,6 +3355,8 @@ async def update_global_settings(
     if sampling_changed:
         success, msg = _apply_sampling_settings_runtime(
             request.sampling_max_context_window,
+            request.sampling_max_context_window_policy,
+            "sampling_max_context_window_policy" in request.model_fields_set,
             request.sampling_max_tokens,
             request.sampling_temperature,
             request.sampling_top_p,
@@ -3372,6 +3437,51 @@ async def update_global_settings(
             request.integrations_openclaw_tools_profile
         )
         integrations_changed = True
+    if "markitdown_enabled" in request.model_fields_set:
+        global_settings.integrations.markitdown_enabled = bool(
+            request.markitdown_enabled
+        )
+        integrations_changed = True
+    if "markitdown_expose_model" in request.model_fields_set:
+        global_settings.integrations.markitdown_expose_model = bool(
+            request.markitdown_expose_model
+        )
+        integrations_changed = True
+    if "markitdown_max_file_size_mb" in request.model_fields_set:
+        if (
+            request.markitdown_max_file_size_mb is None
+            or request.markitdown_max_file_size_mb <= 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="markitdown_max_file_size_mb must be > 0",
+            )
+        global_settings.integrations.markitdown_max_file_size_mb = (
+            request.markitdown_max_file_size_mb
+        )
+        integrations_changed = True
+    if "markitdown_max_files_per_request" in request.model_fields_set:
+        if (
+            request.markitdown_max_files_per_request is None
+            or request.markitdown_max_files_per_request <= 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="markitdown_max_files_per_request must be > 0",
+            )
+        global_settings.integrations.markitdown_max_files_per_request = (
+            request.markitdown_max_files_per_request
+        )
+        integrations_changed = True
+    if "markitdown_pdf_processing_engine" in request.model_fields_set:
+        engine = (request.markitdown_pdf_processing_engine or "").strip()
+        if not engine:
+            raise HTTPException(
+                status_code=400,
+                detail="markitdown_pdf_processing_engine must not be empty",
+            )
+        global_settings.integrations.markitdown_pdf_processing_engine = engine
+        integrations_changed = True
 
     if integrations_changed:
         runtime_applied.append("integrations")
@@ -3382,7 +3492,10 @@ async def update_global_settings(
             f"opencode={global_settings.integrations.opencode_model}, "
             f"openclaw={global_settings.integrations.openclaw_model}, "
             f"hermes={global_settings.integrations.hermes_model}, "
-            f"pi={global_settings.integrations.pi_model}"
+            f"pi={global_settings.integrations.pi_model}, "
+            f"markitdown_enabled={global_settings.integrations.markitdown_enabled}, "
+            f"markitdown_expose_model={global_settings.integrations.markitdown_expose_model}, "
+            f"markitdown_pdf_processing_engine={global_settings.integrations.markitdown_pdf_processing_engine}"
         )
 
     # Apply UI settings
@@ -3891,12 +4004,12 @@ def _build_runtime_cache_observability(
 
     payload["effective_block_sizes"] = sorted(block_sizes)
 
-    # Aggregate hot-cache and disk-max across models.
-    # hot_cache_max sums across models (each model reserves its own slice of
-    # the same process-wide hot cache budget) so the gauge denominator matches
-    # the summed numerator.  disk_max keeps the config fallback via max()
-    # because a single SSD cache directory is shared — the effective cap is
-    # the largest configured limit, not a per-model sum.
+    # Aggregate hot-cache and disk-max across models. Hot cache max is a single
+    # process-wide budget shared by all loaded model managers, so keep the
+    # largest reported cap instead of summing per-model rows. Disk max also
+    # keeps the config fallback via max() because a single SSD cache directory
+    # is shared — the effective cap is the largest configured limit, not a
+    # per-model sum.
     hot_cache_max = 0
     disk_max = payload["disk_max_bytes"]
     hot_cache_size_total = 0
@@ -3904,7 +4017,7 @@ def _build_runtime_cache_observability(
     for m in payload["models"]:
         hot_cache_size_total += m.get("hot_cache_size_bytes", 0)
         hot_cache_entries_total += m.get("hot_cache_entries", 0)
-        hot_cache_max += m.get("hot_cache_max_bytes", 0)
+        hot_cache_max = max(hot_cache_max, m.get("hot_cache_max_bytes", 0))
         disk_max = max(disk_max, m.get("max_size_bytes", 0))
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total
@@ -4271,12 +4384,11 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     return {"status": "ok"}
 
 
-def _iter_loaded_schedulers():
-    """Yield (model_id, scheduler) for each loaded model.
+def _iter_loaded_scheduler_records():
+    """Yield (model_id, scheduler, core) for each loaded model.
 
     Traverses the internal engine hierarchy: pool entry → async engine →
-    core engine → scheduler.  Both ``clear_ssd_cache`` and
-    ``clear_hot_cache`` share this traversal.
+    core engine → scheduler.
     """
     engine_pool = _get_engine_pool()
     if engine_pool is None:
@@ -4292,7 +4404,16 @@ def _iter_loaded_schedulers():
         core = getattr(async_core, "engine", None) if async_core is not None else None
         scheduler = getattr(core, "scheduler", None) if core is not None else None
         if scheduler is not None:
-            yield model_id, scheduler
+            yield model_id, scheduler, core
+
+
+def _iter_loaded_schedulers():
+    """Yield (model_id, scheduler) for each loaded model.
+
+    Both ``clear_ssd_cache`` and ``clear_hot_cache`` share this traversal.
+    """
+    for model_id, scheduler, _core in _iter_loaded_scheduler_records():
+        yield model_id, scheduler
 
 
 @router.post("/api/ssd-cache/clear")
@@ -4343,13 +4464,23 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
 
 @router.post("/api/hot-cache/clear")
 async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
-    """Clear the in-memory (hot) cache for all loaded models.
+    """Clear the in-memory hot cache and release the buffers it held.
 
-    No filesystem fallback needed — hot cache is in-memory only and does
-    not survive process restart.
+    Dropping hot cache entries releases Python references, but MLX may keep
+    now-unused buffers in its allocator pool. Reclaim through the scheduler's
+    synchronized clear path so active engine streams and async store-cache
+    workers keep the same Metal safety barriers used by generation.
     """
+    import gc
+
+    from ..engine_core import get_mlx_executor
+    from ..scheduler import _sync_and_clear_cache
+    from ..utils.proc_memory import get_phys_footprint
+
+    footprint_before = get_phys_footprint()
     total_cleared = 0
-    for model_id, scheduler in _iter_loaded_schedulers():
+    reclaim_targets = []
+    for model_id, scheduler, core in _iter_loaded_scheduler_records():
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
         if ssd_manager is not None and hasattr(ssd_manager, "clear_hot_cache"):
             try:
@@ -4363,7 +4494,51 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
         rate_tracker = getattr(scheduler, "_cache_rate_tracker", None)
         if rate_tracker is not None:
             rate_tracker.clear()
-    return {"status": "ok", "total_cleared": total_cleared}
+        executor = getattr(core, "_mlx_executor", None)
+        if executor is not None:
+            reclaim_targets.append((model_id, executor, getattr(scheduler, "_stream", None)))
+
+    # Also clear managers orphaned by an abnormal teardown: they hold live
+    # hot cache but are no longer attached to a loaded scheduler, so the loop
+    # above cannot reach them. The shared budget still references them.
+    pool = _get_engine_pool()
+    budget = getattr(getattr(pool, "_scheduler_config", None), "hot_cache_budget", None)
+    if budget is not None and hasattr(budget, "clear_all_owners"):
+        try:
+            total_cleared += budget.clear_all_owners()
+        except Exception as exc:
+            logger.warning("Failed to clear orphaned hot caches: %s", exc)
+
+    # Return pooled buffers to the OS using scheduler._sync_and_clear_cache(),
+    # the same lock/synchronize/clear helper used by generation. Run on each
+    # loaded engine's executor so its thread-local stream is present. If every
+    # model has been unloaded, still run one reclaim on the fallback executor so
+    # orphaned/no-loaded hot cache cleanup can release MLX's allocator pool.
+    gc.collect()
+    loop = asyncio.get_running_loop()
+    if reclaim_targets:
+        for model_id, executor, stream in reclaim_targets:
+            try:
+                await loop.run_in_executor(executor, _sync_and_clear_cache, stream)
+            except RuntimeError as exc:
+                if "cannot schedule new futures after shutdown" not in str(exc):
+                    raise
+                logger.warning(
+                    "Engine executor unavailable while reclaiming MLX buffers "
+                    "for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+                await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
+    else:
+        await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
+    bytes_reclaimed = max(0, footprint_before - get_phys_footprint())
+
+    return {
+        "status": "ok",
+        "total_cleared": total_cleared,
+        "bytes_reclaimed": bytes_reclaimed,
+    }
 
 
 @router.post("/api/cache/probe")

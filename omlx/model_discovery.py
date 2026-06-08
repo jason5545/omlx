@@ -37,6 +37,7 @@ VLM_MODEL_TYPES = {
     "qwen3_5_moe",
     "gemma3",
     "gemma4",
+    "gemma4_unified",
     "llava",
     "llava_next",
     "llava-qwen2",
@@ -92,7 +93,6 @@ EMBEDDING_MODEL_TYPES = {
     "siglip",
     "colqwen2_5",
     "colqwen2-5",
-    "lfm2",
 }
 
 # Model types that have both embedding and LLM variants.
@@ -101,6 +101,7 @@ AMBIGUOUS_EMBEDDING_MODEL_TYPES = {
     "qwen3",
     "gemma3-text",
     "gemma3_text",
+    "lfm2",
 }
 
 # Known embedding architectures

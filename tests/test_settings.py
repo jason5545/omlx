@@ -16,6 +16,7 @@ from omlx.settings import (
     ClaudeCodeSettings,
     GlobalSettings,
     HuggingFaceSettings,
+    IntegrationSettings,
     LoggingSettings,
     MCPSettings,
     MemorySettings,
@@ -1006,6 +1007,16 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert errors == []
 
+    def test_validate_context_window_policy(self):
+        """Sampling context policy must be positive when set."""
+        settings = GlobalSettings()
+        settings.sampling.max_context_window_policy = 128000
+        assert settings.validate() == []
+
+        settings.sampling.max_context_window_policy = 0
+        errors = settings.validate()
+        assert any("max_context_window_policy" in e for e in errors)
+
     def test_validate_invalid_port_low(self):
         """Test validation catches port below 1."""
         settings = GlobalSettings()
@@ -1673,7 +1684,12 @@ class TestSamplingSettings:
     def test_defaults(self):
         """Test default values."""
         settings = SamplingSettings()
+        # Fallback default kept at 32768 so existing settings.json
+        # files carrying the historical default keep working unchanged
+        # after upgrade. ``max_context_window_policy`` is the explicit
+        # operator policy cap (None by default).
         assert settings.max_context_window == 32768
+        assert settings.max_context_window_policy is None
         assert settings.max_tokens == 32768
         assert settings.temperature == 1.0
         assert settings.top_p == 0.95
@@ -1704,7 +1720,23 @@ class TestSamplingSettings:
         """Test from_dict uses defaults for missing fields."""
         settings = SamplingSettings.from_dict({})
         assert settings.max_context_window == 32768
+        assert settings.max_context_window_policy is None
         assert settings.repetition_penalty == 1.0
+
+    def test_policy_field_round_trip(self):
+        """``max_context_window_policy`` must serialize and
+        deserialize without losing its ``None`` semantics."""
+        unset = SamplingSettings.from_dict({})
+        assert unset.max_context_window_policy is None
+        # to_dict preserves None
+        d = unset.to_dict()
+        assert d["max_context_window_policy"] is None
+        # Setting an explicit value round-trips
+        with_policy = SamplingSettings.from_dict(
+            {"max_context_window_policy": 128_000}
+        )
+        assert with_policy.max_context_window_policy == 128_000
+        assert with_policy.to_dict()["max_context_window_policy"] == 128_000
 
 
 class TestClaudeCodeSettings:
@@ -1800,6 +1832,51 @@ class TestClaudeCodeSettings:
         settings = ClaudeCodeSettings.from_dict(data)
         assert settings.mode == "cloud"
         assert settings.opus_model is None
+
+
+class TestIntegrationSettings:
+    """Tests for IntegrationSettings dataclass."""
+
+    def test_markitdown_defaults(self):
+        settings = IntegrationSettings()
+        assert settings.markitdown_enabled is True
+        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_max_file_size_mb == 25
+        assert settings.markitdown_max_files_per_request == 5
+        assert settings.markitdown_pdf_processing_engine == "markitdown"
+
+    def test_markitdown_to_dict(self):
+        settings = IntegrationSettings(
+            markitdown_enabled=False,
+            markitdown_expose_model=False,
+            markitdown_max_file_size_mb=10,
+            markitdown_max_files_per_request=2,
+            markitdown_pdf_processing_engine="OCR-Model",
+        )
+        result = settings.to_dict()
+        assert result["markitdown_enabled"] is False
+        assert result["markitdown_expose_model"] is False
+        assert result["markitdown_max_file_size_mb"] == 10
+        assert result["markitdown_max_files_per_request"] == 2
+        assert result["markitdown_pdf_processing_engine"] == "OCR-Model"
+
+    def test_markitdown_from_dict_backward_compat(self):
+        settings = IntegrationSettings.from_dict({})
+        assert settings.markitdown_enabled is True
+        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_max_file_size_mb == 25
+        assert settings.markitdown_max_files_per_request == 5
+        assert settings.markitdown_pdf_processing_engine == "markitdown"
+
+    def test_markitdown_validation(self):
+        settings = GlobalSettings()
+        settings.integrations.markitdown_max_file_size_mb = 0
+        settings.integrations.markitdown_max_files_per_request = 0
+        settings.integrations.markitdown_pdf_processing_engine = ""
+        errors = settings.validate()
+        assert "markitdown_max_file_size_mb must be > 0" in errors
+        assert "markitdown_max_files_per_request must be > 0" in errors
+        assert "markitdown_pdf_processing_engine must not be empty" in errors
 
 
 class TestClaudeCodeValidation:

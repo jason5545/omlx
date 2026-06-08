@@ -169,6 +169,16 @@ from .exceptions import (
     ModelTooLargeError,
     SchedulerQueueFullError,
 )
+from .api.markitdown import (
+    MARKITDOWN_MODEL_ID,
+    MarkItDownRequestError,
+    convert_messages_to_markdown_async,
+    is_markitdown_model,
+    markitdown_model_visible,
+    preprocess_markitdown_file_parts_async,
+    request_has_file_parts,
+    stream_messages_to_markdown_async,
+)
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
 
@@ -197,7 +207,19 @@ class EngineType(Enum):
 class SamplingDefaults:
     """Default sampling parameters."""
 
+    # Fallback context length used by ``get_max_context_window`` only
+    # when neither a per-model override nor a model-config-discovered
+    # native context length is available. Setting this does NOT cap
+    # models that declare their own context — use
+    # ``max_context_window_policy`` for the operator-policy cap.
     max_context_window: int = 32768
+    # Optional operator policy cap. When set, models whose native
+    # context length is discovered get ``min(native, policy)``. Per-model
+    # overrides and the fallback default above are not affected — those
+    # represent explicit choices that the policy cannot override
+    # without surprising migration semantics for existing
+    # ``settings.json`` files.
+    max_context_window_policy: int | None = None
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
@@ -836,9 +858,18 @@ app.add_middleware(DebugRequestLoggingMiddleware)
 # =============================================================================
 
 
+def _wake_process_memory_enforcer(*, active: bool = False) -> None:
+    enforcer = _server_state.process_memory_enforcer
+    wake = getattr(enforcer, "wake", None) if enforcer is not None else None
+    if callable(wake):
+        wake(active=active)
+
+
 async def get_engine(
     model_id: str | None = None,
     engine_type: EngineType = EngineType.LLM,
+    _lease: bool = False,
+    _leased_out: list | None = None,
 ) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine]:
     """
     Get engine for the specified model and type.
@@ -848,6 +879,13 @@ async def get_engine(
     Args:
         model_id: Model ID to get engine for, or None for default (LLM only)
         engine_type: Type of engine to retrieve (LLM, EMBEDDING, or RERANKER)
+        _lease: When True, take an atomic in-use lease on the engine that the
+            pool actually loaded (eviction-proof until released). The caller
+            MUST release exactly one lease per successful leased call.
+        _leased_out: When _lease is True, the EXACT pool model_id that was
+            leased is appended to this list. Release using that id (not the
+            request model) so the lease/release ids always match even when the
+            pool falls back to the default model.
 
     Returns:
         The loaded engine of the appropriate type
@@ -874,9 +912,16 @@ async def get_engine(
 
     # Resolve alias to real model_id
     model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
+    _wake_process_memory_enforcer(active=True)
 
+    # Only thread the _lease kwarg through when a lease is actually requested,
+    # so the common non-lease path keeps the original pool.get_engine(model_id)
+    # call contract (LLM/STT/TTS/STS handlers, and pool mocks, never lease).
+    _lease_kwargs = {"_lease": True} if _lease else {}
     try:
-        engine = await pool.get_engine(model_id)
+        engine = await pool.get_engine(model_id, **_lease_kwargs)
+        if _lease and _leased_out is not None:
+            _leased_out.append(model_id)
     except ModelNotFoundError as e:
         # Fallback to default model if enabled (LLM only)
         if (
@@ -890,7 +935,13 @@ async def get_engine(
                 f"default model '{_server_state.default_model}'"
             )
             try:
-                return await pool.get_engine(_server_state.default_model)
+                _wake_process_memory_enforcer(active=True)
+                fb_engine = await pool.get_engine(
+                    _server_state.default_model, **_lease_kwargs
+                )
+                if _lease and _leased_out is not None:
+                    _leased_out.append(_server_state.default_model)
+                return fb_engine
             except Exception:
                 pass  # Fall through to original 404
 
@@ -917,35 +968,42 @@ async def get_engine(
     except EnginePoolError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Validate engine type
-    if engine_type == EngineType.EMBEDDING:
-        if not isinstance(engine, EmbeddingEngine):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Model '{model_id}' is not an embedding model. "
-                f"Use /v1/chat/completions for LLM models."
-            )
-    elif engine_type == EngineType.RERANKER:
-        if not isinstance(engine, RerankerEngine):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Model '{model_id}' is not a reranker model. "
-                f"Use a SequenceClassification model for reranking."
-            )
-    elif engine_type == EngineType.LLM:
-        # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
-        # fell through and crashed on `engine.model_type` with an unhandled
-        # 500. Reject with a clear 400 pointing the caller at the right
-        # endpoint.
-        if not isinstance(engine, BaseEngine):
-            _endpoint_hint = _suggest_endpoint_for_engine(engine)
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Model '{model_id}' is not an LLM / chat model. "
-                    f"{_endpoint_hint}"
-                ),
-            )
+    # Validate engine type. If a lease was taken above but validation fails,
+    # release it before raising so a rejected request never leaks an in_use
+    # count (which would pin the engine non-evictable forever).
+    try:
+        if engine_type == EngineType.EMBEDDING:
+            if not isinstance(engine, EmbeddingEngine):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model '{model_id}' is not an embedding model. "
+                    f"Use /v1/chat/completions for LLM models."
+                )
+        elif engine_type == EngineType.RERANKER:
+            if not isinstance(engine, RerankerEngine):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model '{model_id}' is not a reranker model. "
+                    f"Use a SequenceClassification model for reranking."
+                )
+        elif engine_type == EngineType.LLM:
+            # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
+            # fell through and crashed on `engine.model_type` with an unhandled
+            # 500. Reject with a clear 400 pointing the caller at the right
+            # endpoint.
+            if not isinstance(engine, BaseEngine):
+                _endpoint_hint = _suggest_endpoint_for_engine(engine)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Model '{model_id}' is not an LLM / chat model. "
+                        f"{_endpoint_hint}"
+                    ),
+                )
+    except BaseException:
+        if _lease and _leased_out:
+            await pool.release_engine(_leased_out.pop())
+        raise
 
     return engine
 
@@ -1072,6 +1130,43 @@ def _get_mtplx_sampling_defaults(model_id: str | None) -> dict[str, float | int]
 
     _mtplx_sampling_defaults_cache[model_id] = defaults
     return defaults
+
+
+@asynccontextmanager
+async def acquire_embedding_engine(model: str):
+    """Acquire an embedding engine with an atomic, eviction-proof in-use lease.
+
+    Resolves + loads + validates exactly like get_embedding_engine, but holds
+    the engine non-evictable for the duration of the request and releases the
+    lease on the EXACT pool model_id the pool loaded (handles default-model
+    fallback) in finally.
+    """
+    leased: list = []
+    engine = await get_engine(
+        model, EngineType.EMBEDDING, _lease=True, _leased_out=leased
+    )
+    try:
+        yield engine
+    finally:
+        if leased:
+            await get_engine_pool().release_engine(leased[0])
+
+
+@asynccontextmanager
+async def acquire_reranker_engine(model: str):
+    """Acquire a reranker engine with an atomic, eviction-proof in-use lease.
+
+    See acquire_embedding_engine for the lease/release contract.
+    """
+    leased: list = []
+    engine = await get_engine(
+        model, EngineType.RERANKER, _lease=True, _leased_out=leased
+    )
+    try:
+        yield engine
+    finally:
+        if leased:
+            await get_engine_pool().release_engine(leased[0])
 
 
 def get_sampling_params(
@@ -1411,14 +1506,27 @@ def get_max_context_window(
     """
     Get effective max context window limit.
 
-    Priority (#1308):
-        1. Explicit per-model setting (admin UI / settings.json override).
-        2. Context length discovered from the model's ``config.json`` at
-           server startup (``max_position_embeddings`` etc.); without
-           this tier the server would advertise the 32 K global default
-           even for models that declare 256 K+ natively.
-        3. Global default from ``SamplingConfig`` — last-resort fallback
-           for models whose config files don't expose a context length.
+    Resolution:
+        1. **Per-model override** (admin UI / settings.json) — always
+           wins. An operator who has set a per-model number knows what
+           they want; ``max_context_window_policy`` does not clamp it.
+        2. **Model-config-discovered native context length** (#1308),
+           optionally clamped by the operator policy: if
+           ``sampling.max_context_window_policy`` is set, return
+           ``min(native, policy)``; otherwise return ``native`` as-is.
+        3. **Fallback default** from ``SamplingSettings.max_context_window``
+           — only used when neither tier 1 nor tier 2 yields a value.
+           Treated as a default, NOT capped by the policy; existing
+           ``settings.json`` files carrying the historical ``32768``
+           default keep working unchanged after upgrade.
+
+    The policy field is intentionally nullable and unset by default so
+    no existing install behavior shifts. Setting it engages
+    ``min(native, policy)`` across every model whose native context is
+    discoverable; per-model overrides remain the operator's escape
+    hatch for individual models that should exceed the policy.
+    Request policy is applied last as a client/API-key ceiling, so
+    callers such as sub-keys can only shrink the effective window.
 
     Returns:
         Max context window token count, or ``None`` if no tier resolves
@@ -1432,17 +1540,25 @@ def get_max_context_window(
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
+    # Priority 1: explicit per-model override (not capped by policy)
     if model_settings and model_settings.max_context_window is not None:
-        base_context = model_settings.max_context_window
+        effective_context = model_settings.max_context_window
     else:
-        base_context = None
+        effective_context = None
         pool = _server_state.engine_pool
         if model_id and pool is not None:
             entry = pool.get_entry(model_id)
             if entry is not None and entry.model_context_length is not None:
-                base_context = entry.model_context_length
-        if base_context is None:
-            base_context = _server_state.sampling.max_context_window
+                native = entry.model_context_length
+                policy = getattr(
+                    _server_state.sampling, "max_context_window_policy", None
+                )
+                if policy is not None and policy > 0:
+                    effective_context = min(native, policy)
+                else:
+                    effective_context = native
+        if effective_context is None:
+            effective_context = _server_state.sampling.max_context_window
 
     policy_context = (
         _positive_int_or_none(request_policy.get("max_context_window"))
@@ -1450,10 +1566,25 @@ def get_max_context_window(
         else None
     )
     if policy_context is None:
-        return base_context
-    if base_context is None:
+        return effective_context
+    if effective_context is None:
         return policy_context
-    return min(base_context, policy_context)
+    return min(effective_context, policy_context)
+
+
+def get_embedding_max_length(
+    model_id: str | None = None,
+    request_max_length: int | None = None,
+) -> int:
+    """Get max token length for embedding requests."""
+    if request_max_length is not None:
+        return request_max_length
+
+    max_context_window = get_max_context_window(model_id)
+    if max_context_window is not None:
+        return max_context_window
+
+    return 512
 
 
 def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int:
@@ -1589,6 +1720,9 @@ def init_server(
     if global_settings and global_settings.sampling:
         _server_state.sampling = SamplingDefaults(
             max_context_window=global_settings.sampling.max_context_window,
+            max_context_window_policy=getattr(
+                global_settings.sampling, "max_context_window_policy", None
+            ),
             max_tokens=global_settings.sampling.max_tokens,
             temperature=global_settings.sampling.temperature,
             top_p=global_settings.sampling.top_p,
@@ -2075,6 +2209,216 @@ async def server_status(_: bool = Depends(verify_api_key)):
     }
 
 
+def _markitdown_virtual_model_status() -> dict:
+    return {
+        "id": MARKITDOWN_MODEL_ID,
+        "model_path": "builtin://markitdown",
+        "loaded": True,
+        "is_loading": False,
+        "loading_started_at": None,
+        "estimated_size": 0,
+        "actual_size": 0,
+        "pinned": False,
+        "engine_type": "markitdown",
+        "model_type": "markitdown",
+        "config_model_type": "markitdown",
+        "thinking_default": None,
+        "preserve_thinking_default": None,
+        "source_type": "builtin",
+        "source_repo_id": None,
+        "last_access": None,
+    }
+
+
+def _markitdown_is_visible() -> bool:
+    return markitdown_model_visible(_server_state.global_settings)
+
+
+def _with_markitdown_status(status: dict) -> dict:
+    if not _markitdown_is_visible():
+        return status
+
+    augmented = dict(status)
+    models = list(augmented.get("models", []))
+    if not any(m.get("id") == MARKITDOWN_MODEL_ID for m in models):
+        models.append(_markitdown_virtual_model_status())
+    augmented["models"] = models
+    augmented["model_count"] = len(models)
+    augmented["loaded_count"] = sum(1 for m in models if m.get("loaded"))
+    return augmented
+
+
+async def _preprocess_markitdown_files_for_llm(
+    request: ChatCompletionRequest,
+) -> ChatCompletionRequest:
+    if not request_has_file_parts(request.messages):
+        return request
+
+    try:
+        messages = await preprocess_markitdown_file_parts_async(
+            request.messages,
+            global_settings=_server_state.global_settings,
+            engine_pool=_server_state.engine_pool,
+            settings_manager=_server_state.settings_manager,
+            get_sampling_params=get_sampling_params,
+            fail_when_disabled=True,
+        )
+    except MarkItDownRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return request.model_copy(update={"messages": messages})
+
+
+def _build_markitdown_chat_response(
+    request: ChatCompletionRequest,
+    markdown: str,
+) -> ChatCompletionResponse:
+    return ChatCompletionResponse(
+        model=request.model,
+        choices=[
+            ChatCompletionChoice(
+                message=AssistantMessage(content=markdown),
+                finish_reason="stop",
+            )
+        ],
+        usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+    )
+
+
+async def _stream_markitdown_chat_response(
+    request: ChatCompletionRequest,
+    markdown_chunks: AsyncIterator[str],
+    response_id: str | None = None,
+) -> AsyncIterator[str]:
+    response_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    role_chunk = ChatCompletionChunk(
+        id=response_id,
+        model=request.model,
+        choices=[
+            ChatCompletionChunkChoice(
+                delta=ChatCompletionChunkDelta(role="assistant"),
+            )
+        ],
+    )
+    yield f"data: {role_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    emitted = False
+    async for markdown in markdown_chunks:
+        if not markdown:
+            continue
+        emitted = True
+        content_chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(content=markdown),
+                )
+            ],
+        )
+        yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    if not emitted:
+        raise MarkItDownRequestError(
+            "No text or supported file content found for MarkItDown.",
+            status_code=400,
+        )
+
+    final_chunk = ChatCompletionChunk(
+        id=response_id,
+        model=request.model,
+        choices=[
+            ChatCompletionChunkChoice(
+                delta=ChatCompletionChunkDelta(),
+                finish_reason="stop",
+            )
+        ],
+    )
+    yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    if request.stream_options and request.stream_options.include_usage:
+        usage_chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[],
+            usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        )
+        yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    yield "data: [DONE]\n\n"
+
+
+async def _create_markitdown_chat_completion(
+    request: ChatCompletionRequest,
+    http_request: FastAPIRequest,
+):
+    if not _markitdown_is_visible():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model not found: {MARKITDOWN_MODEL_ID}",
+        )
+
+    if request.stream:
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        keepalive = _resolve_keepalive("openai_chat")
+        if keepalive == _KEEPALIVE_CHAT_CHUNK:
+            keepalive = _chat_keepalive_chunk(response_id)
+        markdown_chunks = stream_messages_to_markdown_async(
+            request.messages,
+            global_settings=_server_state.global_settings,
+            engine_pool=_server_state.engine_pool,
+            settings_manager=_server_state.settings_manager,
+            get_sampling_params=get_sampling_params,
+            latest_user_only=True,
+        )
+        return StreamingResponse(
+            _with_sse_keepalive(
+                _stream_markitdown_chat_response(
+                    request,
+                    markdown_chunks,
+                    response_id=response_id,
+                ),
+                http_request=http_request,
+                keepalive_chunk=keepalive,
+            ),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
+
+    async def _build_markitdown_completion():
+        try:
+            markdown = await convert_messages_to_markdown_async(
+                request.messages,
+                global_settings=_server_state.global_settings,
+                engine_pool=_server_state.engine_pool,
+                settings_manager=_server_state.settings_manager,
+                get_sampling_params=get_sampling_params,
+                latest_user_only=True,
+            )
+        except MarkItDownRequestError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        if not markdown:
+            raise HTTPException(
+                status_code=400,
+                detail="No text or supported file content found for MarkItDown.",
+            )
+
+        logger.info("MarkItDown completion converted request to markdown")
+        return _build_markitdown_chat_response(
+            request,
+            markdown,
+        ).model_dump_json(exclude_none=True)
+
+    return StreamingResponse(
+        _with_json_keepalive(http_request, _build_markitdown_completion()),
+        media_type="application/json",
+    )
+
+
 @app.get("/v1/models")
 async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     """List all available models with load status."""
@@ -2098,6 +2442,9 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                 )
             )
 
+    if _markitdown_is_visible() and not any(m.id == MARKITDOWN_MODEL_ID for m in models):
+        models.append(ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx"))
+
     return ModelsResponse(data=models)
 
 
@@ -2111,9 +2458,14 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    status = _server_state.engine_pool.get_status()
+    status = _with_markitdown_status(_server_state.engine_pool.get_status())
     for m in status["models"]:
         model_id = m["id"]
+        if is_markitdown_model(model_id):
+            m["max_context_window"] = None
+            m["max_tokens"] = None
+            continue
+
         m["max_context_window"] = get_max_context_window(model_id)
 
         # Resolve effective max_tokens: model setting > global default
@@ -2200,7 +2552,11 @@ async def create_embeddings(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    engine = await get_embedding_engine(request.model)
+    # Validate the model up front (resolves + loads + type-checks) so a bad
+    # model still 400/404s before we start the streaming response. The actual
+    # eviction-proof lease is taken inside _build_embeddings, which is where
+    # the engine is used (the StreamingResponse runs that coroutine later).
+    await get_embedding_engine(request.model)
 
     if request.items is not None:
         embedding_inputs = normalize_embedding_items(request.items)
@@ -2212,10 +2568,17 @@ async def create_embeddings(
     if not embedding_inputs:
         raise HTTPException(status_code=400, detail="Input cannot be empty")
 
+    max_length = get_embedding_max_length(request.model, request.max_length)
+
     async def _build_embeddings():
         start_time = time.perf_counter()
         try:
-            output = await engine.embed(embedding_inputs)
+            async with acquire_embedding_engine(request.model) as engine:
+                output = await engine.embed(
+                    embedding_inputs,
+                    max_length=max_length,
+                    truncation=request.truncation,
+                )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except TypeError as e:
@@ -2224,7 +2587,8 @@ async def create_embeddings(
         elapsed = time.perf_counter() - start_time
         logger.info(
             f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
-            f"{output.total_tokens} tokens in {elapsed:.3f}s"
+            f"{output.total_tokens} tokens, max_length={max_length}, "
+            f"truncation={request.truncation} in {elapsed:.3f}s"
         )
         get_server_metrics().record_request_complete(
             prompt_tokens=output.total_tokens,
@@ -2319,7 +2683,9 @@ async def create_rerank(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    engine = await get_reranker_engine(request.model)
+    # Validate the model up front (resolves + loads + type-checks). The
+    # eviction-proof lease is held only around the actual rerank() call below.
+    await get_reranker_engine(request.model)
 
     # Preserve original structure for the engine (multimodal rerankers need
     # dicts with 'image'), but keep a normalized text view for logging and
@@ -2336,11 +2702,12 @@ async def create_rerank(
     # Perform reranking
     start_time = time.perf_counter()
 
-    output = await engine.rerank(
-        query=request.query,
-        documents=documents_raw,
-        top_n=request.top_n,
-    )
+    async with acquire_reranker_engine(request.model) as engine:
+        output = await engine.rerank(
+            query=request.query,
+            documents=documents_raw,
+            top_n=request.top_n,
+        )
 
     elapsed = time.perf_counter() - start_time
     logger.info(
@@ -2540,6 +2907,11 @@ async def create_chat_completion(
     )
     _log_request_policy(request_policy, request.model)
 
+    if is_markitdown_model(request.model):
+        return await _create_markitdown_chat_completion(request, http_request)
+
+    request = await _preprocess_markitdown_files_for_llm(request)
+
     # Block inference during quantization to prevent GPU Metal errors
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
@@ -2663,8 +3035,14 @@ async def create_chat_completion(
         chat_template_kwargs=merged_ct_kwargs or None,
         reasoning_parser=reasoning_parser,
     )
-    # Fall back to prompt injection when grammar is not compiled
-    if compiled_grammar is None and response_format:
+    # Fall back to prompt injection when grammar is not compiled. The degrade
+    # is also surfaced to the caller as a Warning response header (#1241).
+    # Only response formats that actually request grammar-constrained JSON
+    # (json_object / json_schema) can be "unenforced"; a plain text format
+    # never asked for enforcement, so it must not warn (#1241 review).
+    response_format_warning = None
+    if compiled_grammar is None and _response_format_requests_grammar(response_format):
+        response_format_warning = _response_format_warning_header(response_format)
         json_instruction = build_json_system_prompt(response_format)
         if json_instruction:
             messages = _inject_json_instruction(messages, json_instruction)
@@ -2812,6 +3190,9 @@ async def create_chat_completion(
         keepalive = _resolve_keepalive("openai_chat")
         if keepalive == _KEEPALIVE_CHAT_CHUNK:
             keepalive = _chat_keepalive_chunk(response_id)
+        sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+        if response_format_warning:
+            sse_headers["Warning"] = response_format_warning
         return StreamingResponse(
             _with_sse_keepalive(
                 stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, response_id=response_id, **chat_kwargs),
@@ -2819,7 +3200,7 @@ async def create_chat_completion(
                 keepalive_chunk=keepalive,
             ),
             media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            headers=sse_headers,
         )
 
     # Non-streaming response with keepalive during prefill
@@ -2918,9 +3299,13 @@ async def create_chat_completion(
             ),
         ).model_dump_json(exclude_none=True)
 
+    json_headers = (
+        {"Warning": response_format_warning} if response_format_warning else None
+    )
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),
         media_type="application/json",
+        headers=json_headers,
     )
 
 
@@ -3122,6 +3507,46 @@ def _compile_bare_grammar(compiler, fmt: dict):
     return None
 
 
+def _response_format_requests_strict(response_format) -> bool:
+    """True when an OpenAI ``response_format`` demands strict json_schema output.
+
+    A ``json_schema`` response_format with ``strict: true`` signals that the
+    caller expects schema-conformant output, not best-effort.  When
+    grammar-constrained decoding is unavailable the request still falls back to
+    prompt injection, but the downgrade is logged at a level that names the
+    unhonored ``strict`` intent so it is not silent (issue #1241).
+    """
+    if response_format is None:
+        return False
+    rf = response_format
+    rf_type = rf.get("type") if isinstance(rf, dict) else getattr(rf, "type", None)
+    if rf_type != "json_schema":
+        return False
+    js = rf.get("json_schema") if isinstance(rf, dict) else getattr(rf, "json_schema", None)
+    if js is None:
+        return False
+    strict = js.get("strict") if isinstance(js, dict) else getattr(js, "strict", None)
+    return bool(strict)
+
+
+def _response_format_requests_grammar(response_format) -> bool:
+    """True when an OpenAI ``response_format`` maps to grammar-constrained JSON.
+
+    Delegates to :func:`_build_format_element` so the unenforced-degrade signal
+    stays in sync with what actually gets compiled: a format earns the
+    Warning header / prompt-injection fallback only when a grammar element would
+    have been built for it.  That is non-``None`` exactly for ``json_object``
+    and a ``json_schema`` carrying a schema; a plain ``{"type": "text"}`` (or a
+    json_schema with no schema) maps to nothing and must not warn.  Sharing the
+    one source of truth keeps the header consistent with the server-side warn
+    log and avoids claiming "grammar-constrained decoding unavailable" for a
+    request that never described an enforceable grammar (#1241 review).
+    """
+    if response_format is None:
+        return False
+    return _build_format_element(response_format=response_format) is not None
+
+
 def _compile_grammar_for_request(
     engine: BaseEngine,
     structured_outputs=None,
@@ -3136,9 +3561,12 @@ def _compile_grammar_for_request(
     so that protocol tokens (thinking tags, channel markers) are handled
     automatically.  When not set, the grammar is compiled bare.
 
-    Returns a compiled grammar object or ``None``.  Raises
-    :class:`HTTPException` on compilation errors or when xgrammar is
-    required but not installed.
+    Returns a compiled grammar object or ``None``.  ``structured_outputs``
+    raises :class:`HTTPException` when grammar is unavailable or fails to
+    compile.  A ``response_format`` degrades to ``None`` so the caller can fall
+    back to prompt injection; the downgrade is logged (and named as an
+    unhonored strict request when ``strict: true`` was set) rather than being
+    silent (#1241).
     """
     compiler = getattr(engine, 'grammar_compiler', None)
 
@@ -3168,6 +3596,8 @@ def _compile_grammar_for_request(
                     "Install with: pip install 'omlx[grammar]'"
                 )
             raise HTTPException(status_code=400, detail=detail)
+        if response_format is not None:
+            _warn_response_format_not_enforced(response_format)
         return None
 
     try:
@@ -3182,9 +3612,57 @@ def _compile_grammar_for_request(
                 status_code=400,
                 detail=f"Grammar compilation error: {e}",
             )
-        logger.warning("Grammar compilation from response_format failed, "
-                       "falling back to prompt injection: %s", e)
+        _warn_response_format_not_enforced(response_format, error=e)
     return None
+
+
+def _warn_response_format_not_enforced(response_format, error=None):
+    """Log that a ``response_format`` request fell back to prompt injection.
+
+    Previously a ``response_format`` that could not be grammar-constrained
+    (no compiler available, or a compilation error) degraded to best-effort
+    prompt injection silently, giving the client no signal that the schema was
+    not enforced (#1241).  A ``strict: true`` request gets a message that names
+    the unhonored strict intent.
+    """
+    reason = f" ({error})" if error is not None else ""
+    if _response_format_requests_strict(response_format):
+        logger.warning(
+            "response_format requested strict json_schema output but "
+            "grammar-constrained decoding is unavailable; strict enforcement "
+            "cannot be honored, falling back to best-effort prompt injection "
+            "(output is NOT schema-enforced)%s.", reason,
+        )
+    else:
+        logger.warning(
+            "response_format requested but grammar-constrained decoding is "
+            "unavailable; output will not be schema-enforced (falling back to "
+            "prompt injection)%s.", reason,
+        )
+
+
+def _response_format_warning_header(response_format) -> str:
+    """Build an RFC 7234 ``Warning`` header for an unenforced response_format.
+
+    The server already logs the downgrade (see
+    :func:`_warn_response_format_not_enforced`), but that signal is only
+    visible to the operator.  This header surfaces the same fact to the API
+    caller so a client can tell that ``response_format`` fell back to
+    best-effort prompt injection rather than schema-enforced output (#1241).
+    Header values must be single-line ASCII, so the text is terse.
+    """
+    if _response_format_requests_strict(response_format):
+        text = (
+            "response_format strict json_schema not enforced; "
+            "grammar-constrained decoding unavailable, output is "
+            "best-effort and NOT schema-enforced"
+        )
+    else:
+        text = (
+            "response_format not enforced; grammar-constrained decoding "
+            "unavailable, output is best-effort"
+        )
+    return f'199 omlx "{text}"'
 
 
 # =============================================================================
@@ -5425,7 +5903,6 @@ Note: Use the omlx CLI for full feature support.
 
     # Parse pinned models
     pinned_models = args.pin.split(",") if args.pin else []
-
     # Initialize server
     init_server(
         model_dir=args.model_dir,

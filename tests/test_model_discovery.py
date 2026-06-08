@@ -132,6 +132,28 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_lfm2_text_model_is_llm(self, tmp_path):
+        """LFM2 text checkpoints share model_type with non-text variants."""
+        llm_dir = tmp_path / "LFM2-1.2B"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "lfm2",
+            "architectures": ["Lfm2ForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
+    def test_detect_lfm2_5_moe_text_model_is_llm(self, tmp_path):
+        """LiquidAI/LFM2.5-8B-A1B is a text-generation MoE LLM."""
+        llm_dir = tmp_path / "LFM2.5-8B-A1B"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "lfm2_moe",
+            "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
     def test_detect_qwen3_vl_reranker(self, tmp_path):
         """Qwen3VLForConditionalGeneration + 'reranker' in dir name → reranker."""
         reranker_dir = tmp_path / "Qwen3-VL-Reranker-2B-4bit"
@@ -231,6 +253,17 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_vlm_gemma4_unified(self, tmp_path):
+        """Test detection of Gemma4 unified as VLM."""
+        config = {
+            "model_type": "gemma4_unified",
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
+            "audio_config": {"feature_size": 128},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_text_only_gemma3_as_llm(self, tmp_path):
         """Text-only quant of Gemma3 (no vision_config) should be LLM."""
         config = {
@@ -245,6 +278,15 @@ class TestDetectModelType:
         config = {
             "model_type": "gemma4",
             "architectures": ["Gemma4ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_text_only_gemma4_unified_as_llm(self, tmp_path):
+        """Gemma4 unified without vision_config should not be forced to VLM."""
+        config = {
+            "model_type": "gemma4_unified",
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
