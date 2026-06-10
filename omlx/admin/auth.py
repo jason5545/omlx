@@ -5,6 +5,7 @@ This module provides session-based authentication using signed tokens
 and API key verification for admin panel access.
 """
 
+import hashlib
 import os
 import secrets
 from typing import Any, Optional
@@ -109,10 +110,54 @@ def verify_session_token(token: str, max_age: int = SESSION_MAX_AGE) -> bool:
         return False
 
 
+def compare_keys(provided_key: str, expected_key: str) -> bool:
+    """Compare two API keys in constant time, tolerating any str input.
+
+    secrets.compare_digest raises TypeError when given str arguments that
+    contain non-ASCII characters, which turns a bad client key into an
+    unhandled 500 instead of a 401. Comparing UTF-8 bytes accepts any
+    input while keeping the constant-time guarantee. surrogatepass covers
+    lone surrogates, which json.loads can produce from escape sequences
+    and which strict UTF-8 encoding rejects.
+
+    Both arguments must be str; None is the caller's responsibility.
+
+    Args:
+        provided_key: The key supplied by the client (untrusted).
+        expected_key: The configured key to compare against.
+
+    Returns:
+        True if the keys match, False otherwise.
+    """
+    return secrets.compare_digest(
+        provided_key.encode("utf-8", "surrogatepass"),
+        expected_key.encode("utf-8", "surrogatepass"),
+    )
+
+
+def fingerprint_key(api_key: str) -> str:
+    """Return a short, non-reversible fingerprint of an API key for logging.
+
+    Logging a rejected key verbatim leaks the client's secret into the server
+    log. A truncated SHA-256 digest lets operators correlate repeated
+    rejections of the same key without exposing the key itself. surrogatepass
+    matches compare_keys() so any str the auth path accepts can be
+    fingerprinted, including lone surrogates from json escape sequences.
+
+    Args:
+        api_key: The (untrusted) key to fingerprint. Empty string is allowed.
+
+    Returns:
+        The first 8 hex characters of the SHA-256 digest of the UTF-8 bytes.
+    """
+    digest = hashlib.sha256(api_key.encode("utf-8", "surrogatepass")).hexdigest()
+    return digest[:8]
+
+
 def verify_api_key(api_key: str, server_api_key: str) -> bool:
     """Verify an API key using constant-time comparison.
 
-    This function uses secrets.compare_digest to prevent timing attacks
+    This function uses constant-time comparison to prevent timing attacks
     when comparing the provided API key with the server's API key.
 
     Args:
@@ -130,7 +175,7 @@ def verify_api_key(api_key: str, server_api_key: str) -> bool:
     """
     if not api_key or not server_api_key:
         return False
-    return secrets.compare_digest(api_key, server_api_key)
+    return compare_keys(api_key, server_api_key)
 
 
 def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
@@ -154,11 +199,11 @@ def identify_api_key(api_key: str, main_key: str, sub_keys: list) -> dict[str, A
     """Return safe metadata for the matched API key, without exposing the key value."""
     if not api_key:
         return None
-    if main_key and secrets.compare_digest(api_key, main_key):
+    if main_key and compare_keys(api_key, main_key):
         return {"kind": "main", "name": "main", "sub_key": None}
     for sk in sub_keys:
         key = getattr(sk, "key", "")
-        if key and secrets.compare_digest(api_key, key):
+        if key and compare_keys(api_key, key):
             return {
                 "kind": "sub",
                 "name": getattr(sk, "name", "") or "sub-key",

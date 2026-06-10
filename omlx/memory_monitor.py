@@ -16,12 +16,12 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
 
-from omlx.utils.hardware import get_max_working_set_bytes, format_bytes
+from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,13 @@ try:
 except ImportError:
     HAS_MLX_METAL = False
     mx = None
+
+# MLX >= 0.31 no longer materializes the full fp32 score matrix for
+# head_dim > 128, but local peak measurements still show a tiled score/scratch
+# term. Model it as one fp16 query tile plus the fp32 output buffer.
+_SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD = 128
+_SDPA_TILED_SCRATCH_QUERY_TOKENS = 512
+_SDPA_TILED_SCRATCH_DTYPE_SIZE = 2
 
 
 @dataclass
@@ -68,23 +75,40 @@ class MemoryMonitor:
 
     def __init__(
         self,
-        max_kv_cache_memory: int,
+        max_kv_cache_memory: int | None,
         check_interval: float = 1.0,
+        *,
+        eviction_enabled: bool = True,
     ):
         """
         Initialize the memory monitor.
 
         Args:
-            max_kv_cache_memory: Maximum memory for KV cache in bytes (required).
-                This is the absolute limit for KV cache memory usage.
+            max_kv_cache_memory: Maximum memory for KV cache in bytes.
+                Required when ``eviction_enabled=True``. May be ``None``
+                (or 0) when the monitor is used only for prefill-peak
+                estimation and no eviction/pressure decisions are made
+                against this limit.
             check_interval: Minimum seconds between memory checks (for throttling).
+            eviction_enabled: When False, ``max_kv_cache_memory`` is not
+                consulted and estimation methods that depend on it raise.
+                Set False on schedulers in paged-SSD-only mode where the
+                monitor exists solely for prefill-peak estimation.
         """
-        if max_kv_cache_memory <= 0:
+        if eviction_enabled and (
+            max_kv_cache_memory is None or max_kv_cache_memory <= 0
+        ):
             raise ValueError(
-                f"max_kv_cache_memory must be positive, got {max_kv_cache_memory}"
+                "max_kv_cache_memory must be positive when "
+                f"eviction_enabled=True, got {max_kv_cache_memory}"
             )
 
-        self._max_kv_cache_memory = max_kv_cache_memory
+        self._max_kv_cache_memory = max_kv_cache_memory or 0
+        self._eviction_enabled = eviction_enabled
+        # Public accessor — callers (Scheduler._evict_blocks_*) need a way
+        # to skip the eviction code path without reaching into a private
+        # attribute and without triggering a RuntimeError from
+        # estimate_blocks_to_free().
         self._check_interval = check_interval
         self._max_memory = self._get_max_memory()
 
@@ -96,7 +120,7 @@ class MemoryMonitor:
         self._num_layers: Optional[int] = None
         self._num_kv_heads: Optional[int] = None
         self._head_dim: Optional[int] = None
-        self._dtype_size: int = 2  # Default float16
+        self._dtype_size: float = 2  # Default float16/bfloat16
         self._num_attention_heads: Optional[int] = None
         self._num_kv_cache_layers: Optional[int] = None
 
@@ -111,9 +135,13 @@ class MemoryMonitor:
         self._running_requests: int = 0
         self._waiting_requests: int = 0
 
-        logger.info(
-            f"MemoryMonitor initialized: max_kv_cache={format_bytes(max_kv_cache_memory)}"
-        )
+        if self._eviction_enabled:
+            logger.info(
+                "MemoryMonitor initialized: max_kv_cache=%s",
+                format_bytes(self._max_kv_cache_memory),
+            )
+        else:
+            logger.info("MemoryMonitor initialized (estimator-only, eviction disabled)")
 
     def _get_max_memory(self) -> int:
         """
@@ -204,7 +232,7 @@ class MemoryMonitor:
 
             process = psutil.Process()
             return process.memory_info().rss
-        except ImportError:
+        except Exception:
             return 0
 
     def get_memory_info(self) -> MemoryInfo:
@@ -268,7 +296,7 @@ class MemoryMonitor:
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
-        dtype_size: int = 2,
+        dtype_size: float = 2,
         num_attention_heads: Optional[int] = None,
         num_kv_cache_layers: Optional[int] = None,
     ) -> None:
@@ -279,7 +307,8 @@ class MemoryMonitor:
             num_layers: Number of transformer layers
             num_kv_heads: Number of KV attention heads
             head_dim: Dimension per attention head
-            dtype_size: Bytes per element (2 for float16, 4 for float32)
+            dtype_size: Bytes per element. This may be fractional for
+                quantized KV cache layouts.
             num_attention_heads: Number of query attention heads (for SDPA
                 peak estimation). Defaults to num_kv_heads if not set.
             num_kv_cache_layers: Number of layers that use KVCache
@@ -305,14 +334,34 @@ class MemoryMonitor:
                 f"{format_bytes(sample_block_mem)}"
             )
 
+    def has_model_info(self) -> bool:
+        """Whether ``set_model_info`` has been called with real dims.
+
+        ``estimate_block_memory`` silently substitutes ``32 layers / 8 KV
+        heads / 128 head_dim`` (a 7B-class assumption) when dims are
+        unset, which means callers can't tell "real model" from
+        "estimator default" by inspecting the return value. Use this
+        accessor when the difference matters — e.g. the PagedSSDCache
+        writer-queue cap formula prefers its own 200 KB fallback over
+        the monitor's 128 KB default-fiction.
+        """
+        return (
+            self._num_layers is not None
+            and self._num_layers > 0
+            and self._num_kv_heads is not None
+            and self._num_kv_heads > 0
+            and self._head_dim is not None
+            and self._head_dim > 0
+        )
+
     def estimate_block_memory(
         self,
         block_size: int,
         num_layers: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
-        dtype_size: Optional[int] = None,
-    ) -> int:
+        dtype_size: Optional[float] = None,
+    ) -> float:
         """
         Estimate memory usage for a KV cache block.
 
@@ -338,7 +387,7 @@ class MemoryMonitor:
 
         return total
 
-    def estimate_prompt_kv_bytes(self, num_tokens: int) -> int:
+    def estimate_prompt_kv_bytes(self, num_tokens: int) -> float:
         """
         Estimate KV cache memory for a prompt of given length.
 
@@ -363,46 +412,59 @@ class MemoryMonitor:
         per_token = layers * kv_heads * dim * dtype * 2  # keys + values
         return num_tokens * per_token
 
+    def _estimate_sdpa_activation_bytes(self, query_tokens: int, kv_len: int) -> int:
+        hd = self._head_dim or 0
+        n_q = self._num_attention_heads or 0
+        if n_q == 0 or hd == 0 or query_tokens <= 0:
+            return 0
+
+        output = n_q * query_tokens * hd * 4
+        if hd <= _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD:
+            return output
+
+        tiled_query = min(query_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
+        scratch = n_q * tiled_query * max(kv_len, 0) * _SDPA_TILED_SCRATCH_DTYPE_SIZE
+        return scratch + output
+
     def estimate_prefill_peak_bytes(
         self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0
-    ) -> int:
+    ) -> float:
         """
         Estimate per-request prefill peak memory contribution (KV + SDPA).
 
         Returns only the part directly attributable to this request's prefill:
-        newly allocated KV cache + SDPA attention activation peak for the last
-        chunk. Does NOT include model weights (already in active baseline) or
-        MLX cache pool / python heap overhead (absorbed by enforcer's hard
+        KV cache for the new tokens being added + SDPA attention activation
+        peak for the last chunk. Does NOT include model weights (already in
+        active baseline), prefix-cached KV that is already resident, or MLX
+        cache pool / python heap overhead (absorbed by enforcer's hard
         threshold margin — see MemorySettings.hard_threshold).
 
-        MLX SDPA internals (C++ fallback path, head_dim > 128):
-          1. scores = scale*Q @ K^T → [B, n_q, chunk, kv_len] float32
-          2. softmax(scores) → in-place (already float32)
-          3. out = scores @ V → [B, n_q, chunk, head_dim] float32
-          GQA: K/V broadcast, no extra allocation.
-
-        MLX SDPA fused kernel (head_dim <= 128):
-          Tiled computation, O(n) memory. Only output buffer allocated.
-
-        The SDPA scores matrix at the last chunk attends over the FULL context
-        (cached_tokens + new_tokens), not just the newly prefilled tokens. With
-        a large prefix-cache hit (big cached prefix, small new suffix) the
-        kv_len term must use the full span, otherwise the transient is
-        undercounted by the cache-hit ratio and a request that actually
-        overflows the MetalAllocator slips past the preflight guard.
+        MLX SDPA avoids the old full fp32 score-matrix allocation for
+        head_dim > 128, but high-head-dim kernels still need a tiled scratch
+        term that spans the full key/value context. With prefix-cache hits,
+        that context is ``new_tokens + cached_tokens``, not just the new suffix.
+        Passing only ``new_tokens`` here silently under-counts long-context
+        prefill, exactly where prefix caching makes such requests possible.
 
         Args:
-            new_tokens: Tokens to be prefilled (prompt minus cached prefix).
-                Drives newly allocated KV. Also the last chunk's query length.
-            chunk_size: Prefill step size (default 2048).
-            cached_tokens: Tokens already resident in the prompt cache. Adds to
-                the SDPA kv_len span but not to newly allocated KV (cached KV is
-                already counted in the caller's `current` baseline).
+            new_tokens: Tokens being prefilled this request (prompt minus
+                what the prefix cache already covers). Drives newly
+                allocated KV and the last chunk's query length.
+            chunk_size: Prefill step size (default 2048). Effective chunk
+                is ``min(chunk_size, new_tokens)`` since the last chunk
+                cannot be larger than the remaining new tokens.
+            cached_tokens: Tokens served from prefix cache. Added to
+                ``new_tokens`` for the SDPA scores K-dim because those
+                positions still participate in attention. Keyword-only with
+                a default of 0 so callers that don't know the cache state
+                still typecheck — but they get the under-counting behavior
+                this method was designed to fix, so always pass it when the
+                value is available.
 
         Returns:
             Per-request peak contribution in bytes (KV + SDPA). Returns 0 if
             model info is not available. Caller compares this against
-            `(hard_threshold * max_bytes) - max(active, phys_footprint())` —
+            `(hard_threshold * max_bytes) - current_usage_bytes` —
             the margin handles cache pool / python heap / compressed memory.
         """
         hd = self._head_dim or 0
@@ -411,20 +473,21 @@ class MemoryMonitor:
         if n_q == 0 or hd == 0:
             return 0  # can't estimate
 
-        # Last chunk attends over the full context; query length is the last
-        # chunk size (capped at the new-token count for short suffixes).
-        attn_span = new_tokens + cached_tokens
-        query_len = min(chunk_size, new_tokens)
+        if new_tokens <= 0:
+            return 0
 
-        if hd > 128:
-            # Fallback: full attention matrix materialized in float32
-            # scores [B, n_q, query_len, attn_span] + output [B, n_q, query_len, hd]
-            attn = n_q * query_len * attn_span * 4
-            attn += n_q * query_len * hd * 4  # output buffer (small)
-        else:
-            # Fused kernel: tiled, only output buffer
-            attn = n_q * query_len * hd * 4
+        # Effective chunk: bounded by the remaining new tokens. Short
+        # prompts (smaller than chunk_size) would otherwise be charged the
+        # full chunk_size width in the scores tensor, over-estimating by
+        # chunk_size / new_tokens — a constant-factor over-count that
+        # raised false-positive 413s on small prompts.
+        eff_chunk = min(chunk_size, new_tokens)
+        full_kv_len = new_tokens + max(cached_tokens, 0)
+        attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
 
+        # KV growth attributable to this request: only the new tokens.
+        # The cached portion is already counted in the caller's current-usage
+        # baseline.
         kv = self.estimate_prompt_kv_bytes(new_tokens)
         return attn + kv
 
@@ -438,21 +501,14 @@ class MemoryMonitor:
         in the caller's ``current`` baseline once eval'd); it is the quantity
         the adaptive throttle must keep under the remaining headroom.
 
-        head_dim > 128: MLX SDPA fallback materializes the full attention
-        matrix [B, n_q, n_tokens, kv_len] in float32, plus a small output
-        buffer — so the transient scales with ``n_tokens * kv_len``.
-        head_dim <= 128: fused kernel is tiled / O(n), so only the output
-        buffer is allocated and throttling is effectively a no-op (correct).
+        MLX fused SDPA uses the output-buffer estimate for head_dim <= 128.
+        For larger head_dim values, current MLX avoids the old full fp32
+        score matrix but still needs a bounded query-tile scratch term that
+        scales with total ``kv_len``.
 
         Returns 0 when model info is unavailable.
         """
-        hd = self._head_dim or 0
-        n_q = self._num_attention_heads or 0
-        if n_q == 0 or hd == 0 or n_tokens <= 0:
-            return 0
-        if hd > 128:
-            return n_q * n_tokens * max(kv_len, 0) * 4 + n_q * n_tokens * hd * 4
-        return n_q * n_tokens * hd * 4
+        return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """
@@ -465,12 +521,17 @@ class MemoryMonitor:
         Returns:
             Number of blocks to evict.
         """
+        if not self._eviction_enabled:
+            raise RuntimeError(
+                "estimate_blocks_to_free called on a MemoryMonitor "
+                "constructed with eviction_enabled=False"
+            )
         block_mem = self.estimate_block_memory(block_size)
         if block_mem <= 0:
             return 0
 
         # Round up to ensure we free enough
-        num_blocks = (bytes_to_free + block_mem - 1) // block_mem
+        num_blocks = int((bytes_to_free + block_mem - 1) // block_mem)
         return max(1, num_blocks)
 
     @property
@@ -482,6 +543,18 @@ class MemoryMonitor:
     def max_kv_cache_memory(self) -> int:
         """Get maximum KV cache memory limit."""
         return self._max_kv_cache_memory
+
+    @property
+    def eviction_enabled(self) -> bool:
+        """Whether this monitor was built with eviction wiring.
+
+        Paged-SSD-only mode passes ``eviction_enabled=False`` because
+        the SDPA-peak / prefill-admission paths don't need KV eviction
+        math. Callers (Scheduler._evict_blocks_*) check this before
+        calling ``estimate_blocks_to_free``, which would otherwise
+        raise ``RuntimeError``.
+        """
+        return self._eviction_enabled
 
     def get_stats(self) -> dict:
         """
@@ -508,3 +581,215 @@ class MemoryMonitor:
             f"MemoryMonitor(max_kv_cache={format_bytes(self._max_kv_cache_memory)}, "
             f"used={format_bytes(info.used_bytes)})"
         )
+
+
+def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
+    """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
+
+    The engine-agnostic baseline used by engines that bypass the
+    ``Scheduler`` (currently ``DFlashEngine``'s primary speculative path) so
+    they can run the same prefill-peak estimate the scheduler-driven engines
+    get. Best-effort: on any extraction failure the monitor is left dim-less
+    and ``estimate_prefill_peak_bytes`` returns 0, making the guard a no-op
+    rather than raising spuriously.
+
+    Note this populates the *uncompressed* (base-dtype) KV size — it does not
+    apply the TurboQuant fractional-byte adjustment that
+    ``Scheduler._set_model_info_for_monitor`` layers on, because that depends
+    on scheduler-side TurboQuant configuration. For a memory *guard* the
+    uncompressed estimate is the conservative (never-under-count) choice.
+    """
+    try:
+        # Try to get model config
+        config = None
+        if hasattr(model, "config"):
+            config = model.config
+        elif hasattr(model, "args"):
+            config = model.args
+
+        if config is None:
+            logger.debug("Could not extract model config for memory estimation")
+            return
+
+        # VLM / multimodal configs (e.g. Qwen3.6-VL, Gemma-4) nest the
+        # language-model dimensions under a sub-config. Prefer
+        # ``text_config`` / ``language_config`` / ``llm_config`` when ANY of
+        # them exposes the LM layer count, even if the top-level config also
+        # has one — on some VLM packs the top-level field refers to the
+        # *vision encoder*, not the LM, and accepting it silently miscalibrates
+        # the SDPA-peak estimate. Probe ``num_hidden_layers`` and the legacy
+        # ``n_layer`` alias. Falls back to the top-level config only when no
+        # sub-config has either field.
+        for sub_attr in ("text_config", "language_config", "llm_config"):
+            sub = getattr(config, sub_attr, None)
+            if sub is not None and (
+                getattr(sub, "num_hidden_layers", None)
+                or getattr(sub, "n_layer", None)
+            ):
+                config = sub
+                break
+
+        # Extract KV cache dimensions
+        num_layers = getattr(config, "num_hidden_layers", None) or getattr(
+            config, "n_layer", None
+        )
+        num_kv_heads = (
+            getattr(config, "num_key_value_heads", None)
+            or getattr(config, "num_attention_heads", None)
+            or getattr(config, "n_head", None)
+        )
+        head_dim = getattr(config, "head_dim", None)
+        hidden_size = getattr(config, "hidden_size", None) or getattr(
+            config, "n_embd", None
+        )
+
+        # Calculate head_dim if not directly available
+        if head_dim is None and hidden_size and num_kv_heads:
+            num_heads = getattr(config, "num_attention_heads", None) or num_kv_heads
+            head_dim = hidden_size // num_heads
+
+        # Determine dtype size
+        dtype_size = 2  # Default float16
+        if hasattr(model, "dtype"):
+            if model.dtype == mx.float32:
+                dtype_size = 4
+            elif model.dtype == mx.bfloat16:
+                dtype_size = 2
+
+        # Extract num_attention_heads (query heads) for SDPA peak estimation
+        num_attention_heads = (
+            getattr(config, "num_attention_heads", None)
+            or getattr(config, "n_head", None)
+            or num_kv_heads
+        )
+
+        # Count KVCache layers for hybrid models. Mirrors
+        # Scheduler._set_model_info_for_monitor: recurse into CacheList so
+        # wrapped full-attention layers are counted, not just bare KVCache.
+        num_kv_cache_layers = num_layers
+        if hasattr(model, "make_cache"):
+            try:
+                cache_list = model.make_cache()
+                from mlx_lm.models.cache import CacheList, KVCache
+
+                def _count_kv(c: Any) -> int:
+                    if type(c) is KVCache:
+                        return 1
+                    if isinstance(c, CacheList):
+                        return sum(_count_kv(inner) for inner in c.caches)
+                    return 0
+
+                num_kv_cache_layers = sum(_count_kv(c) for c in cache_list)
+                if num_kv_cache_layers == 0:
+                    num_kv_cache_layers = num_layers  # fallback
+            except Exception:
+                pass
+
+        # Truthiness alone isn't enough — MagicMock proxies leaking through the
+        # descent (test scaffolds that don't fully spec ``model.config``) are
+        # truthy but fail any later numeric comparison (``> 128`` etc.) deep
+        # inside MemoryMonitor. Insist on real positive integers before calling.
+        def _pos_int(v: Any) -> bool:
+            return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+        if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+            monitor.set_model_info(
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype_size=dtype_size,
+                num_attention_heads=num_attention_heads,
+                num_kv_cache_layers=num_kv_cache_layers,
+            )
+            logger.debug(
+                f"Model info for memory estimation: "
+                f"layers={num_layers} ({num_kv_cache_layers} KVCache), "
+                f"kv_heads={num_kv_heads}, q_heads={num_attention_heads}, "
+                f"head_dim={head_dim}, dtype_size={dtype_size}"
+            )
+        else:
+            logger.debug(
+                f"Incomplete model info: layers={num_layers}, "
+                f"kv_heads={num_kv_heads}, head_dim={head_dim}"
+            )
+
+    except Exception as e:
+        logger.debug(f"Failed to extract model info: {e}")
+
+
+def raise_if_prefill_exceeds(
+    monitor: "MemoryMonitor | None",
+    *,
+    prefill_memory_guard: bool,
+    hard_limit_bytes: int,
+    current_usage_bytes: int,
+    prefill_step_size: int,
+    num_prompt_tokens: int,
+    cached_tokens: int = 0,
+    request_id: str | None = None,
+) -> None:
+    """Raise ``PrefillMemoryExceededError`` if a prompt's prefill peak would
+    push memory past ``hard_limit_bytes``.
+
+    The shared front-door guard, taking token counts + watermarks directly so
+    an engine without a ``Scheduler`` (``DFlashEngine``) enforces with the
+    same math ``Scheduler.preflight_or_raise`` uses. No-op when the guard is
+    disabled, no limit is set, the monitor is missing, or the request fits.
+    The caller supplies ``current_usage_bytes`` so HTTP/event-loop preflight
+    paths can use cached executor telemetry plus physical footprint without
+    calling MLX directly. Maps to HTTP 400 via the server's
+    ``prefill_memory_exceeded_handler``.
+
+    ``cached_tokens`` means prompt KV *already resident in current memory*
+    (e.g. the scheduler's paged prefix cache) — not merely "tokens that hit
+    a cache". A cache whose hits re-allocate KV (DFlash prefix snapshots)
+    must pass 0.
+    """
+    if not prefill_memory_guard:
+        return
+    if hard_limit_bytes <= 0:
+        return
+    if monitor is None:
+        return
+
+    new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
+    if new_tokens == 0:
+        return
+
+    peak = monitor.estimate_prefill_peak_bytes(
+        new_tokens, prefill_step_size, cached_tokens=cached_tokens
+    )
+    if peak == 0:
+        return
+
+    current = max(0, int(current_usage_bytes))
+    if current + peak <= hard_limit_bytes:
+        return
+
+    from omlx.exceptions import PrefillMemoryExceededError
+
+    usage_gb = current / (1024**3)
+    ceiling_gb = hard_limit_bytes / (1024**3)
+    message = (
+        f"Prefill would require ~{format_bytes(current + peak)} peak "
+        f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+        f"but ceiling is {format_bytes(hard_limit_bytes)} "
+        f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+        f"Reduce context length, free system memory, or loosen "
+        f"memory_guard_tier (safe → balanced → aggressive)."
+    )
+
+    if not request_id:
+        import uuid as _uuid
+
+        request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
+    logger.warning(
+        "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
+        num_prompt_tokens, cached_tokens, request_id, message,
+    )
+    raise PrefillMemoryExceededError(
+        message=message,
+        request_id=request_id,
+        estimated_bytes=int(current + peak),
+        limit_bytes=int(hard_limit_bytes),
+    )

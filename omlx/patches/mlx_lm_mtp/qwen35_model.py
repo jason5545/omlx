@@ -534,7 +534,9 @@ def _patch_text_model(q35: Any) -> None:
         # out because the inner ``language_model`` has no ``mtp``.
         from . import is_mtp_active
 
-        if n_mtp > 0 and is_mtp_active():
+        mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
+        self._omlx_mtp_decode_enabled = mtp_decode_enabled
+        if mtp_decode_enabled:
             self.mtp = q35.MTPModule(args)
             if _mtp_sidecar_expected:
                 self._omlx_mtp_sidecar = True

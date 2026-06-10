@@ -50,6 +50,7 @@ from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
+from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
@@ -91,6 +92,24 @@ def _make_suppressing_sampler(
         return sampler(_apply_suppress_token_ids(logits, suppress_tuple))
 
     return _sample
+
+
+@dataclass
+class _PreflightRejection:
+    """Typed return for ``_preflight_memory_check`` / its token-count
+    helper. Carries the human-readable diagnostic plus the numeric
+    estimated / limit bytes so callers can populate
+    ``PrefillMemoryExceededError`` without parsing the string.
+
+    Same shim as ``preflight_or_raise`` (restored on main after the
+    upstream merge dropped it); the typed shape is what
+    ``tests/test_scheduler_prefill_memory_guard.py`` asserts against,
+    and what PR #1452 carries upstream.
+    """
+
+    message: str
+    estimated_bytes: int
+    limit_bytes: int
 
 
 @dataclass
@@ -366,6 +385,13 @@ def _patched_generation_batch_step(self):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
         model.set_batch_rope_deltas(mx.array(deltas))
 
+    # Defensive: mlx-lm's GenerationBatch._step does `any(self.logits_processors)`
+    # and `for p in self.logits_processors[e]`, both of which crash when
+    # logits_processors is None.  Normalise to [] so the original code path
+    # works without modification.  See #934.
+    if self.logits_processors is None:
+        self.logits_processors = []
+
     result = _original_generation_batch_step(self)
 
     # self._next_tokens contains the just-sampled tokens (async eval pending).
@@ -552,7 +578,9 @@ def _patched_ppb_split(self, indices):
         new_batch.prefill_step_size = self.prefill_step_size
         new_batch.samplers = self.samplers
         new_batch.fallback_sampler = self.fallback_sampler
-        new_batch.logits_processors = self.logits_processors
+        # Defensive: normalise None → [] to avoid mlx-lm crash in _step
+        lps = self.logits_processors if self.logits_processors is not None else []
+        new_batch.logits_processors = lps
         new_batch.state_machines = self.state_machines
         new_batch.max_tokens = self.max_tokens
 
@@ -774,6 +802,41 @@ def _cache_base_sizes(caches: list[Any]) -> int:
         return 0
 
 
+def _collect_cache_storage_arrays(cache_obj: Any) -> list[mx.array]:
+    """Collect concrete backing arrays from cache objects, not state slices."""
+    arrays: list[mx.array] = []
+
+    if isinstance(cache_obj, mx.array):
+        return [cache_obj]
+
+    sub_caches = getattr(cache_obj, "caches", None)
+    if isinstance(sub_caches, (list, tuple)):
+        for sub_cache in sub_caches:
+            arrays.extend(_collect_cache_storage_arrays(sub_cache))
+
+    array_cache = getattr(cache_obj, "cache", None)
+    if isinstance(array_cache, (list, tuple)):
+        for item in array_cache:
+            arrays.extend(_collect_cache_storage_arrays(item))
+
+    for attr in ("keys", "values", "left_padding", "lengths"):
+        value = getattr(cache_obj, attr, None)
+        if isinstance(value, mx.array):
+            arrays.append(value)
+
+    return arrays
+
+
+def _materialize_cache_storage(cache_list: list[Any]) -> None:
+    """Force restored cache backing arrays concrete before decode begins."""
+    arrays: list[mx.array] = []
+    for cache_obj in cache_list:
+        arrays.extend(_collect_cache_storage_arrays(cache_obj))
+    if arrays:
+        with _mx_buffer_access_lock:
+            mx.eval(*arrays)
+
+
 def _seed_text_only_mrope_delta_for_cached_prefill(model: Any, request: Any) -> None:
     """Seed zero mRoPE delta after clearing text-only cached-prefix state."""
     if getattr(request, "cached_tokens", 0) <= 0:
@@ -817,6 +880,43 @@ def _advance_vlm_extra(extra: dict[str, Any], n: int) -> dict[str, Any]:
         else:
             advanced[key] = val
     return advanced
+
+
+def _get_attr_or_key(obj: Any, name: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name)
+    try:
+        value = getattr(obj, name)
+    except Exception:
+        return None
+    if type(value).__module__.startswith("unittest.mock"):
+        return None
+    return value
+
+
+def _model_declares_llama4(model: Any) -> bool:
+    """Return True if the loaded model/config tree declares Llama 4."""
+    seen: set[int] = set()
+    stack = [model]
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+
+        if _get_attr_or_key(obj, "model_type") == "llama4":
+            return True
+
+        for attr in ("config", "args", "text_config", "language_config", "llm_config"):
+            child = _get_attr_or_key(obj, attr)
+            if child is not None and not isinstance(
+                child, (str, bytes, int, float, bool)
+            ):
+                stack.append(child)
+    return False
 
 
 class SchedulingPolicy(Enum):
@@ -968,6 +1068,8 @@ class Scheduler:
     """
 
     _DEFERRED_CLEAR_DELAY: int = 8
+    _GENERATION_OVERFLOW_PATTERN = "__next_prime overflow"
+    _MAX_GENERATION_OVERFLOW_RETRIES = 1
 
     def __init__(
         self,
@@ -996,6 +1098,12 @@ class Scheduler:
         self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
         self._stream = stream if stream is not None else _default_generation_stream
+        self._serialize_llama4_requests = _model_declares_llama4(model)
+        if self._serialize_llama4_requests and self.config.max_num_seqs > 1:
+            logger.info(
+                "Llama 4 detected; serializing requests because ChunkedKVCache "
+                "does not support multi-row batching yet"
+            )
 
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
@@ -1030,6 +1138,7 @@ class Scheduler:
         self._prefill_states: dict[str, _PrefillState] = {}
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
+        self._generation_overflow_recovery_ids: set[str] = set()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
@@ -1060,6 +1169,10 @@ class Scheduler:
         # kill a near-complete request that actually fits. 0 => fall back to
         # _memory_hard_limit_bytes (pre-propagation / old enforcer).
         self._memory_abort_limit_bytes: int = 0
+        # Last mx.get_active_memory() sample taken on this scheduler's MLX
+        # executor thread. The background memory enforcer reads this cached
+        # value during active decode instead of touching MLX/Metal directly.
+        self._last_mlx_active_memory_bytes: int = 0
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
@@ -1084,6 +1197,12 @@ class Scheduler:
         self._specprefill_draft_model: Any | None = None
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: str | None = None
+
+        # DEBUG-only prefix-cache divergence probe (issue #1003): recent
+        # stored cache sequences, so a miss can be traced to the exact
+        # token where the new prompt diverges from what was cached.
+        # Populated only when debug logging is enabled — zero cost otherwise.
+        self._cache_probe_seqs: deque[tuple[str, list[int]]] = deque(maxlen=4)
 
         # VLM MTP: gemma4_assistant drafter attached by VLMBatchedEngine.
         # When set, eligible requests bypass mlx-lm BatchGenerator for decode
@@ -1140,7 +1259,28 @@ class Scheduler:
         self.block_aware_cache: BlockAwarePrefixCache | None = None
         self.paged_ssd_cache_manager: PagedSSDCacheManager | None = None
         self._cache_rate_tracker = CacheRateTracker()
-        self.memory_monitor: MemoryMonitor | None = None
+        # Prefill-peak estimator used by ``_preflight_memory_check`` /
+        # ``preflight_or_raise``. Only the estimator path is exercised
+        # here (it reads head_dim / num_layers / num_kv_heads via
+        # ``set_model_info`` below); ``eviction_enabled=False`` so the
+        # monitor does not gate on ``max_kv_cache_memory`` — paged SSD
+        # mode never wants this monitor making eviction decisions, and
+        # we have no real value to pass for that field at this point.
+        #
+        # This auto-init was wired up in b6a69c4 then silently dropped
+        # by an upstream merge (same pattern as ``preflight_or_raise``
+        # in d40ab80). Without it the guard short-circuits at the
+        # ``memory_monitor is None`` gate for every request — Pi prompts
+        # that should be rejected by the configured hard limit instead
+        # sail straight into chunked prefill and OOM at the Metal cap.
+        if MemoryMonitor is not None:
+            self.memory_monitor: MemoryMonitor | None = MemoryMonitor(
+                max_kv_cache_memory=None,
+                eviction_enabled=False,
+            )
+            self._set_model_info_for_monitor()
+        else:
+            self.memory_monitor: MemoryMonitor | None = None
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
@@ -1952,7 +2092,7 @@ class Scheduler:
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens_seq,
             sampler=sampler,
-            logits_processors=logits_processors if logits_processors else None,
+            logits_processors=logits_processors if logits_processors else [],
             prefill_batch_size=1,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
@@ -2084,13 +2224,15 @@ class Scheduler:
         plain KVCache objects but read fetched cache tensors directly, which
         TurboQuant's quantized states do not support (#1613).
         """
-        from mlx_lm.models.cache import CacheList, KVCache
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
         if self._model_uses_mla():
             return False
 
         def _ok(c: Any) -> bool:
             if isinstance(c, KVCache):
+                return True
+            if isinstance(c, ArraysCache):
                 return True
             if isinstance(c, CacheList):
                 return all(_ok(inner) for inner in c.caches)
@@ -2396,7 +2538,7 @@ class Scheduler:
             # show in mx.get_active_memory() still trigger the guard.
             # See utils/proc_memory.py for why phys_footprint matters.
             if self._memory_limit_bytes > 0:
-                current = max(mx.get_active_memory(), get_phys_footprint())
+                current = self._current_usage_bytes()
                 _hard = self._memory_hard_limit_bytes
                 _soft = self._memory_limit_bytes
                 # Only log when crossing the soft watermark — that's the
@@ -2507,6 +2649,10 @@ class Scheduler:
             prompt_cache
         ):
             self._apply_turboquant_kv_convert(prompt_cache)
+
+        if getattr(request, "cached_tokens", 0) > 0:
+            with mx.stream(self._stream):
+                _materialize_cache_storage(prompt_cache)
 
         return prompt_cache, last_token
 
@@ -2656,7 +2802,7 @@ class Scheduler:
         if cap <= 0:
             return n_tokens
         min_chunk = max(1, self._prefill_min_chunk_tokens)
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes()
         if current + self._predicted_chunk_transient(n_tokens, kv_len) <= cap:
             return n_tokens
 
@@ -2770,7 +2916,7 @@ class Scheduler:
         if soft_base <= 0 or hard_cap <= 0 or requested <= 0:
             return requested
 
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
 
         # Conservative per-token transient (measured-last / EWMA / static, ×
@@ -2854,6 +3000,23 @@ class Scheduler:
             )
         return n
 
+    def get_cached_mlx_active_memory_bytes(self) -> int:
+        """Return the last MLX active-memory sample taken on the executor."""
+        return self._last_mlx_active_memory_bytes
+
+    def _current_usage_bytes(self, *, refresh_mlx_active: bool = True) -> int:
+        """Current memory usage for scheduler-side guard checks.
+
+        Scheduler steps run on the MLX executor thread, so they can refresh
+        mx.get_active_memory() safely. Event-loop callers such as early
+        preflight use the cached executor sample and phys_footprint instead.
+        """
+        active = self._last_mlx_active_memory_bytes
+        if refresh_mlx_active:
+            active = max(0, int(mx.get_active_memory()))
+            self._last_mlx_active_memory_bytes = active
+        return max(active, get_phys_footprint())
+
     def _record_chunk_transient(
         self,
         n_tokens: int,
@@ -2907,7 +3070,7 @@ class Scheduler:
             ``max(active, phys_footprint)`` after reclaim.
         """
         _sync_and_clear_cache(self._stream)
-        return max(mx.get_active_memory(), get_phys_footprint())
+        return self._current_usage_bytes()
 
     # ------------------------------------------------------------------
     # Chunked prefill helpers (used when config.chunked_prefill=True)
@@ -3071,7 +3234,7 @@ class Scheduler:
         # phys_footprint, so the active-only check could miss the page
         # before the kernel kills us.
         if self._memory_limit_bytes > 0:
-            current = max(mx.get_active_memory(), get_phys_footprint())
+            current = self._current_usage_bytes()
             _hard = self._memory_hard_limit_bytes
             _soft = self._memory_limit_bytes
             # Caution-zone-only memcheck log (see external loop counterpart).
@@ -4567,6 +4730,55 @@ class Scheduler:
 
         return extracted, model_cache_config
 
+    @staticmethod
+    def _common_prefix_len(a: list[int], b: list[int]) -> int:
+        n = min(len(a), len(b))
+        for i in range(n):
+            if a[i] != b[i]:
+                return i
+        return n
+
+    def _log_prefix_divergence(self, request: Request) -> None:
+        """DEBUG-only prefix-cache miss diagnostic (issue #1003).
+
+        Compares the new prompt against recently stored cache sequences and
+        logs the first divergent token offset with decoded context on both
+        sides, so an always-miss report can be traced to the exact prompt
+        position (template re-render drift, client echo changes, eviction)
+        instead of guessing from hit counters.
+        """
+        prompt = request.prompt_token_ids or []
+        if not prompt or not self._cache_probe_seqs:
+            return
+        best_id, best_seq, best_p = None, None, -1
+        for ref_id, seq in list(self._cache_probe_seqs):
+            p = self._common_prefix_len(prompt, seq)
+            if p > best_p:
+                best_id, best_seq, best_p = ref_id, seq, p
+        if best_seq is None:
+            return
+        cached = request.cached_tokens or 0
+        reusable = min(len(prompt), len(best_seq))
+        block = self.config.paged_cache_block_size
+        logger.debug(
+            f"Request {request.request_id}: prefix probe vs stored {best_id}: "
+            f"common_prefix={best_p}/{reusable} tokens "
+            f"(~{best_p // max(1, block)} blocks of {block}), "
+            f"served cached_tokens={cached}, prompt={len(prompt)}"
+        )
+        if best_p < reusable:
+            lo = max(0, best_p - 12)
+            hi = best_p + 12
+            try:
+                stored_ctx = self.tokenizer.decode(best_seq[lo:hi])
+                prompt_ctx = self.tokenizer.decode(prompt[lo:hi])
+            except Exception:
+                stored_ctx = prompt_ctx = "<decode failed>"
+            logger.debug(
+                f"Request {request.request_id}: first divergence at token "
+                f"{best_p}: stored=...{stored_ctx!r} vs prompt=...{prompt_ctx!r}"
+            )
+
     def add_request(self, request: Request) -> None:
         """
         Add a new request to the scheduler.
@@ -4707,9 +4919,30 @@ class Scheduler:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
 
+        # DEBUG-only: trace where this prompt diverges from recently stored
+        # cache sequences (issue #1003 always-miss diagnosis).
+        if logger.isEnabledFor(logging.DEBUG):
+            self._log_prefix_divergence(request)
+
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
         self._try_specprefill_scoring(request)
+
+        # Front-door preflight: reject obviously-too-large requests at
+        # ``add_request`` rather than letting them sit in the waiting
+        # queue and trip the in-stream re-check later. The cache lookup
+        # above may have already attached a ``block_table`` whose ref
+        # counts must be released before re-raising — otherwise a
+        # sustained rejection stream leaks one block table per call.
+        try:
+            self.preflight_or_raise(
+                num_prompt_tokens=request.num_prompt_tokens,
+                cached_tokens=request.cached_tokens or 0,
+                request_id=request.request_id,
+            )
+        except Exception:
+            self._release_paged_cache_for_request(request.request_id)
+            raise
 
         # Add to tracking
         self.requests[request.request_id] = request
@@ -5382,7 +5615,7 @@ class Scheduler:
         self._pending_reclaim_request = False
         if self.running or self.prefilling or self.waiting:
             return
-        before = max(mx.get_active_memory(), get_phys_footprint())
+        before = self._current_usage_bytes()
         after = self._reclaim_prefill_headroom()
         logger.info(
             "Idle reclaim: trimmed Metal transients between turns "
@@ -5508,6 +5741,22 @@ class Scheduler:
             or self._deferred_clear_at is not None
         )
 
+    def _refresh_generation_overflow_recovery_ids(self) -> None:
+        """Drop serial-retry markers once the affected requests leave the scheduler."""
+        if not self._generation_overflow_recovery_ids:
+            return
+        active_ids = set(self.running)
+        active_ids.update(request.request_id for request in self.waiting)
+        active_ids.update(request.request_id for request in self.prefilling)
+        self._generation_overflow_recovery_ids.intersection_update(active_ids)
+
+    def _effective_max_num_seqs(self) -> int:
+        """Current admission cap, narrowed for models that require serial decode."""
+        self._refresh_generation_overflow_recovery_ids()
+        if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
+            return 1
+        return max(1, self.config.max_num_seqs)
+
     def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.
 
@@ -5579,6 +5828,7 @@ class Scheduler:
             uid = self.request_id_to_uid.pop(rid, None)
             if uid is not None:
                 self.uid_to_request_id.pop(uid, None)
+        self._generation_overflow_recovery_ids.difference_update(failed_ids)
         # Reset batch generator only (cache is not corrupted)
         self.batch_generator = None
         self._current_sampler_params = None
@@ -5602,20 +5852,29 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _preflight_memory_check(self, request: "Request") -> str | None:
+    def _num_admitted_requests(self) -> int:
+        """Return requests already occupying scheduler capacity."""
+        return len(self.running) + len(self.prefilling)
+
+    def _preflight_memory_check(
+        self, request: "Request"
+    ) -> "_PreflightRejection | None":
         """
         Estimate whether prefill would exceed memory limits.
 
         Computes worst-case peak memory for the last prefill chunk
-        (model weights + KV cache + SDPA attention matrix) and rejects
+        (model weights + KV cache + SDPA activation/scratch) and rejects
         if it would exceed the hard limit.
 
-        For head_dim > 128, MLX SDPA uses a fallback that materializes
-        the full attention matrix [B, n_q, chunk, kv_len] in float32.
-        For head_dim <= 128, MLX uses a fused kernel with O(n) memory.
+        Current MLX avoids the old full fp32 attention matrix for
+        head_dim > 128, but still needs a bounded tiled scratch term.
 
         Returns:
-            Error message string if request should be rejected, None if OK.
+            ``_PreflightRejection`` carrying the message + numeric
+            estimated / limit bytes if the request should be rejected,
+            otherwise ``None``. The structured return lets the server
+            layer populate ``PrefillMemoryExceededError.estimated_bytes``
+            / ``limit_bytes`` without parsing the human string.
         """
         if not self._prefill_memory_guard:
             return None
@@ -5637,13 +5896,21 @@ class Scheduler:
         if peak == 0:
             return None  # can't estimate, skip
 
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes()
+        estimated = current + peak
+        hard_limit = self._memory_hard_limit_bytes
 
-        if current + peak > self._memory_hard_limit_bytes:
+        if estimated > hard_limit:
+            # Try LRU eviction first (upstream's predictive-throttle
+            # path): if eviction can free enough headroom this raises
+            # ``_PrefillEvictionNeeded`` and the request is paused for
+            # retry. If eviction can't help (already retried, no idle
+            # models), the call is a no-op and we fall through to the
+            # typed rejection.
             self._raise_prefill_eviction_if_available(
                 request_id=request.request_id,
                 current=current,
-                target_cap=self._memory_hard_limit_bytes,
+                target_cap=hard_limit,
                 predicted_transient=peak,
                 requested_tokens=min(new_tokens, self.config.prefill_step_size),
                 reason="prefill_preflight",
@@ -5651,15 +5918,90 @@ class Scheduler:
             from .utils.hardware import format_bytes
 
             usage_gb = current / (1024**3)
-            ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
-            return (
-                f"Prefill would require ~{format_bytes(current + peak)} peak "
+            ceiling_gb = hard_limit / (1024**3)
+            message = (
+                f"Prefill would require ~{format_bytes(estimated)} peak "
                 f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
+                f"but ceiling is {format_bytes(hard_limit)} "
                 f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                f"Reduce context length or lower memory_guard_tier."
+                f"Reduce context length, free system memory, or loosen "
+                f"memory_guard_tier (safe → balanced → aggressive)."
+            )
+            return _PreflightRejection(
+                message=message,
+                estimated_bytes=int(estimated),
+                limit_bytes=int(hard_limit),
             )
         return None
+
+    def preflight_or_raise(
+        self,
+        *,
+        num_prompt_tokens: int,
+        cached_tokens: int = 0,
+        request_id: str | None = None,
+    ) -> None:
+        """Pre-StreamingResponse prefill memory check.
+
+        Called from the engine's ``preflight_chat`` / ``preflight_completion``
+        before the FastAPI route wraps the body in a ``StreamingResponse``,
+        so the typed exception can be mapped to HTTP 413 by the registered
+        handler. A no-op when the guard is disabled or the request fits.
+
+        Mirrors the ``_preflight_memory_check`` math but takes token counts
+        directly (no Request object) and raises instead of returning a
+        message — the in-stream re-check inside ``_schedule_waiting``
+        remains as defense-in-depth.
+        """
+        if not self._prefill_memory_guard:
+            return
+        if self._memory_hard_limit_bytes <= 0:
+            return
+        if self.memory_monitor is None:
+            return
+
+        new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
+        if new_tokens == 0:
+            return
+
+        peak = self.memory_monitor.estimate_prefill_peak_bytes(
+            new_tokens, self.config.prefill_step_size, cached_tokens=cached_tokens
+        )
+        if peak == 0:
+            return
+
+        current = self._current_usage_bytes(refresh_mlx_active=False)
+        if current + peak <= self._memory_hard_limit_bytes:
+            return
+
+        from .exceptions import PrefillMemoryExceededError
+        from .utils.hardware import format_bytes
+
+        usage_gb = current / (1024**3)
+        ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
+        message = (
+            f"Prefill would require ~{format_bytes(current + peak)} peak "
+            f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+            f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
+            f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+            f"Reduce context length, free system memory, or loosen "
+            f"memory_guard_tier (safe → balanced → aggressive)."
+        )
+
+        if not request_id:
+            import uuid as _uuid
+
+            request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
+        logger.warning(
+            "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
+            num_prompt_tokens, cached_tokens, request_id, message,
+        )
+        raise PrefillMemoryExceededError(
+            message=message,
+            request_id=request_id,
+            estimated_bytes=int(current + peak),
+            limit_bytes=int(self._memory_hard_limit_bytes),
+        )
 
     def _schedule_waiting(
         self,
@@ -5687,15 +6029,19 @@ class Scheduler:
         # Track SpecPrefill: these requests must be alone (RoPE patching affects whole model)
         batch_specprefill_status: bool | None = None
 
-        while self.waiting and len(self.running) < self.config.max_num_seqs:
+        while (
+            self.waiting
+            and self._num_admitted_requests() < self._effective_max_num_seqs()
+        ):
             # Admission pause: set by ProcessMemoryEnforcer when phys
             # crosses soft_threshold. New prefills wait; in-flight requests
-            # continue. First request always passes (self.running is empty)
+            # continue. First request always passes (no admitted work yet)
             # so admission can recover by completing the current generation.
-            if self._admission_paused and self.running:
+            admitted = self._num_admitted_requests()
+            if self._admission_paused and admitted:
                 logger.debug(
-                    "Admission paused by memory pressure, %d running",
-                    len(self.running),
+                    "Admission paused by memory pressure, %d admitted",
+                    admitted,
                 )
                 break
 
@@ -5722,23 +6068,23 @@ class Scheduler:
                 )
                 break
 
-            # Generation memory guard: when requests are already running,
+            # Generation memory guard: when requests are already admitted,
             # defer scheduling if memory pressure is high to prevent
             # Metal allocation failures during batch_generator.next().
-            # First request always passes (self.running is empty).
+            # First request always passes (no admitted work yet).
             if (
                 self._prefill_memory_guard
                 and self._memory_limit_bytes > 0
-                and self.running
+                and admitted
             ):
-                current = max(mx.get_active_memory(), get_phys_footprint())
+                current = self._current_usage_bytes()
                 if current > self._memory_limit_bytes:
                     logger.debug(
                         "Generation memory guard: deferring scheduling "
-                        "(%s > %s), %d running",
+                        "(%s > %s), %d admitted",
                         current,
                         self._memory_limit_bytes,
-                        len(self.running),
+                        admitted,
                     )
                     break
 
@@ -5844,16 +6190,20 @@ class Scheduler:
             )
 
             # Pre-flight memory guard: estimate peak memory for this request
-            # and reject if it would exceed the hard limit.
+            # and reject if it would exceed the hard limit. The check
+            # may raise ``_PrefillEvictionNeeded`` (upstream's
+            # predictive-throttle path) to pause and retry under
+            # eviction headroom; only if eviction can't help does the
+            # typed rejection propagate.
             try:
-                preflight_error = self._preflight_memory_check(request)
+                preflight_rejection = self._preflight_memory_check(request)
             except _PrefillEvictionNeeded as e:
                 self._pause_for_prefill_eviction(request, e.request)
                 break
-            if preflight_error:
+            if preflight_rejection is not None:
                 logger.warning(
                     f"Request {request.request_id} rejected by prefill "
-                    f"memory guard: {preflight_error}"
+                    f"memory guard: {preflight_rejection.message}"
                 )
                 self._release_paged_cache_for_request(request.request_id)
                 self.requests.pop(request.request_id, None)
@@ -5862,7 +6212,7 @@ class Scheduler:
                         request_id=request.request_id,
                         finished=True,
                         finish_reason="error",
-                        error=preflight_error,
+                        error=preflight_rejection.message,
                     )
                 )
                 continue
@@ -6604,6 +6954,23 @@ class Scheduler:
         elif self.paged_cache_manager is not None:
             self.paged_cache_manager.delete_block_table(request_id)
 
+        # SpecPrefill primes an independent ``_draft_prefix_cache`` in
+        # ``_try_specprefill_scoring`` whose block refs are tracked
+        # separately from the target ``block_aware_cache``. Without
+        # releasing it on the rejection path a rejected SpecPrefill
+        # request leaks every draft-block ref symmetric to the
+        # target-cache leak the main branch above guards against.
+        draft_cache = getattr(self, "_draft_prefix_cache", None)
+        if draft_cache is not None:
+            try:
+                draft_cache.release_cache(request_id)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "Draft prefix cache release_cache(%s) raised; ignoring",
+                    request_id,
+                    exc_info=True,
+                )
+
     def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
         # Synchronize pending engine stream operations before cache storage.
@@ -6651,6 +7018,14 @@ class Scheduler:
                             else:
                                 cacheable_sequence = full_token_sequence
                             token_sequence_to_store = cacheable_sequence
+                            # DEBUG-only divergence probe (issue #1003)
+                            if logger.isEnabledFor(logging.DEBUG):
+                                self._cache_probe_seqs.append(
+                                    (
+                                        request.request_id,
+                                        list(token_sequence_to_store),
+                                    )
+                                )
                             cache_to_store = request._extracted_cache
                             model_cache_config = getattr(
                                 request, "_model_cache_config", None
@@ -6922,6 +7297,13 @@ class Scheduler:
         """Check if an error indicates cache corruption."""
         return is_cache_corruption_error(error)
 
+    def _is_generation_overflow_error(self, error: Exception) -> bool:
+        """Check for MLX/libc++ unordered-container overflow during decode."""
+        return (
+            isinstance(error, OverflowError)
+            and self._GENERATION_OVERFLOW_PATTERN in str(error)
+        )
+
     def _recover_from_cache_error(self) -> None:
         """Recover from cache corruption error."""
         # Clear batch generator (this is the source of the corruption)
@@ -6960,6 +7342,53 @@ class Scheduler:
 
         logger.info("Cache recovery completed")
 
+    def _recover_from_generation_overflow_error(self) -> None:
+        """Reset decode state after MLX __next_prime overflow."""
+        self.batch_generator = None
+        self._current_sampler_params = None
+        self._boundary_snapshot_required = None
+
+        active_specprefill = self._specprefill_active_request_id
+        if active_specprefill is not None:
+            self._cleanup_specprefill(active_specprefill)
+
+        if hasattr(self.model, "clear_vlm_position_state"):
+            self.model.clear_vlm_position_state()
+        if hasattr(self.model, "clear_pending_embeddings"):
+            self.model.clear_pending_embeddings()
+
+        self.request_id_to_uid.clear()
+        self.uid_to_request_id.clear()
+        self._deferred_clear_at = None
+        self._request_detokenizers.clear()
+        self._output_parser_sessions.clear()
+
+        try:
+            _sync_and_clear_cache(self._stream)
+        except Exception as e:
+            logger.warning(
+                "Metal cache clear failed during generation overflow recovery: %s",
+                e,
+            )
+
+        logger.info("Generation overflow recovery completed")
+
+    def _reset_request_for_reprefill(self, request: Request) -> None:
+        """Reset request-owned decode state so it can be prefilled again."""
+        request.status = RequestStatus.WAITING
+        request.batch_uid = None
+        request.prompt_cache = None
+        request.cached_tokens = 0
+        request.remaining_tokens = request.prompt_token_ids
+        request.block_table = None
+        request.shared_prefix_blocks = 0
+        request.output_token_ids = []
+        request.output_text = ""
+        request.num_computed_tokens = 0
+        request._extracted_cache = None
+        request._model_cache_config = None
+        request.think_prefix_sent = False
+
     def _reschedule_running_requests(
         self, is_corruption: bool = False, max_corruption_retries: int = 3
     ) -> list[str]:
@@ -6988,28 +7417,7 @@ class Scheduler:
                         req.prompt_cache = None
                     continue
 
-            # Reset scheduling state
-            request.status = RequestStatus.WAITING
-            request.batch_uid = None
-
-            # Reset cache state
-            request.prompt_cache = None
-            request.cached_tokens = 0
-            request.remaining_tokens = request.prompt_token_ids
-            request.block_table = None
-            request.shared_prefix_blocks = 0
-
-            # Reset generation output (prevent duplicate tokens on re-prefill)
-            request.output_token_ids = []
-            request.output_text = ""
-            request.num_computed_tokens = 0
-
-            # Reset extracted cache (prevent GPU memory leak)
-            request._extracted_cache = None
-            request._model_cache_config = None
-
-            # Reset reasoning model state
-            request.think_prefix_sent = False
+            self._reset_request_for_reprefill(request)
 
             # Move to waiting queue (at front for priority)
             self.waiting.appendleft(request)
@@ -7018,6 +7426,81 @@ class Scheduler:
 
         if count > 0:
             logger.info(f"Rescheduled {count} requests for re-prefill")
+        return failed_ids
+
+    def _reschedule_generation_overflow_requests(
+        self,
+        max_generation_overflow_retries: int = _MAX_GENERATION_OVERFLOW_RETRIES,
+    ) -> list[str]:
+        """Retry active requests serially after MLX generation overflow."""
+        retry_candidates: list[Request] = []
+        seen: set[str] = set()
+        prefilling_ids = {request.request_id for request in self.prefilling}
+        waiting_ids = {request.request_id for request in self.waiting}
+
+        def collect(request: Request | None) -> None:
+            if request is None:
+                return
+            request_id = request.request_id
+            if request_id in seen or request_id in self._inflight_store_futures:
+                return
+            if request.is_finished():
+                return
+            seen.add(request_id)
+            retry_candidates.append(request)
+
+        for request in self.running.values():
+            collect(request)
+        for request in self.prefilling:
+            collect(request)
+        for request_id, request in self.requests.items():
+            if request_id in self.running or request_id in prefilling_ids:
+                continue
+            if request_id in waiting_ids:
+                continue
+            collect(request)
+
+        collected_ids = {request.request_id for request in retry_candidates}
+        for request_id in collected_ids:
+            self.running.pop(request_id, None)
+            self._prefill_states.pop(request_id, None)
+        if collected_ids:
+            self.prefilling = deque(
+                request
+                for request in self.prefilling
+                if request.request_id not in collected_ids
+            )
+
+        failed_ids: list[str] = []
+        retryable: list[Request] = []
+        self._generation_overflow_recovery_ids.clear()
+        for request in retry_candidates:
+            request.generation_overflow_retries += 1
+            request_id = request.request_id
+            self._boundary_cache_snapshots.pop(request_id, None)
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_request(request_id)
+            get_prefill_tracker().remove(request_id)
+            if request.generation_overflow_retries > max_generation_overflow_retries:
+                failed_ids.append(request_id)
+                req = self.requests.pop(request_id, None)
+                if req is not None:
+                    req._extracted_cache = None
+                    req.prompt_cache = None
+                continue
+
+            self._reset_request_for_reprefill(request)
+            retryable.append(request)
+            self._generation_overflow_recovery_ids.add(request_id)
+
+        for request in reversed(retryable):
+            self.waiting.appendleft(request)
+
+        if retryable:
+            logger.info(
+                "Rescheduled %d request(s) for serial generation-overflow retry",
+                len(retryable),
+            )
         return failed_ids
 
     # Max times a single request is requeued after a prefill memory-pressure
@@ -7284,6 +7767,37 @@ class Scheduler:
             else:
                 raise
 
+        except OverflowError as e:
+            if self._is_generation_overflow_error(e):
+                import traceback
+
+                logger.warning(
+                    "Generation overflow detected: %s; resetting decode state "
+                    "and retrying affected requests serially",
+                    e,
+                )
+                logger.debug(
+                    "Generation overflow traceback:\n%s", traceback.format_exc()
+                )
+                self._recover_from_generation_overflow_error()
+                failed_ids = self._reschedule_generation_overflow_requests()
+                for rid in failed_ids:
+                    output.outputs.append(
+                        RequestOutput(
+                            request_id=rid,
+                            finished=True,
+                            finish_reason="error",
+                            error=(
+                                "Generation overflow not recoverable after "
+                                f"serial retry: {e}"
+                            ),
+                        )
+                    )
+                    output.finished_request_ids.add(rid)
+                output.has_work = True
+            else:
+                raise
+
         except Exception as e:
             import traceback
 
@@ -7294,6 +7808,7 @@ class Scheduler:
 
         # Clear finished tracking for next step
         self.finished_req_ids = set()
+        self._refresh_generation_overflow_recovery_ids()
 
         # Periodic Metal cache cleanup
         self._step_counter += 1
@@ -7385,6 +7900,7 @@ class Scheduler:
         self.finished_req_ids.clear()
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._generation_overflow_recovery_ids.clear()
         # Async store_cache bookkeeping. shutdown() drains these before us,
         # but clear here too so reset() is safe to call standalone (e.g. tests
         # or recovery paths) without leaking Request refs through stale futures.
@@ -7461,7 +7977,7 @@ class Scheduler:
         logger.info("Scheduler shutdown initiated...")
         # The store-cache gate is a non-blocking counter (#1496), so there is
         # no step-thread caller to wake here. Inflight futures are drained
-        # below before the executor is joined.
+        # below before the executor is asked to shut down.
         # Wait for any inflight async store_cache futures + drain pending
         # batch_generator removes so the writer thread / underlying paged SSD
         # cache see all blocks before close().
@@ -7473,15 +7989,21 @@ class Scheduler:
                         "Waiting for %d inflight async store_cache future(s)...",
                         len(inflight),
                     )
-                    concurrent.futures.wait(inflight, timeout=30.0)
+                    _done, not_done = concurrent.futures.wait(
+                        inflight, timeout=FATAL_TEARDOWN_TIMEOUT_S
+                    )
+                    if not_done:
+                        fatal_exit(
+                            "Scheduler shutdown timed out after "
+                            f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s waiting for "
+                            f"{len(not_done)} async store_cache future(s)"
+                        )
                 self._drain_pending_async_removes()
-                self._store_cache_executor.shutdown(wait=True)
-                # Final drain after executor join. All workers are now done,
-                # so any entries still in _pending_async_removes (skipped by
-                # the first drain because their future hadn't completed yet)
-                # are guaranteed drainable here. Without this, slow worker
-                # finishes between the 30s wait timeout and shutdown(wait=True)
-                # would leave KV cache references pinned on Request objects.
+                self._store_cache_executor.shutdown(wait=False)
+                # Final drain after the bounded wait. If all workers finished
+                # before the timeout, skipped entries are now drainable. If not,
+                # fatal_exit() above terminates the process instead of leaving
+                # a partially torn-down engine alive.
                 self._drain_pending_async_removes()
             except Exception as e:
                 logger.warning(f"Async store_cache shutdown error: {e}")
@@ -7579,13 +8101,14 @@ class Scheduler:
                 num_heads = getattr(config, "num_attention_heads", None) or num_kv_heads
                 head_dim = hidden_size // num_heads
 
-            # Determine dtype size
-            dtype_size = 2  # Default float16
+            # Determine base dtype size for uncompressed KV cache elements.
+            base_dtype_size: float = 2  # Default float16/bfloat16
             if hasattr(self.model, "dtype"):
                 if self.model.dtype == mx.float32:
-                    dtype_size = 4
+                    base_dtype_size = 4
                 elif self.model.dtype == mx.bfloat16:
-                    dtype_size = 2
+                    base_dtype_size = 2
+            dtype_size = base_dtype_size
 
             # Extract num_attention_heads (query heads) for SDPA peak estimation
             num_attention_heads = (
@@ -7595,21 +8118,68 @@ class Scheduler:
             )
 
             # Count KVCache layers for hybrid models
+            cache_list_for_tq = None
+            actual_kv_cache_layers = None
             num_kv_cache_layers = num_layers
-            if hasattr(self.model, "make_cache"):
+            if not hasattr(self.model, "make_cache"):
+                actual_kv_cache_layers = num_layers
+            else:
                 try:
                     cache_list = self.model.make_cache()
-                    from mlx_lm.models.cache import KVCache
+                    cache_list_for_tq = cache_list
+                    from mlx_lm.models.cache import CacheList, KVCache
 
-                    num_kv_cache_layers = sum(
-                        1 for c in cache_list if type(c) is KVCache
-                    )
+                    def _count_kv(c: Any) -> int:
+                        if type(c) is KVCache:
+                            return 1
+                        if isinstance(c, CacheList):
+                            return sum(_count_kv(inner) for inner in c.caches)
+                        return 0
+
+                    actual_kv_cache_layers = sum(_count_kv(c) for c in cache_list)
+                    num_kv_cache_layers = actual_kv_cache_layers
                     if num_kv_cache_layers == 0:
                         num_kv_cache_layers = num_layers  # fallback
                 except Exception:
                     pass
 
-            if num_layers and num_kv_heads and head_dim:
+            if (
+                self._turboquant_kv_bits is not None
+                and isinstance(head_dim, int)
+                and not isinstance(head_dim, bool)
+                and head_dim > 0
+                and isinstance(actual_kv_cache_layers, int)
+                and actual_kv_cache_layers > 0
+                and (
+                    self._turboquant_eligible(cache_list_for_tq)
+                    if cache_list_for_tq is not None
+                    else not self._model_uses_mla()
+                )
+            ):
+                tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (
+                    2.0 / head_dim
+                )
+                if (
+                    self._turboquant_skip_last
+                    and not isinstance(actual_kv_cache_layers, bool)
+                    and actual_kv_cache_layers > 1
+                ):
+                    dtype_size = (
+                        (actual_kv_cache_layers - 1) * tq_dtype_size
+                        + base_dtype_size
+                    ) / actual_kv_cache_layers
+                else:
+                    dtype_size = tq_dtype_size
+
+            # Truthiness alone isn't enough — MagicMock proxies leaking
+            # through the descent (test scaffolds that don't fully spec
+            # ``model.config``) are truthy but fail any later numeric
+            # comparison (``> 128`` etc.) deep inside MemoryMonitor.
+            # Insist on real positive integers before calling.
+            def _pos_int(v: Any) -> bool:
+                return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+            if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
                 self.memory_monitor.set_model_info(
                     num_layers=num_layers,
                     num_kv_heads=num_kv_heads,
@@ -7673,6 +8243,41 @@ class Scheduler:
                 else 0
             )
 
+            # Pending-writes queue sizing depends on per-block bytes
+            # (block_size × per-token KV). Pass the *final* scheduler
+            # block size — possibly adjusted from the config default by
+            # RotatingKVCache / ArraysCache logic earlier in
+            # ``__init__`` — and a model-derived per-token KV estimate
+            # from the memory monitor.
+            #
+            # Gate on ``has_model_info()`` rather than just non-None:
+            # ``estimate_block_memory(1)`` silently substitutes a
+            # 7B-class fiction (32 layers × 8 KV heads × 128 head_dim
+            # ≈ 128 KB/token) when dims were never set, and feeding
+            # that "default" value into the writer-queue formula gives
+            # the wrong cap on real workloads. When dims are missing
+            # (test fixtures with skeletal model.config, unusual VLM
+            # packs the nested-config walk doesn't recognise), pass
+            # the PagedSSDCacheManager's 200 KB default explicitly so
+            # the cap math degrades to a known constant instead of a
+            # model-class fiction. The auto-init in ``Scheduler.__init__``
+            # paired with ``_set_model_info_for_monitor()`` means the
+            # happy path here is ``has_model_info() is True``; this
+            # else branch only fires for skeletal test fixtures.
+            if (
+                self.memory_monitor is not None
+                and self.memory_monitor.has_model_info()
+            ):
+                # ``estimate_block_memory(1)`` returns all-layers K+V
+                # bytes for a single token at the dtype the monitor was
+                # configured with — exactly the per-token cost the
+                # queue cap needs to weigh.
+                expected_kv_bytes_per_token = (
+                    self.memory_monitor.estimate_block_memory(1)
+                )
+            else:
+                expected_kv_bytes_per_token = 200_000  # PagedSSDCacheManager default
+
             # Initialize paged SSD cache manager for SSD storage
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
                 cache_dir=cache_dir,
@@ -7683,6 +8288,8 @@ class Scheduler:
                 expected_model_name=self.config.model_name or "",
                 expected_num_layers=expected_num_layers,
                 expected_block_size=self.config.paged_cache_block_size,
+                expected_block_size_tokens=self.config.paged_cache_block_size,
+                expected_kv_bytes_per_token=expected_kv_bytes_per_token,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager

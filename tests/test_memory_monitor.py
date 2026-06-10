@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for memory_monitor module (SSD-only mode)."""
 
-import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
-from omlx.memory_monitor import MemoryMonitor, MemoryInfo
+import pytest
+
+from omlx.memory_monitor import (
+    _SDPA_TILED_SCRATCH_DTYPE_SIZE,
+    _SDPA_TILED_SCRATCH_QUERY_TOKENS,
+    MemoryInfo,
+    MemoryMonitor,
+)
 from omlx.utils.hardware import format_bytes
 
 
@@ -54,6 +60,20 @@ class TestMemoryMonitor:
         """Test initialization with negative max_kv_cache_memory."""
         with pytest.raises(ValueError, match="max_kv_cache_memory"):
             MemoryMonitor(max_kv_cache_memory=-1)
+
+    def test_eviction_enabled_property_default_true(self):
+        """The default ``eviction_enabled=True`` makes the
+        public-facing predicate True so the existing tiered-cache
+        path keeps working without changes."""
+        monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
+        assert monitor.eviction_enabled is True
+
+    def test_eviction_enabled_property_false_in_ssd_only_mode(self):
+        """Paged-SSD-only mode passes ``eviction_enabled=False``; the
+        public predicate must surface that so Scheduler can branch on
+        it (avoiding the RuntimeError from estimate_blocks_to_free)."""
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        assert monitor.eviction_enabled is False
 
     def test_get_memory_info(self):
         """Test get_memory_info returns valid data."""
@@ -280,9 +300,20 @@ class TestEstimatePrefillPeakBytes:
         )
         return m
 
+    def _expected_tiled_sdpa(self, n_q, query_tokens, kv_len, head_dim):
+        tiled_query = min(query_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
+        scratch = n_q * tiled_query * kv_len * _SDPA_TILED_SCRATCH_DTYPE_SIZE
+        output = n_q * query_tokens * head_dim * 4
+        return scratch + output
+
     def test_returns_zero_when_model_info_missing(self):
         m = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
         assert m.estimate_prefill_peak_bytes(32768, 2048) == 0
+
+    def test_returns_zero_when_no_new_tokens(self):
+        # Fully-prefix-cached request: nothing to prefill, peak is 0.
+        m = self._make_monitor()
+        assert m.estimate_prefill_peak_bytes(0, 2048, cached_tokens=32768) == 0
 
     def test_fused_kernel_below_head_dim_128(self):
         # head_dim<=128 → fused tiled kernel, SDPA peak is just output buffer
@@ -293,15 +324,38 @@ class TestEstimatePrefillPeakBytes:
         # Total ≈ 4 GB
         assert 3 * 1024**3 < peak < 5 * 1024**3
 
-    def test_fallback_path_above_head_dim_128(self):
-        # head_dim>128 → full attention matrix materialized in float32
+    def test_tiled_scratch_path_above_head_dim_128(self):
+        # head_dim>128 → tiled scratch, not the old full fp32 score matrix.
         m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
         peak = m.estimate_prefill_peak_bytes(32768, 2048)
-        # SDPA fallback: n_attn * chunk * total_tokens * 4 = 8*2048*32768*4 = 2 GB
-        # + output buffer 8*2048*256*4 ≈ 16 MB
-        # KV: 48 * 4 * 256 * 2 * 2 * 32768 ≈ 6 GB
-        # Total ≈ 8 GB
-        assert 7 * 1024**3 < peak < 9 * 1024**3
+        expected_sdpa = self._expected_tiled_sdpa(8, 2048, 32768, 256)
+        expected_kv = m.estimate_prompt_kv_bytes(32768)
+        old_full_scores = 8 * 2048 * 32768 * 4 + 8 * 2048 * 256 * 4
+        assert peak == expected_sdpa + expected_kv
+        assert expected_sdpa < old_full_scores
+        assert expected_sdpa > 8 * 2048 * 256 * 4
+
+    def test_sdpa_tiled_scratch_accounts_for_cached_kv_span(self):
+        """Regression for M3: SDPA scratch spans the FULL prompt (cached + new),
+        not just new_tokens. A heavily-cached long-context request previously
+        slipped through with under-counted peak.
+        """
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        # Same total prompt (100k), different cache split:
+        # - All-new: cached=0, new=100k
+        # - Heavy cache: cached=99k, new=1k
+        all_new = m.estimate_prefill_peak_bytes(100 * 1024, 2048)
+        heavy_cache = m.estimate_prefill_peak_bytes(1024, 2048, cached_tokens=99 * 1024)
+        expected_heavy_sdpa = self._expected_tiled_sdpa(8, 1024, 100 * 1024, 256)
+        expected_heavy = expected_heavy_sdpa + m.estimate_prompt_kv_bytes(1024)
+        assert heavy_cache == expected_heavy
+        assert (
+            heavy_cache > 900 * 1024**2
+        ), f"heavy-cache peak under-counted: {heavy_cache / 1024**2:.0f} MB"
+        # And the all-new case (larger eff_chunk = 2048 but same kv_len)
+        # should be larger overall because both KV growth and scores
+        # widen with new_tokens.
+        assert all_new > heavy_cache
 
     def test_scales_linearly_with_token_count(self):
         m = self._make_monitor()
@@ -313,8 +367,8 @@ class TestEstimatePrefillPeakBytes:
         ratio = p32k / p8k
         assert 3.5 < ratio < 4.5
 
-    def test_sdpa_fallback_scales_quadratically(self):
-        # head_dim>128 fallback: SDPA peak ∝ chunk * total_tokens.
+    def test_sdpa_tiled_scratch_scales_with_context_length(self):
+        # head_dim>128 tiled scratch: SDPA peak ∝ query_tile * total_tokens.
         # When chunk is fixed (2048), peak grows linearly with total_tokens
         # plus KV grows linearly too. Doubling tokens should ~double peak.
         m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
@@ -322,6 +376,22 @@ class TestEstimatePrefillPeakBytes:
         p32k = m.estimate_prefill_peak_bytes(32 * 1024, 2048)
         ratio = p32k / p16k
         assert 1.8 < ratio < 2.2
+
+    def test_eff_chunk_capped_at_new_tokens(self):
+        """Short prompts (smaller than chunk_size) must not be charged
+        the full chunk_size width — the effective chunk is bounded by
+        the number of remaining new tokens. Regression for the constant-
+        factor over-count on small prompts.
+        """
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        # 100-token prompt; chunk_size=2048. eff_chunk should be 100,
+        # not 2048 — so the query tile is 100, not the default step size.
+        peak = m.estimate_prefill_peak_bytes(100, 2048)
+        # KV: 48*4*256*2*2*100 ≈ 19 MB. SDPA is small here. Total < 25 MB.
+        assert peak < 25 * 1024**2, (
+            f"short-prompt peak suggests chunk wasn't clamped: "
+            f"{peak / 1024**2:.0f} MB"
+        )
 
     def test_no_python_overhead_constant(self):
         # estimator must NOT include cache_pool_overhead or python_overhead
@@ -334,7 +404,7 @@ class TestEstimatePrefillPeakBytes:
         assert peak < 100 * 1024**2, f"unexpected large peak: {peak / 1024**2:.1f} MB"
 
     def test_cached_tokens_extends_sdpa_span(self):
-        # head_dim>128 fallback: the last chunk attends over cached+new tokens.
+        # head_dim>128 tiled scratch spans cached+new tokens.
         # A request with a big prefix-cache hit (small new suffix) must still
         # estimate the SDPA transient over the full span, not just new_tokens.
         m = self._make_monitor(head_dim=256, n_attn=16, n_kv=2, n_layers=40)
@@ -342,11 +412,12 @@ class TestEstimatePrefillPeakBytes:
         with_cache = m.estimate_prefill_peak_bytes(2048, 2048, cached_tokens=30 * 1024)
         # Same new_tokens, no cache → SDPA span is only 2k.
         without_cache = m.estimate_prefill_peak_bytes(2048, 2048, cached_tokens=0)
-        # SDPA dominates: span 32k vs 2k → ~16x larger transient.
-        sdpa_with = 16 * 2048 * (2048 + 30 * 1024) * 4
-        sdpa_without = 16 * 2048 * 2048 * 4
+        # The output buffer and KV growth are identical; only the tiled
+        # scratch span changes.
+        sdpa_with = self._expected_tiled_sdpa(16, 2048, 2048 + 30 * 1024, 256)
+        sdpa_without = self._expected_tiled_sdpa(16, 2048, 2048, 256)
         assert with_cache - without_cache == sdpa_with - sdpa_without
-        assert with_cache > without_cache * 5
+        assert with_cache > without_cache * 2
 
     def test_cached_tokens_default_matches_no_cache(self):
         # Omitting cached_tokens must reproduce the pre-change behavior so the
@@ -362,6 +433,6 @@ class TestEstimatePrefillPeakBytes:
         m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
         # 512 new on top of 10k cached: query=512, span=10k+512.
         peak = m.estimate_prefill_peak_bytes(512, 2048, cached_tokens=10 * 1024)
-        expected_sdpa = 8 * 512 * (512 + 10 * 1024) * 4 + 8 * 512 * 256 * 4
+        expected_sdpa = self._expected_tiled_sdpa(8, 512, 512 + 10 * 1024, 256)
         expected_kv = m.estimate_prompt_kv_bytes(512)
         assert peak == expected_sdpa + expected_kv

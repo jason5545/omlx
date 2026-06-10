@@ -298,9 +298,17 @@ class VLMModelAdapter(nn.Module):
                         break
                 B, L = input_ids.shape
                 deltas = self._batch_rope_deltas
-                if (offsets is not None and isinstance(offsets, mx.array)
-                        and deltas.size == B):
-                    positions = offsets + mx.reshape(deltas, (-1,))[:B]
+                base_offsets = None
+                if isinstance(offsets, mx.array):
+                    if offsets.ndim == 0:
+                        base_offsets = mx.broadcast_to(offsets, (B,))
+                    elif offsets.size >= B:
+                        base_offsets = mx.reshape(offsets, (-1,))[:B]
+                elif isinstance(offsets, (int, float)):
+                    base_offsets = mx.broadcast_to(mx.array(offsets), (B,))
+
+                if base_offsets is not None and deltas.size == B:
+                    positions = base_offsets + mx.reshape(deltas, (-1,))[:B]
                     token_positions = (
                         mx.reshape(positions, (-1, 1))
                         + mx.arange(L)[None, :]
