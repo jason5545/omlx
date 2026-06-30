@@ -9,8 +9,12 @@ gate even when ``_prefill_memory_guard`` was flipped on by the enforcer.
 These tests pin the wiring so a future refactor cannot silently revert it.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import MemoryMonitor
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig
@@ -118,6 +122,86 @@ def test_preflight_rejects_when_estimated_peak_exceeds_hard_limit():
     assert rejection.limit_bytes == 1
 
 
+def test_route_preflight_requests_eviction_before_safety_cap_rejection(monkeypatch):
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1_000
+    scheduler._memory_abort_limit_bytes = 100
+    scheduler._prefill_min_chunk_tokens = 4
+    scheduler.memory_monitor.estimate_prefill_peak_bytes = MagicMock(return_value=10)
+    scheduler.memory_monitor.estimate_prompt_kv_bytes = MagicMock(return_value=20)
+    scheduler._predicted_chunk_transient = MagicMock(return_value=30)
+
+    import omlx.scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", lambda: 0)
+    monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 60)
+
+    eviction = scheduler.preflight_eviction_request(
+        num_prompt_tokens=128,
+        request_id="req-safety",
+    )
+
+    assert eviction is not None
+    assert eviction.reason == "prefill_safety_cap"
+    assert eviction.request_id == "req-safety"
+    assert eviction.current_bytes == 60
+    assert eviction.predicted_transient_bytes == 50
+    assert eviction.target_cap_bytes == 90
+    assert eviction.requested_tokens == 4
+
+    with pytest.raises(PrefillMemoryExceededError) as exc:
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=128,
+            request_id="req-safety",
+        )
+
+    assert "preflight safety guard" in str(exc.value)
+    assert exc.value.request_id == "req-safety"
+    assert exc.value.estimated_bytes == 110
+    assert exc.value.limit_bytes == 90
+
+
+def test_current_usage_subtracts_shared_hot_cache_bytes_from_phys_side():
+    scheduler = _make_scheduler()
+    scheduler.config.hot_cache_budget = SimpleNamespace(total_bytes=3 * 1024**3)
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=4 * 1024**3),
+        patch("omlx.scheduler.get_phys_footprint", return_value=10 * 1024**3),
+    ):
+        assert scheduler._current_usage_bytes() == 7 * 1024**3
+
+
+def test_current_usage_keeps_mlx_active_as_floor_after_hot_cache_subtract():
+    scheduler = _make_scheduler()
+    scheduler.config.hot_cache_budget = SimpleNamespace(total_bytes=9 * 1024**3)
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=6 * 1024**3),
+        patch("omlx.scheduler.get_phys_footprint", return_value=10 * 1024**3),
+    ):
+        assert scheduler._current_usage_bytes() == 6 * 1024**3
+
+
+def test_current_usage_falls_back_to_local_hot_cache_counter():
+    scheduler = _make_scheduler()
+
+    class _LocalHotCacheManager:
+        _hot_cache_total_bytes = 2 * 1024**3
+
+        def get_stats(self):
+            raise RuntimeError("stats unavailable")
+
+    scheduler.paged_ssd_cache_manager = _LocalHotCacheManager()
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=1 * 1024**3),
+        patch("omlx.scheduler.get_phys_footprint", return_value=8 * 1024**3),
+    ):
+        assert scheduler._current_usage_bytes() == 6 * 1024**3
+
+
 def test_preflight_returns_none_when_guard_disabled():
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = False
@@ -138,9 +222,9 @@ def test_preflight_returns_none_when_request_fully_cached():
 def test_preflight_rejects_heavily_cached_long_context():
     """Regression for M3: a request whose suffix is small but whose
     *full* prompt is long must still trip the guard, because the SDPA
-    tiled scratch spans the full prompt (cached + new), not just the new
-    tokens. Previously the estimator passed only new_tokens to the
-    scratch formula and the heavily-cached path slipped through.
+    fallback score matrix spans the full prompt (cached + new), not just the
+    new tokens. Previously the estimator passed only new_tokens to the
+    fallback formula and the heavily-cached path slipped through.
     """
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True
@@ -232,6 +316,53 @@ def test_vlm_estimator_produces_nonzero_peak():
     # KV growth plus a bounded tiled SDPA scratch term.
     peak = scheduler.memory_monitor.estimate_prefill_peak_bytes(90000, 2048)
     assert peak > 7 * 1024 * 1024 * 1024  # > 7 GiB
+
+
+def test_dict_nested_config_populates_estimator_dims_and_preflight_rejects():
+    """Real Qwen3.6 text-only packs can expose LM dims as a dict-valued
+    ``text_config``. The guard must read that shape too; otherwise real
+    servers keep the estimator dim-less and route preflight becomes a no-op.
+    """
+    model = MagicMock()
+    model.layers = []
+    model.config = {
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "num_hidden_layers": 40,
+            "num_key_value_heads": 2,
+            "num_attention_heads": 16,
+            "head_dim": 256,
+        },
+    }
+    del model.make_cache
+
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            max_num_seqs=8,
+            prefill_step_size=2048,
+            paged_cache_block_size=0,
+        ),
+    )
+
+    monitor = scheduler.memory_monitor
+    assert monitor is not None
+    assert monitor._num_layers == 40
+    assert monitor._num_kv_heads == 2
+    assert monitor._num_attention_heads == 16
+    assert monitor._head_dim == 256
+
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 2 * 1024**3
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+        pytest.raises(PrefillMemoryExceededError),
+    ):
+        scheduler.preflight_or_raise(num_prompt_tokens=50_000, request_id="dict-cfg")
 
 
 def test_rejection_releases_block_aware_cache_when_present():

@@ -72,6 +72,12 @@ omlx start
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
+선택사항인 GLM-5.2 / MiniMax M3 네이티브 커스텀 커널은 현재 HEAD 빌드가 필요합니다:
+
+```bash
+brew install omlx --HEAD --with-custom-kernel
+```
+
 ### 소스에서 설치
 
 ```bash
@@ -79,6 +85,9 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # 코어만
 pip install -e ".[mcp]"   # MCP (Model Context Protocol) 포함
+
+# 선택사항: GLM-5.2 / MiniMax M3 네이티브 커스텀 커널
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
 Python 3.10+와 Apple Silicon (M1/M2/M3/M4)이 필요합니다.
@@ -180,6 +189,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트
 
 - **모델 별칭**: 커스텀 API 표시 이름을 설정합니다. `/v1/models`에서 별칭을 반환하며, 요청 시 별칭과 디렉토리 이름 모두 사용 가능합니다.
 - **모델 타입 오버라이드**: 자동 감지와 관계없이 LLM 또는 VLM으로 수동 설정합니다.
+- **프로파일**: 모델별 설정을 이름이 지정된 번들로 저장하고 관리자 패널에서 전환합니다. 프로파일은 선택적으로 자체 모델로 노출할 수 있습니다: 그러면 `/v1/models`에 `<모델>:<프로파일>`(예: `qwen3-8b:thinking`)도 표시되며, 베이스 모델과 동일한 엔진에서 프로파일 설정을 요청마다 덮어써 동작합니다 — 추가 메모리나 재로드가 없습니다. 베이스 모델에 별칭이 있으면 노출되는 ID는 `<별칭>:<프로파일>` 형식으로 표시되고, 디렉토리 이름 형식도 베이스 모델과 마찬가지로 계속 작동합니다.
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX 채팅 템플릿 파라미터" width="480">
@@ -361,6 +371,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # venvstacks 강제 재빌드 (그 외에는 fingerprint 로 캐시됨)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# 선택 GLM-5.2 / MiniMax M3 네이티브 커스텀 커널을 포함해 스테이징
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 첫 cold 빌드는 10–20분 소요됩니다 (venvstacks Python 레이어 어셈블리). 이후 빌드는 `packaging/_export/` 캐시를 재사용해 약 4분에 끝납니다. 레이어 구성은 [packaging/README.md](packaging/README.md), Swift 소스는 [apps/omlx-mac/](apps/omlx-mac/) 를 참조하세요.

@@ -16,7 +16,6 @@ import os
 import re
 import shutil
 import signal
-import subprocess
 import sys
 import time
 from collections import deque
@@ -167,10 +166,12 @@ class CreateProfileRequest(BaseModel):
 
     name: str
     display_name: str
+    api_name: str | None = None
     description: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
     also_save_as_template: bool = False
     source_template: str | None = None
+    expose_as_model: bool = False
 
 
 class UpdateProfileRequest(BaseModel):
@@ -178,9 +179,11 @@ class UpdateProfileRequest(BaseModel):
 
     new_name: str | None = None
     display_name: str | None = None
+    api_name: str | None = None
     description: str | None = None
     settings: dict[str, Any] | None = None
     source_template: str | None = None
+    expose_as_model: bool | None = None
     also_save_as_template: bool = False
 
 
@@ -213,6 +216,7 @@ class GlobalSettingsRequest(BaseModel):
     sse_keepalive_mode: str | None = None
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
+    preserve_mid_system_cache: bool | None = None
 
     # Model settings
     model_dirs: list[str] | None = None
@@ -444,6 +448,154 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     if not model_path:
         return False, "model_path missing"
     return is_dflash_compatible(model_path)
+
+
+def _entry_is_diffusion_model(entry) -> bool:
+    model_type = (getattr(entry, "config_model_type", None) or "").lower()
+    return model_type.replace("-", "_") == "diffusion_gemma"
+
+
+def _sanitize_diffusion_settings_dict(settings: dict) -> None:
+    """Clear unsupported diffusion-lane settings before ModelSettings parsing.
+
+    Tool-calling settings (``max_tool_result_tokens``) are intentionally NOT
+    cleared: tool calling is prompt-driven plus output parsing and works on
+    the diffusion lane when a tool parser matches the chat template.
+    """
+    unsupported_none_fields = (
+        "top_p",
+        "top_k",
+        "min_p",
+        "repetition_penalty",
+        "presence_penalty",
+        "enable_thinking",
+        "preserve_thinking",
+        "thinking_budget_tokens",
+        "reasoning_parser",
+        "guided_grammar",
+        "index_cache_freq",
+        "specprefill_draft_model",
+        "specprefill_keep_pct",
+        "specprefill_threshold",
+        "dflash_draft_model",
+        "dflash_draft_quant_enabled",
+        "dflash_draft_quant_weight_bits",
+        "dflash_draft_quant_activation_bits",
+        "dflash_draft_quant_group_size",
+        "dflash_max_ctx",
+        "dflash_draft_window_size",
+        "dflash_draft_sink_size",
+        "dflash_verify_mode",
+        "vlm_mtp_draft_model",
+        "vlm_mtp_draft_block_size",
+    )
+    for key in unsupported_none_fields:
+        settings[key] = None
+
+    settings["force_sampling"] = False
+    settings["thinking_budget_enabled"] = False
+    settings["guided_grammar_enabled"] = False
+    settings["turboquant_kv_enabled"] = False
+    settings["turboquant_kv_bits"] = 4
+    settings["turboquant_skip_last"] = True
+    settings["specprefill_enabled"] = False
+    settings["dflash_enabled"] = False
+    settings["dflash_in_memory_cache"] = True
+    settings["dflash_in_memory_cache_max_entries"] = 4
+    settings["dflash_in_memory_cache_max_bytes"] = 8 * 1024 * 1024 * 1024
+    settings["dflash_ssd_cache"] = False
+    settings["dflash_ssd_cache_max_bytes"] = 20 * 1024 * 1024 * 1024
+    settings["mtp_enabled"] = False
+    settings["vlm_mtp_enabled"] = False
+
+    unsupported_ct_kwargs = {
+        "enable_thinking",
+        "reasoning_effort",
+        "preserve_thinking",
+    }
+    kwargs = settings.get("chat_template_kwargs")
+    if kwargs:
+        filtered_kwargs = {
+            k: v for k, v in kwargs.items() if k not in unsupported_ct_kwargs
+        }
+        settings["chat_template_kwargs"] = filtered_kwargs or None
+    forced = settings.get("forced_ct_kwargs")
+    if forced:
+        allowed = set(settings.get("chat_template_kwargs") or {})
+        filtered_forced = [
+            k for k in forced if k not in unsupported_ct_kwargs and k in allowed
+        ]
+        settings["forced_ct_kwargs"] = filtered_forced or None
+
+
+def _sanitize_diffusion_model_settings(settings) -> None:
+    """Clear settings that the serial diffusion lane does not implement.
+
+    ``max_tool_result_tokens`` is intentionally preserved — tool calling
+    works on the diffusion lane (prompt-driven + output parsing).
+    """
+    settings.top_p = None
+    settings.top_k = None
+    settings.min_p = None
+    settings.repetition_penalty = None
+    settings.presence_penalty = None
+    settings.force_sampling = False
+    settings.enable_thinking = None
+    settings.preserve_thinking = None
+    settings.thinking_budget_enabled = False
+    settings.thinking_budget_tokens = None
+    settings.reasoning_parser = None
+    settings.guided_grammar_enabled = False
+    settings.guided_grammar = None
+
+    unsupported_ct_kwargs = {
+        "enable_thinking",
+        "reasoning_effort",
+        "preserve_thinking",
+    }
+    if settings.chat_template_kwargs:
+        filtered_kwargs = {
+            k: v
+            for k, v in settings.chat_template_kwargs.items()
+            if k not in unsupported_ct_kwargs
+        }
+        settings.chat_template_kwargs = filtered_kwargs or None
+    if settings.forced_ct_kwargs:
+        allowed = set(settings.chat_template_kwargs or {})
+        filtered_forced = [
+            k
+            for k in settings.forced_ct_kwargs
+            if k not in unsupported_ct_kwargs and k in allowed
+        ]
+        settings.forced_ct_kwargs = filtered_forced or None
+
+    settings.index_cache_freq = None
+    settings.turboquant_kv_enabled = False
+    settings.turboquant_kv_bits = 4
+    settings.turboquant_skip_last = True
+    settings.specprefill_enabled = False
+    settings.specprefill_draft_model = None
+    settings.specprefill_keep_pct = None
+    settings.specprefill_threshold = None
+    settings.dflash_enabled = False
+    settings.dflash_draft_model = None
+    settings.dflash_draft_quant_enabled = None
+    settings.dflash_draft_quant_weight_bits = None
+    settings.dflash_draft_quant_activation_bits = None
+    settings.dflash_draft_quant_group_size = None
+    settings.dflash_max_ctx = None
+    settings.dflash_in_memory_cache = True
+    settings.dflash_in_memory_cache_max_entries = 4
+    settings.dflash_in_memory_cache_max_bytes = 8 * 1024 * 1024 * 1024
+    settings.dflash_ssd_cache = False
+    settings.dflash_ssd_cache_max_bytes = 20 * 1024 * 1024 * 1024
+    settings.dflash_draft_window_size = None
+    settings.dflash_draft_sink_size = None
+    settings.dflash_verify_mode = None
+    settings.mtp_enabled = False
+    settings.vlm_mtp_enabled = False
+    settings.vlm_mtp_draft_model = None
+    settings.vlm_mtp_draft_block_size = None
 
 
 def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
@@ -1121,22 +1273,11 @@ def get_system_memory_info() -> dict:
         and auto_limit_formatted (80% of total).
     """
     try:
-        # macOS: use sysctl to get physical memory. Invoke by absolute path —
-        # sysctl lives in /usr/sbin, which isn't on PATH in some headless
-        # launchd contexts (brew services). See issue #1322.
-        result = subprocess.run(
-            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        total_bytes = int(result.stdout.strip())
+        from ..utils import psutil_compat
+
+        total_bytes = int(psutil_compat.get_total_memory())
     except Exception:
-        # Fallback: try os.sysconf (works on some Unix systems)
-        try:
-            total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        except Exception:
-            total_bytes = 0
+        total_bytes = 0
 
     auto_limit_bytes = int(total_bytes * 0.8)
 
@@ -1144,9 +1285,9 @@ def get_system_memory_info() -> dict:
     # tier (static_ceiling + dynamic_ceiling depend on these). Read on each
     # call — never cached.
     try:
-        import psutil
+        from ..utils import psutil_compat
 
-        available_bytes = int(psutil.virtual_memory().available)
+        available_bytes = int(psutil_compat.virtual_memory().available)
     except Exception:
         available_bytes = 0
     try:
@@ -1185,9 +1326,9 @@ def get_system_memory_info() -> dict:
     inactive_memory_bytes = 0
     active_memory_bytes = 0
     try:
-        from ..process_memory_enforcer import get_macos_vm_stats
+        from ..utils import psutil_compat
 
-        vm = get_macos_vm_stats()
+        vm = psutil_compat.get_macos_vm_stats()
         if vm is not None:
             free_memory_bytes = int(vm.get("free", 0))
             inactive_memory_bytes = int(vm.get("inactive", 0))
@@ -1650,6 +1791,54 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 # =============================================================================
 
 
+def _model_display_name(
+    model_id: str,
+    model_path: str | Path | None,
+    model_dirs: list[Path],
+    *,
+    source_repo_id: str | None = None,
+) -> str:
+    """Return the UI-only display name for a discovered local model."""
+    repo_id = (source_repo_id or "").strip()
+    if "/" in repo_id:
+        return repo_id
+
+    if not model_path:
+        return model_id
+
+    path_text = str(model_path)
+    if "://" in path_text:
+        return model_id
+
+    try:
+        path = Path(path_text).expanduser().resolve()
+    except (OSError, RuntimeError):
+        path = Path(path_text).expanduser()
+
+    for model_dir in model_dirs:
+        try:
+            rel = path.relative_to(model_dir.expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+        parts = rel.parts
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        return model_id
+
+    return model_id
+
+
+def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
+    if global_settings is None:
+        return []
+    try:
+        return global_settings.model.get_model_dirs(global_settings.base_path)
+    except Exception as e:  # pragma: no cover - defensive for partial test doubles
+        logger.debug("Could not resolve model dirs for display names: %s", e)
+        return []
+
+
 @router.get("/api/models")
 async def list_models(is_admin: bool = Depends(require_admin)):
     """
@@ -1667,6 +1856,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     engine_pool = _get_engine_pool()
     settings_manager = _get_settings_manager()
     server_state = _get_server_state()
+    global_settings = _get_global_settings() if _get_global_settings else None
+    model_dirs = _model_dirs_for_display(global_settings)
 
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
@@ -1700,6 +1891,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
+            "display_name": _model_display_name(
+                model_id,
+                model_info.get("model_path", ""),
+                model_dirs,
+                source_repo_id=model_info.get("source_repo_id"),
+            ),
             "loaded": model_info.get("loaded", False),
             "is_loading": model_info.get("is_loading", False),
             "estimated_size": model_info.get("estimated_size", 0),
@@ -1736,10 +1933,15 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         # Add settings if available
         if settings:
             model_data["settings"] = asdict(settings)
+        if settings_manager:
+            model_data["exposed_profiles"] = [
+                profile
+                for profile in settings_manager.list_profiles(model_id)
+                if profile.get("expose_as_model")
+            ]
 
         models.append(model_data)
 
-    global_settings = _get_global_settings() if _get_global_settings else None
     if markitdown_model_visible(global_settings) and not any(
         m.get("id") == MARKITDOWN_MODEL_ID for m in models
     ):
@@ -1747,6 +1949,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             {
                 "id": MARKITDOWN_MODEL_ID,
                 "model_path": "builtin://markitdown",
+                "display_name": MARKITDOWN_MODEL_ID,
                 "loaded": True,
                 "is_loading": False,
                 "estimated_size": 0,
@@ -1912,6 +2115,7 @@ async def update_model_settings(
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
     prev_engine_type = entry.engine_type  # Track for requires_reload check
+    is_diffusion_model = _entry_is_diffusion_model(entry)
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
         if alias_value == "":
@@ -1930,6 +2134,12 @@ async def update_model_settings(
                         status_code=400,
                         detail=f"Alias '{alias_value}' conflicts with model directory name '{mid}'",
                     )
+            _raise_if_alias_conflicts_exposed_profiles(
+                alias_value=alias_value,
+                model_id=model_id,
+                settings_manager=settings_manager,
+                engine_pool=engine_pool,
+            )
         current_settings.model_alias = alias_value
     if "model_type_override" in sent:
         valid_types = {
@@ -2039,7 +2249,9 @@ async def update_model_settings(
         current_settings.specprefill_threshold = request.specprefill_threshold or None
     # DFlash settings
     if "dflash_enabled" in sent:
-        new_dflash_enabled = bool(request.dflash_enabled)
+        new_dflash_enabled = (
+            False if is_diffusion_model else bool(request.dflash_enabled)
+        )
         if new_dflash_enabled:
             from ..engine.dflash import is_dflash_compatible
 
@@ -2093,7 +2305,9 @@ async def update_model_settings(
         )
     if "dflash_ssd_cache" in sent:
         ssd_requested = bool(request.dflash_ssd_cache)
-        if ssd_requested:
+        if is_diffusion_model:
+            ssd_requested = False
+        elif ssd_requested:
             in_mem_after = (
                 bool(request.dflash_in_memory_cache)
                 if "dflash_in_memory_cache" in sent
@@ -2144,7 +2358,7 @@ async def update_model_settings(
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
-        new_mtp_enabled = bool(request.mtp_enabled)
+        new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
         if new_mtp_enabled:
             # Compatibility check: the model needs MTP heads in config.json AND
             # the model_type must be one PR 990 / PR 15 covers AND the weight
@@ -2235,7 +2449,7 @@ async def update_model_settings(
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
-        new_vlm_mtp = bool(request.vlm_mtp_enabled)
+        new_vlm_mtp = False if is_diffusion_model else bool(request.vlm_mtp_enabled)
         if new_vlm_mtp:
             drafter_after = (
                 request.vlm_mtp_draft_model
@@ -2298,6 +2512,9 @@ async def update_model_settings(
             server_state.default_model = model_id
     if "trust_remote_code" in sent:
         current_settings.trust_remote_code = bool(request.trust_remote_code)
+
+    if is_diffusion_model:
+        _sanitize_diffusion_model_settings(current_settings)
 
     # If an active profile was set, clear it when the user's save diverges
     # from the profile's stored values.  Only compare fields present in
@@ -2424,6 +2641,81 @@ def _require_model(model_id: str):
     return entry
 
 
+def _model_aliases(
+    settings_manager, *, exclude_model_id: str | None = None
+) -> dict[str, str]:
+    return {
+        ms.model_alias: mid
+        for mid, ms in settings_manager.get_all_settings().items()
+        if mid != exclude_model_id and ms.model_alias
+    }
+
+
+def _raise_if_profile_id_conflicts_model_id(
+    candidate_id: str,
+    *,
+    model_id: str,
+    engine_pool,
+):
+    for existing_id in engine_pool.get_model_ids():
+        if existing_id != model_id and existing_id == candidate_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Exposed profile model ID '{candidate_id}' conflicts with "
+                    f"model directory name '{existing_id}'"
+                ),
+            )
+
+
+def _raise_if_alias_conflicts_exposed_profiles(
+    *,
+    alias_value: str,
+    model_id: str,
+    settings_manager,
+    engine_pool,
+):
+    exposed_ids = settings_manager.get_exposed_profile_model_ids()
+    if alias_value in exposed_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Alias '{alias_value}' conflicts with an exposed profile model ID",
+        )
+
+    aliases = _model_aliases(settings_manager, exclude_model_id=model_id)
+    for profile in settings_manager.list_profiles(model_id):
+        if not profile.get("expose_as_model"):
+            continue
+        api_name = profile.get("api_name") or profile["name"]
+        candidate_id = f"{alias_value}:{api_name}"
+        _raise_if_profile_id_conflicts_model_id(
+            candidate_id,
+            model_id=model_id,
+            engine_pool=engine_pool,
+        )
+        if candidate_id in aliases:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Alias '{alias_value}' would expose profile model ID "
+                    f"'{candidate_id}', which conflicts with model alias "
+                    f"for '{aliases[candidate_id]}'"
+                ),
+            )
+        other_exposed_ids = settings_manager.get_exposed_profile_model_ids(
+            exclude_model_id=model_id,
+            exclude_profile_name=profile["name"],
+        )
+        if candidate_id in other_exposed_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Alias '{alias_value}' would expose duplicate profile "
+                    f"model ID '{candidate_id}'"
+                ),
+            )
+
+
 @router.get("/api/models/{model_id}/profiles")
 async def list_model_profiles(
     model_id: str,
@@ -2444,6 +2736,7 @@ async def create_model_profile(
 
     mgr = _require_settings_manager()
     _require_model(model_id)
+    engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
             model_id=model_id,
@@ -2452,6 +2745,11 @@ async def create_model_profile(
             description=request.description,
             settings=request.settings or {},
             source_template=request.source_template,
+            expose_as_model=request.expose_as_model,
+            api_name=request.api_name,
+            reserved_model_ids=(
+                set(engine_pool.get_model_ids()) if engine_pool is not None else None
+            ),
         )
     except InvalidProfileNameError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2482,6 +2780,7 @@ async def update_model_profile(
 
     mgr = _require_settings_manager()
     _require_model(model_id)
+    engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
             model_id=model_id,
@@ -2491,6 +2790,11 @@ async def update_model_profile(
             description=request.description,
             settings=request.settings,
             source_template=request.source_template,
+            expose_as_model=request.expose_as_model,
+            api_name=request.api_name,
+            reserved_model_ids=(
+                set(engine_pool.get_model_ids()) if engine_pool is not None else None
+            ),
         )
     except InvalidProfileNameError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2532,10 +2836,15 @@ async def apply_model_profile(
     is_admin: bool = Depends(require_admin),
 ):
     mgr = _require_settings_manager()
-    _require_model(model_id)
-    applied = mgr.apply_profile(model_id, name)
+    entry = _require_model(model_id)
+    is_diffusion_model = _entry_is_diffusion_model(entry)
+    sanitizer = _sanitize_diffusion_settings_dict if is_diffusion_model else None
+    applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
     if applied is None:
         raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    if is_diffusion_model:
+        _sanitize_diffusion_model_settings(applied)
+        mgr.set_settings(model_id, applied)
     return {"model_id": model_id, "settings": applied.to_dict()}
 
 
@@ -2887,6 +3196,11 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
             "auto_start_on_launch": global_settings.server.auto_start_on_launch,
             "burst_decode_mode": global_settings.server.burst_decode_mode,
+            "preserve_mid_system_cache": getattr(
+                global_settings.server,
+                "preserve_mid_system_cache",
+                True,
+            ),
         },
         "model": {
             "model_dirs": [
@@ -3106,6 +3420,11 @@ async def update_global_settings(
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
+    if request.preserve_mid_system_cache is not None:
+        global_settings.server.preserve_mid_system_cache = (
+            request.preserve_mid_system_cache
+        )
+        runtime_applied.append("preserve_mid_system_cache")
 
     if request.server_aliases is not None:
         from ..utils.network import is_valid_alias
@@ -4556,7 +4875,9 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
             rate_tracker.clear()
         executor = getattr(core, "_mlx_executor", None)
         if executor is not None:
-            reclaim_targets.append((model_id, executor, getattr(scheduler, "_stream", None)))
+            reclaim_targets.append(
+                (model_id, executor, getattr(scheduler, "_stream", None))
+            )
 
     # Also clear managers orphaned by an abnormal teardown: they hold live
     # hot cache but are no longer attached to a loaded scheduler, so the loop
@@ -4988,7 +5309,12 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     from ..model_discovery import _resolve_hf_cache_entry
 
-    def _add_model(model_path: Path, model_name: str) -> None:
+    def _add_model(
+        model_path: Path,
+        model_name: str,
+        *,
+        source_repo_id: str | None = None,
+    ) -> None:
         if model_name in seen_names:
             return
         seen_names.add(model_name)
@@ -4997,6 +5323,12 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             {
                 "name": model_name,
                 "path": str(model_path),
+                "display_name": _model_display_name(
+                    model_name,
+                    model_path,
+                    model_dirs,
+                    source_repo_id=source_repo_id,
+                ),
                 "size": total_size,
                 "size_formatted": format_size(total_size),
             }
@@ -5019,7 +5351,11 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 hf_resolved = _resolve_hf_cache_entry(subdir)
                 if hf_resolved is not None:
                     if (hf_resolved.snapshot_path / "config.json").exists():
-                        _add_model(hf_resolved.snapshot_path, hf_resolved.model_id)
+                        _add_model(
+                            hf_resolved.snapshot_path,
+                            hf_resolved.model_id,
+                            source_repo_id=hf_resolved.source_repo_id,
+                        )
                     continue
 
                 # Level 2: organization folder — scan children
@@ -5029,8 +5365,8 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                     if (child / "config.json").exists():
                         _add_model(child, child.name)
 
-    # Sort case-insensitively by name for a stable, user-friendly order.
-    models.sort(key=lambda m: m["name"].lower())
+    # Sort by the UI display name so organization prefixes group together.
+    models.sort(key=lambda m: m["display_name"].lower())
     return {"models": models}
 
 
@@ -5533,6 +5869,7 @@ async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
         "running": True,
         "bench_id": run.bench_id,
         "model_id": run.request.model_id,
+        "force_lm_engine": run.request.force_lm_engine,
     }
 
 
@@ -5882,12 +6219,14 @@ async def start_oq_quantization(
     is_admin: bool = Depends(require_admin),
 ):
     """Start an oQ quantization task."""
+    from ..oq import OQ_LEVELS
+
     if _oq_manager is None:
         raise HTTPException(status_code=503, detail="oQ quantizer not initialized")
-    if request.oq_level not in (2, 3, 3.5, 4, 5, 6, 8):
+    if request.oq_level not in OQ_LEVELS:
         raise HTTPException(
             status_code=400,
-            detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, or 8",
+            detail=f"Invalid oQ level. Must be one of {sorted(OQ_LEVELS)}",
         )
     if request.dtype not in ("bfloat16", "float16"):
         raise HTTPException(

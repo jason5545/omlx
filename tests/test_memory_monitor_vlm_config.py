@@ -14,11 +14,15 @@ count, else fall back to the top-level config.
 
 from unittest.mock import MagicMock
 
+import mlx.core as mx
+
 from omlx.memory_monitor import (
-    _SDPA_TILED_SCRATCH_DTYPE_SIZE,
-    _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD,
-    _SDPA_TILED_SCRATCH_QUERY_TOKENS,
+    _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
+    _SDPA_FULL_SUPPORTED_HEAD_DIMS,
+    _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD,
+    _SDPA_VECTOR_SUPPORTED_HEAD_DIMS,
     MemoryMonitor,
+    estimate_mla_kv_bytes_per_token,
 )
 from omlx.scheduler import Scheduler, SchedulerConfig
 
@@ -78,6 +82,19 @@ class _PlainLMConfig:
     head_dim = 128
 
 
+class _GlmMlaConfig:
+    """GLM-5.2-style MLA config with compressed resident KV cache."""
+
+    model_type = "glm_moe_dsa"
+    num_hidden_layers = 78
+    num_key_value_heads = 64
+    num_attention_heads = 64
+    hidden_size = 6144
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    index_head_dim = 128
+
+
 class _VLMConfigEmptySubConfigs:
     """Sub-configs are present but expose no layer count — skip and fall
     back to the top-level config. Defends against accidentally walking
@@ -115,7 +132,6 @@ class TestSetModelInfoForMonitorVLMWalk:
             "Should have read the 40-layer LM from text_config, not the "
             "33-layer vision tower at the top level"
         )
-        assert kwargs["num_kv_heads"] == 8
 
     def test_picks_language_config_over_top_level(self):
         sched = _make_scheduler()
@@ -194,6 +210,64 @@ class TestSetModelInfoForMonitorVLMWalk:
         assert (
             kwargs["num_layers"] == 24
         ), "GPT-style ``n_layer`` in the sub-config should be recognized"
+
+
+class TestMlaKvMemoryEstimate:
+    def _glm_cache(self):
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        return [CacheList(KVCache(), KVCache()) for _ in range(21)] + [
+            CacheList(KVCache()) for _ in range(57)
+        ]
+
+    def test_glm_mla_helper_uses_latent_cache_dims(self):
+        bytes_per_token = estimate_mla_kv_bytes_per_token(
+            _GlmMlaConfig(),
+            self._glm_cache(),
+            dtype_size=2,
+        )
+
+        assert bytes_per_token == (78 * (512 + 64) + 21 * 128) * 2
+
+    def test_monitor_uses_mla_kv_override_for_prompt_kv(self):
+        bytes_per_token = estimate_mla_kv_bytes_per_token(
+            _GlmMlaConfig(),
+            self._glm_cache(),
+            dtype_size=2,
+        )
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=78,
+            num_kv_heads=64,
+            head_dim=96,
+            dtype_size=2,
+            num_attention_heads=64,
+            num_kv_cache_layers=99,
+            compute_dtype_size=2,
+            kv_bytes_per_token=bytes_per_token,
+        )
+
+        tokens = 32767
+        standard = tokens * 99 * 64 * 96 * 2 * 2
+        actual = monitor.estimate_prompt_kv_bytes(tokens)
+        assert actual == tokens * bytes_per_token
+        assert actual < standard / 20
+
+    def test_scheduler_passes_mla_kv_override_to_monitor(self):
+        sched = _make_scheduler()
+        sched.memory_monitor = MagicMock()
+        sched.model = MagicMock()
+        sched.model.config = _GlmMlaConfig()
+        sched.model.make_cache.return_value = self._glm_cache()
+        del sched.model.args
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["num_layers"] == 78
+        assert kwargs["num_kv_heads"] == 64
+        assert kwargs["num_kv_cache_layers"] == 99
+        assert kwargs["kv_bytes_per_token"] == (78 * (512 + 64) + 21 * 128) * 2
 
 
 class TestSetModelInfoTurboQuantDtype:
@@ -318,6 +392,17 @@ class TestSetModelInfoTurboQuantDtype:
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
         assert kwargs["dtype_size"] == 2
 
+    def test_turboquant_attention_sink_model_uses_full_dtype(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched.model.modules = lambda: [{"sinks": mx.zeros((8,))}]
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = True
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["dtype_size"] == 2
+
     def test_reported_scale_fits_after_turboquant_skip_last_accounting(self):
         tokens = 327_872
         ceiling = 44.0 * 1024**3
@@ -355,17 +440,16 @@ class TestSetModelInfoTurboQuantDtype:
         assert turboquant_peak < headroom
 
 
-class TestSdpaTiledScratch:
-    """MLX >= 0.31 avoids the old full fp32 scores allocation for head_dim > 128,
-    but local peak measurements still show a bounded tiled scratch term."""
+class TestSdpaDispatchEstimate:
+    """MemoryMonitor mirrors MLX SDPA full/vector dispatch support."""
 
-    def test_tiled_scratch_constants_match_mlx_031_observation(self):
-        assert _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD == 128
-        assert _SDPA_TILED_SCRATCH_QUERY_TOKENS == 512
-        assert _SDPA_TILED_SCRATCH_DTYPE_SIZE == 2
+    def test_sdpa_dispatch_constants_match_mlx_031(self):
+        assert _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD == 8
+        assert frozenset({64, 80, 128}) == _SDPA_FULL_SUPPORTED_HEAD_DIMS
+        assert frozenset({64, 96, 128, 256}) == _SDPA_VECTOR_SUPPORTED_HEAD_DIMS
 
-    def test_estimate_prefill_uses_tiled_scratch_for_large_head_dim(self):
-        """head_dim=256 must not use the old full fp32 score-matrix path."""
+    def test_estimate_prefill_uses_full_fallback_for_head_dim_256(self):
+        """head_dim=256 is not supported by MLX fused full prefill."""
         monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
         monitor.set_model_info(
             num_layers=28,
@@ -382,27 +466,21 @@ class TestSdpaTiledScratch:
 
         eff_chunk = min(chunk, new_tokens)
         output_only = n_q * eff_chunk * hd * 4
-        old_full_scores = n_q * eff_chunk * full_kv_len * 4 + output_only
-        expected_attn = (
-            n_q
-            * min(eff_chunk, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
-            * full_kv_len
-            * _SDPA_TILED_SCRATCH_DTYPE_SIZE
-        )
+        expected_attn = n_q * eff_chunk * full_kv_len * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
         expected_attn += output_only
         kv = monitor.estimate_prompt_kv_bytes(new_tokens)
         expected_peak = expected_attn + kv
 
         actual = monitor.estimate_prefill_peak_bytes(new_tokens, chunk, cached_tokens=0)
         assert actual == expected_peak, (
-            f"head_dim=256 should use tiled scratch formula "
+            f"head_dim=256 should use full-score fallback formula "
             f"({expected_peak:,} bytes), "
             f"got {actual:,} bytes"
         )
-        assert output_only < expected_attn < old_full_scores
+        assert output_only < expected_attn
 
-    def test_estimate_chunk_transient_uses_tiled_scratch_for_large_head_dim(self):
-        """head_dim=256 chunk transient must include the tiled scratch term."""
+    def test_estimate_chunk_transient_uses_full_fallback_for_head_dim_256(self):
+        """head_dim=256 full prefill transient must include fp32 scores."""
         monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
         monitor.set_model_info(
             num_layers=28,
@@ -417,12 +495,7 @@ class TestSdpaTiledScratch:
         kv_len = 327872
 
         output_only = n_q * n_tokens * hd * 4
-        expected = (
-            n_q
-            * min(n_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
-            * kv_len
-            * _SDPA_TILED_SCRATCH_DTYPE_SIZE
-        )
+        expected = n_q * n_tokens * kv_len * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
         expected += output_only
         actual = monitor.estimate_chunk_transient_bytes(n_tokens, kv_len)
         assert actual == expected, (

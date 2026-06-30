@@ -28,19 +28,16 @@ limit being below the chosen ceiling.
 from __future__ import annotations
 
 import asyncio
-import ctypes
-import ctypes.util
 import inspect
 import logging
 import subprocess
-import sys
 import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
-import psutil
 
+from .utils import psutil_compat
 from .utils.proc_memory import get_phys_footprint
 
 if TYPE_CHECKING:
@@ -75,6 +72,24 @@ _ACTIVE_RECLAIM_RATIO: dict[str, float] = {
     "aggressive": 0.8,
 }
 
+# Default soft watermark per tier. A saved 0.85 from older configs is treated
+# as the legacy default so balanced / aggressive can move to their tier defaults.
+_LEGACY_SOFT_THRESHOLD = 0.85
+_SOFT_THRESHOLD_BY_TIER: dict[str, float] = {
+    "safe": 0.85,
+    "balanced": 0.90,
+    "aggressive": 0.925,
+    "custom": 0.85,
+}
+
+# Fraction of the hard ceiling used by the adaptive prefill chunk sizer.
+_PREFILL_HEADROOM_SAFETY: dict[str, float] = {
+    "safe": 0.90,
+    "balanced": 0.90,
+    "aggressive": 0.925,
+    "custom": 0.90,
+}
+
 # Fraction of the effective physical cap used by the pre-chunk prediction
 # guard. Aggressive/custom are user-directed and can run closer to the
 # configured ceiling.
@@ -91,34 +106,12 @@ _PREFILL_ABORT_MARGIN: dict[str, float] = {
 # over the ceiling for consecutive polls.
 _EMERGENCY_OVER_CEILING_MARGIN_BYTES = 2 * 1024**3
 _EMERGENCY_OVER_CEILING_POLLS = 2
+_HOT_CACHE_RESERVATION_SLACK_BYTES = 512 * 1024**2
 
 
 def _format_gb(b: int) -> str:
     """Format bytes as GB string."""
     return f"{b / 1024**3:.1f}GB"
-
-
-_HOST_VM_INFO64 = 4
-_HOST_INFO64_MAX_COUNT = 256
-_VM_STATS_MIN_COUNT = 4
-_VM_PAGE_SIZE = 16384  # default on Apple Silicon; refined at import
-
-if sys.platform == "darwin":
-    try:
-        _libc = ctypes.CDLL(ctypes.util.find_library("c"))
-        _libc.mach_host_self.restype = ctypes.c_uint
-        _MACH_HOST = _libc.mach_host_self()
-        # Read actual page size once at import time
-        _ps = ctypes.c_uint(0)
-        _libc.host_page_size(_MACH_HOST, ctypes.byref(_ps))
-        if _ps.value > 0:
-            _VM_PAGE_SIZE = _ps.value
-    except Exception:  # noqa: BLE001
-        _libc = None
-        _MACH_HOST = None
-else:
-    _libc = None
-    _MACH_HOST = None
 
 
 def get_macos_vm_stats() -> dict[str, int] | None:
@@ -133,25 +126,7 @@ def get_macos_vm_stats() -> dict[str, int] | None:
     `vm_statistics64`; using a max-sized `host_info64_t` buffer avoids
     pinning oMLX to an SDK-specific tail layout.
     """
-    if _libc is None or _MACH_HOST is None:
-        return None
-    try:
-        stats = (ctypes.c_int * _HOST_INFO64_MAX_COUNT)()
-        count = ctypes.c_uint(_HOST_INFO64_MAX_COUNT)
-        rc = _libc.host_statistics64(
-            _MACH_HOST, _HOST_VM_INFO64, stats, ctypes.byref(count)
-        )
-        if rc != 0 or count.value < _VM_STATS_MIN_COUNT:
-            return None
-        ps = _VM_PAGE_SIZE
-        return {
-            "free": int(stats[0]) * ps,
-            "active": int(stats[1]) * ps,
-            "inactive": int(stats[2]) * ps,
-            "wired": int(stats[3]) * ps,
-        }
-    except Exception:  # noqa: BLE001
-        return None
+    return psutil_compat.get_macos_vm_stats()
 
 
 def get_iogpu_wired_limit_bytes() -> int:
@@ -293,7 +268,7 @@ class ProcessMemoryEnforcer:
         settings_manager: ModelSettingsManager | None = None,
         prefill_memory_guard: bool = True,
         global_settings: GlobalSettings | None = None,
-        soft_threshold: float = 0.90,
+        soft_threshold: float | None = None,
         hard_threshold: float = 0.95,
         prefill_safe_zone_ratio: float = 0.89,
         prefill_min_chunk_tokens: int = 256,
@@ -316,8 +291,9 @@ class ProcessMemoryEnforcer:
             prefill_memory_guard: When False, returns a ceiling of 0 so
                 callers treat the limit as disabled.
             global_settings: Optional global settings for idle timeout.
-            soft_threshold: Fraction of ceiling that triggers soft action
-                (LRU non-pinned eviction + admission pause; in-flight allowed).
+            soft_threshold: Optional explicit fraction of ceiling that triggers
+                soft action. None, or the legacy 0.85 default, uses the tier
+                default instead.
             hard_threshold: Fraction of ceiling that triggers hard action
                 (LRU/non-pinned aborts, loading aborts, and idle reclaim).
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
@@ -336,8 +312,12 @@ class ProcessMemoryEnforcer:
         self._settings_manager = settings_manager
         self._prefill_memory_guard = prefill_memory_guard
         self._global_settings = global_settings
-        self._soft_threshold = soft_threshold
+        self._soft_threshold_override = self._normalize_soft_threshold_override(
+            soft_threshold
+        )
+        self._soft_threshold = self._get_soft_threshold()
         self._hard_threshold = hard_threshold
+        self._prefill_headroom_safety = self._get_prefill_headroom_safety()
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
         self._task: asyncio.Task | None = None
@@ -370,6 +350,29 @@ class ProcessMemoryEnforcer:
             return "balanced"
         return t
 
+    @staticmethod
+    def _normalize_soft_threshold_override(value: float | None) -> float | None:
+        if value is None:
+            return None
+        threshold = float(value)
+        if threshold <= 0:
+            return None
+        if abs(threshold - _LEGACY_SOFT_THRESHOLD) < 1e-9:
+            return None
+        return threshold
+
+    def _refresh_tier_thresholds(self) -> None:
+        self._soft_threshold = self._get_soft_threshold()
+        self._prefill_headroom_safety = self._get_prefill_headroom_safety()
+
+    def _get_soft_threshold(self) -> float:
+        if self._soft_threshold_override is not None:
+            return self._soft_threshold_override
+        return _SOFT_THRESHOLD_BY_TIER[self._memory_guard_tier]
+
+    def _get_prefill_headroom_safety(self) -> float:
+        return _PREFILL_HEADROOM_SAFETY[self._memory_guard_tier]
+
     @property
     def memory_guard_tier(self) -> str:
         return self._memory_guard_tier
@@ -381,6 +384,7 @@ class ProcessMemoryEnforcer:
             return
         old = self._memory_guard_tier
         self._memory_guard_tier = new_tier
+        self._refresh_tier_thresholds()
         if self._running:
             if self._prefill_memory_guard:
                 self._refresh_effective_metal_cap_bytes()
@@ -514,10 +518,12 @@ class ProcessMemoryEnforcer:
             subsets of free / inactive, so we deliberately do not add
             them (would double count).
 
-        Non-macOS or vm_stat failure: falls back to psutil's available
-        (= roughly free + inactive on macOS, similar elsewhere). If psutil
-        is also unavailable or broken, fall back to the static ceiling so
-        telemetry failures do not disable the server's health endpoints.
+        VM stats failure: falls back to psutil_compat.virtual_memory().available
+        (= roughly free + inactive on macOS, similar elsewhere). On macOS that
+        compat layer avoids psutil's HOST_VM_INFO64 adapter and uses a cached
+        vm_stat fallback only if the fast host_statistics64 path is unavailable.
+        If all telemetry is unavailable, fall back to the static ceiling so
+        server health endpoints and the enforcer keep running.
         """
         if self._memory_guard_tier == "custom":
             return max(0, self._memory_guard_custom_ceiling_bytes)
@@ -525,10 +531,8 @@ class ProcessMemoryEnforcer:
         omlx_usage = get_phys_footprint()
         stats = get_macos_vm_stats()
         if stats is None:
-            if sys.platform == "darwin":
-                return self._get_static_ceiling()
             try:
-                available = int(psutil.virtual_memory().available)
+                available = int(psutil_compat.virtual_memory().available)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Memory guard could not read available memory; "
@@ -538,15 +542,15 @@ class ProcessMemoryEnforcer:
                 return self._get_static_ceiling()
             return max(0, omlx_usage + available)
         ratio = _ACTIVE_RECLAIM_RATIO[self._memory_guard_tier]
-        reclaimable = (
-            stats["free"]
-            + stats["inactive"]
-            + int(stats["active"] * ratio)
-        )
+        reclaimable = stats["free"] + stats["inactive"] + int(stats["active"] * ratio)
         return max(0, omlx_usage + reclaimable)
 
     def _get_hard_limit_bytes(self) -> int:
         """Final hard ceiling = min(static, dynamic, metal_cap).
+
+        Thin wrapper over ``_get_ceiling_breakdown`` that discards the
+        component breakdown. Hot callers that don't need to know which
+        ceiling is binding should keep using this helper.
 
         `metal_cap` is the effective Metal allocation cap (kernel
         iogpu.wired_limit_mb when set, otherwise Apple's
@@ -562,17 +566,37 @@ class ProcessMemoryEnforcer:
         Returns 0 if the memory guard is disabled (callers treat 0 as
         "no limit").
         """
+        return self._get_ceiling_breakdown()["hard_limit"]
+
+    def _get_ceiling_breakdown(self) -> dict[str, int]:
+        """Compute the hard limit AND the three component ceilings.
+
+        Returns a dict with keys ``static``, ``dynamic``, ``metal_cap``,
+        ``hard_limit`` (= min of the three non-zero values, or 0 when
+        the guard is disabled). Used by ``_propagate_memory_limit`` to
+        push the breakdown to schedulers so the prefill-rejection error
+        message can identify which constraint is binding and suggest the
+        right remedy. Single computation so the subprocess to ``sysctl``
+        (inside ``get_effective_metal_cap_bytes``) only fires once per
+        call.
+        """
         if not self._prefill_memory_guard:
-            return 0
-        candidates = [self._get_static_ceiling()]
+            return {"static": 0, "dynamic": 0, "metal_cap": 0, "hard_limit": 0}
+        static_ceiling = self._get_static_ceiling()
         if self._memory_guard_tier == "custom":
-            candidates.append(max(0, self._memory_guard_custom_ceiling_bytes))
+            dynamic_ceiling = max(0, self._memory_guard_custom_ceiling_bytes)
         else:
-            candidates.append(self._get_dynamic_ceiling())
+            dynamic_ceiling = self._get_dynamic_ceiling()
         metal_cap = self._get_effective_metal_cap_bytes()
+        candidates = [static_ceiling, dynamic_ceiling]
         if metal_cap > 0:
             candidates.append(metal_cap)
-        return min(candidates)
+        return {
+            "static": static_ceiling,
+            "dynamic": dynamic_ceiling,
+            "metal_cap": metal_cap,
+            "hard_limit": min(candidates),
+        }
 
     def get_final_ceiling(self) -> int:
         """Public accessor used by engine_pool pre-load admission."""
@@ -687,14 +711,180 @@ class ProcessMemoryEnforcer:
                 continue
             getter = getattr(scheduler, "get_cached_mlx_active_memory_bytes", None)
             try:
-                value = getter() if callable(getter) else getattr(
-                    scheduler, "_last_mlx_active_memory_bytes", 0
+                value = (
+                    getter()
+                    if callable(getter)
+                    else getattr(scheduler, "_last_mlx_active_memory_bytes", 0)
                 )
             except Exception:
                 continue
             if isinstance(value, (int, float)):
                 cached = max(cached, int(value))
         return cached
+
+    @staticmethod
+    def _nonnegative_bytes(value: Any) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return max(0, int(value))
+
+    @classmethod
+    def _nonnegative_byte_attr(cls, obj: Any, name: str) -> int | None:
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            return None
+        return cls._nonnegative_bytes(value)
+
+    def _hot_cache_budget(self) -> Any | None:
+        config = getattr(self._engine_pool, "_scheduler_config", None)
+        if config is None:
+            return None
+        budget = getattr(config, "hot_cache_budget", None)
+        if budget is None:
+            return None
+        max_bytes = self._nonnegative_byte_attr(budget, "max_bytes")
+        total_bytes = self._nonnegative_byte_attr(budget, "total_bytes")
+        if max_bytes is None or max_bytes <= 0 or total_bytes is None:
+            return None
+        return budget
+
+    def _hot_cache_max_bytes(self) -> int:
+        budget = self._hot_cache_budget()
+        if budget is not None:
+            return self._nonnegative_byte_attr(budget, "max_bytes") or 0
+        config = getattr(self._engine_pool, "_scheduler_config", None)
+        if config is None:
+            return 0
+        return self._nonnegative_byte_attr(config, "hot_cache_max_size") or 0
+
+    @staticmethod
+    def _manager_hot_cache_bytes(manager: Any) -> int:
+        try:
+            stats = manager.get_stats()
+            size = ProcessMemoryEnforcer._nonnegative_byte_attr(
+                stats, "hot_cache_size_bytes"
+            )
+            if size is not None:
+                return size
+        except Exception:
+            pass
+        return (
+            ProcessMemoryEnforcer._nonnegative_byte_attr(
+                manager, "_hot_cache_total_bytes"
+            )
+            or 0
+        )
+
+    def _hot_cache_used_bytes(self) -> int:
+        budget = self._hot_cache_budget()
+        if budget is not None:
+            return self._nonnegative_byte_attr(budget, "total_bytes") or 0
+
+        total = 0
+        seen_managers: set[int] = set()
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            if scheduler is None:
+                continue
+            manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+            if manager is None or id(manager) in seen_managers:
+                continue
+            seen_managers.add(id(manager))
+            total += self._manager_hot_cache_bytes(manager)
+        return total
+
+    def _hot_cache_reserved_bytes(self) -> int:
+        max_bytes = self._hot_cache_max_bytes()
+        if max_bytes <= 0:
+            return 0
+        used = self._hot_cache_used_bytes()
+        return min(max_bytes, used + _HOT_CACHE_RESERVATION_SLACK_BYTES)
+
+    def _scheduler_limit_bytes(
+        self, process_limit: int, *, reserved: int | None = None
+    ) -> int:
+        if process_limit <= 0:
+            return 0
+        if reserved is None:
+            reserved = self._hot_cache_reserved_bytes()
+        if reserved <= 0:
+            return process_limit
+        return max(1, process_limit - reserved)
+
+    def _active_hot_cache_block_hashes(self) -> set[bytes]:
+        hashes: set[bytes] = set()
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            if scheduler is None:
+                continue
+            getter = getattr(scheduler, "get_active_hot_cache_block_hashes", None)
+            if not callable(getter):
+                continue
+            try:
+                hashes.update(bytes(h) for h in getter())
+            except Exception:
+                logger.debug("Failed to read active hot-cache block hashes")
+        return hashes
+
+    def _shrink_hot_cache_for_pressure(self, current: int, target: int) -> int:
+        """Try to shrink hot cache enough to move process usage toward target."""
+        hot_used = self._hot_cache_used_bytes()
+        if hot_used <= 0 or current <= target:
+            return 0
+
+        target_hot_bytes = max(0, hot_used - (current - target))
+        protected_hashes = self._active_hot_cache_block_hashes()
+        budget = self._hot_cache_budget()
+        if budget is not None:
+            shrink = getattr(budget, "shrink_to", None)
+            if callable(shrink):
+                freed = int(
+                    shrink(target_hot_bytes, protected_hashes=protected_hashes) or 0
+                )
+                if freed > 0:
+                    logger.warning(
+                        "Shrank shared hot cache under memory pressure: "
+                        "freed=%s target_hot=%s protected=%d",
+                        _format_gb(freed),
+                        _format_gb(target_hot_bytes),
+                        len(protected_hashes),
+                    )
+                return freed
+
+        freed_total = 0
+        remaining_to_free = current - target
+        seen_managers: set[int] = set()
+        for entry in self._engine_pool._entries.values():
+            if remaining_to_free <= 0:
+                break
+            scheduler = self._resolve_scheduler(entry)
+            if scheduler is None:
+                continue
+            manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+            if manager is None or id(manager) in seen_managers:
+                continue
+            seen_managers.add(id(manager))
+            manager_used = self._manager_hot_cache_bytes(manager)
+            if manager_used <= 0:
+                continue
+            target_manager_bytes = max(0, manager_used - remaining_to_free)
+            shrink = getattr(manager, "shrink_hot_cache_to", None)
+            if not callable(shrink):
+                continue
+            freed = int(
+                shrink(target_manager_bytes, protected_hashes=protected_hashes) or 0
+            )
+            freed_total += freed
+            remaining_to_free = max(0, remaining_to_free - freed)
+
+        if freed_total > 0:
+            logger.warning(
+                "Shrank hot cache under memory pressure: freed=%s protected=%d",
+                _format_gb(freed_total),
+                len(protected_hashes),
+            )
+        return freed_total
 
     def get_pressure_level(self) -> str:
         """Return cached pressure level: 'ok', 'soft', or 'hard'.
@@ -755,8 +945,23 @@ class ProcessMemoryEnforcer:
         Called on every enforcer tick so the dynamic ceiling reaches the
         schedulers as fast as the poll interval allows.
         """
-        ceiling = self._get_hard_limit_bytes()
-        soft_limit = int(ceiling * self._soft_threshold) if ceiling > 0 else 0
+        breakdown = self._get_ceiling_breakdown()
+        ceiling = breakdown["hard_limit"]
+        abort_limit = self._get_abort_limit_bytes()
+        hot_cache_reserved = (
+            self._hot_cache_reserved_bytes() if ceiling > 0 or abort_limit > 0 else 0
+        )
+        scheduler_ceiling = self._scheduler_limit_bytes(
+            ceiling, reserved=hot_cache_reserved
+        )
+        soft_limit = (
+            int(scheduler_ceiling * self._soft_threshold)
+            if scheduler_ceiling > 0
+            else 0
+        )
+        scheduler_abort_limit = self._scheduler_limit_bytes(
+            abort_limit, reserved=hot_cache_reserved
+        )
         admission_paused = self._pressure_level != "ok"
         for entry in self._engine_pool._entries.values():
             scheduler = self._resolve_scheduler(entry)
@@ -769,10 +974,18 @@ class ProcessMemoryEnforcer:
                     # would fire on a routine startup before any model is
                     # loaded and turn the signal into noise.
                     continue
+                if getattr(engine, "_loaded", True) is False:
+                    # EnginePool clears entry.engine after stop(), but an
+                    # enforcer tick can observe the engine in the small
+                    # teardown window after its scheduler has been released.
+                    # Treat that like an unloaded entry, not a wrapper break.
+                    continue
                 if (
                     type(engine).__name__ == "DFlashEngine"
                     and getattr(engine, "_fallback_engine", None) is None
                 ):
+                    continue
+                if getattr(engine, "is_diffusion_model", False):
                     continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made
@@ -794,17 +1007,32 @@ class ProcessMemoryEnforcer:
                     )
                 continue
             scheduler._memory_limit_bytes = soft_limit
-            scheduler._memory_hard_limit_bytes = ceiling
-            scheduler._memory_abort_limit_bytes = self._get_abort_limit_bytes()
+            scheduler._memory_hard_limit_bytes = scheduler_ceiling
+            scheduler._memory_abort_limit_bytes = scheduler_abort_limit
             scheduler._prefill_abort_margin = self._get_prefill_abort_margin()
+            # Propagate the component ceilings too so the rejection
+            # message in ``_preflight_memory_check`` can name the binding
+            # constraint and steer the user toward the right remedy
+            # (close apps for dynamic, raise sysctl for metal_cap, raise
+            # tier or reduce context for static).
+            scheduler._memory_static_ceiling_bytes = breakdown["static"]
+            scheduler._memory_dynamic_ceiling_bytes = breakdown["dynamic"]
+            scheduler._memory_metal_cap_bytes = breakdown["metal_cap"]
+            scheduler._memory_hot_cache_reserved_bytes = hot_cache_reserved
+            # Tier name disambiguates dynamic = computed reclaimable
+            # (safe/balanced/aggressive) from dynamic = user-pinned
+            # custom_ceiling_bytes (custom). The advice ladder needs
+            # the distinction to point at the right knob.
+            scheduler._memory_guard_tier = self._memory_guard_tier
             scheduler._prefill_memory_guard = self._prefill_memory_guard
             scheduler._admission_paused = admission_paused
+            scheduler._prefill_headroom_safety = self._prefill_headroom_safety
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
             scheduler._prefill_min_chunk_tokens = self._prefill_min_chunk_tokens
             bg = getattr(scheduler, "batch_generator", None)
             if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                 bg._memory_limit_bytes = soft_limit
-                bg._memory_hard_limit_bytes = ceiling
+                bg._memory_hard_limit_bytes = scheduler_ceiling
 
     def _walk_store_cache_caps(self) -> None:
         """Walk each scheduler's store-cache gate one step per poll (#1383).
@@ -850,6 +1078,38 @@ class ProcessMemoryEnforcer:
             if isinstance(result, (int, float)):
                 aborted_total += max(0, int(result))
         return aborted_total
+
+    def _find_lru_busy_non_pinned_victim_locked(self) -> str | None:
+        """Find a non-pinned loaded model that is busy but abortable.
+
+        Caller must hold the engine-pool lock. This is used only at hard
+        pressure, after idle victims have already been considered.
+        """
+        candidates: list[tuple[float, str]] = []
+        for mid, entry in self._engine_pool._entries.items():
+            if (
+                getattr(entry, "engine", None) is None
+                or getattr(entry, "is_pinned", False)
+                or getattr(entry, "is_loading", False)
+            ):
+                continue
+
+            busy = getattr(entry, "in_use", 0) > 0
+            if not busy:
+                engine = getattr(entry, "engine", None)
+                has_active = getattr(engine, "has_active_requests", None)
+                if callable(has_active):
+                    try:
+                        busy = has_active() is True
+                    except Exception:  # noqa: BLE001
+                        busy = True
+            if busy:
+                candidates.append((getattr(entry, "last_access", 0.0), mid))
+
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
 
     async def stop(self) -> None:
         """Stop the background enforcement loop."""
@@ -927,7 +1187,8 @@ class ProcessMemoryEnforcer:
             self._settings_manager,
             global_idle_timeout_seconds=(
                 self._global_settings.idle_timeout.idle_timeout_seconds
-                if self._global_settings else None
+                if self._global_settings
+                else None
             ),
         )
 
@@ -980,6 +1241,34 @@ class ProcessMemoryEnforcer:
                 f"ceiling={_format_gb(ceiling)})"
             )
 
+        if new_level == "hard":
+            freed_hot = await asyncio.to_thread(
+                self._shrink_hot_cache_for_pressure,
+                current,
+                soft,
+            )
+            if freed_hot > 0:
+                current = self._current_usage_bytes()
+                emergency = self._is_emergency_pressure(current, ceiling)
+                if current < soft:
+                    recovered_level = "ok"
+                elif current < hard:
+                    recovered_level = "soft"
+                else:
+                    recovered_level = "hard"
+                if recovered_level != new_level:
+                    logger.info(
+                        "Memory pressure after hot-cache shrink: %s -> %s "
+                        "(current=%s, freed_hot=%s)",
+                        new_level,
+                        recovered_level,
+                        _format_gb(current),
+                        _format_gb(freed_hot),
+                    )
+                    new_level = recovered_level
+                    self._pressure_level = new_level
+                    self._propagate_memory_limit()
+
         if new_level == "ok":
             # Still walk the store-cache cap so it can recover toward
             # max_num_seqs while pressure stays low (#1383).
@@ -992,6 +1281,11 @@ class ProcessMemoryEnforcer:
 
         async with self._engine_pool._lock:
             while self._current_usage_bytes() > target:
+                pending = self._engine_pool._find_pending_unload_ready_locked()
+                if pending is not None:
+                    await self._engine_pool._unload_pending_if_idle_locked(pending)
+                    continue
+
                 victim = self._engine_pool._find_lru_victim()
                 if victim is not None:
                     loaded_non_pinned = [
@@ -999,18 +1293,19 @@ class ProcessMemoryEnforcer:
                         for mid, e in self._engine_pool._entries.items()
                         if e.engine is not None and not e.is_pinned
                     ]
-                    if len(loaded_non_pinned) > 1:
-                        # Multiple non-pinned: evict LRU victim cleanly.
-                        # abort_all_requests is fired before _unload_engine
-                        # so clients receive proper error responses instead
-                        # of silent disconnect.
+                    if new_level == "hard" or len(loaded_non_pinned) > 1:
+                        # Evict idle LRU victims cleanly. At hard pressure even
+                        # the last idle non-pinned model should be unloaded; it
+                        # has no active KV to preserve and keeping it resident
+                        # does not reduce pressure.
                         entry = self._engine_pool._entries.get(victim)
                         if (
                             entry
                             and entry.engine is not None
                             and hasattr(entry.engine, "abort_all_requests")
                         ):
-                            aborted = await entry.engine.abort_all_requests()
+                            result = await entry.engine.abort_all_requests()
+                            aborted = max(0, int(result or 0))
                             if aborted > 0:
                                 logger.warning(
                                     f"Aborted {aborted} requests on "
@@ -1022,23 +1317,6 @@ class ProcessMemoryEnforcer:
                         await self._engine_pool._unload_engine(victim)
                         continue
 
-                    # Only one non-pinned model remains.
-                    if new_level == "hard":
-                        # Abort in-flight requests, keep model loaded —
-                        # frees KV blocks so short-context follow-ups work.
-                        entry = self._engine_pool._entries.get(victim)
-                        if (
-                            entry
-                            and entry.engine is not None
-                            and hasattr(entry.engine, "abort_all_requests")
-                        ):
-                            aborted = await entry.engine.abort_all_requests()
-                            if aborted > 0:
-                                logger.warning(
-                                    f"Aborted {aborted} requests on "
-                                    f"'{victim}' due to hard memory "
-                                    f"pressure (model kept loaded)"
-                                )
                     # soft: leave in-flight alone — admission pause already
                     # signaled, eviction can't help further without aborts.
                     break
@@ -1046,6 +1324,33 @@ class ProcessMemoryEnforcer:
                 # No non-pinned victim. Loaded models are pinned or no loaded
                 # engines exist at all.
                 if new_level == "hard":
+                    busy_victim = self._find_lru_busy_non_pinned_victim_locked()
+                    if busy_victim is not None:
+                        entry = self._engine_pool._entries.get(busy_victim)
+                        aborted = 0
+                        if (
+                            entry
+                            and entry.engine is not None
+                            and hasattr(entry.engine, "abort_all_requests")
+                        ):
+                            aborted = await entry.engine.abort_all_requests()
+                        if entry is not None:
+                            self._engine_pool._mark_pending_unload_locked(
+                                busy_victim,
+                                "hard memory pressure",
+                                abort_requested=True,
+                            )
+                            await self._engine_pool._unload_pending_if_idle_locked(
+                                busy_victim
+                            )
+                        logger.warning(
+                            "Hard memory pressure: requested abort/unload for "
+                            "'%s' (aborted=%d)",
+                            busy_victim,
+                            aborted,
+                        )
+                        break
+
                     # Hard only: abort any in-progress model loads.
                     aborted_any = False
                     for entry in self._engine_pool._entries.values():
@@ -1104,9 +1409,7 @@ class ProcessMemoryEnforcer:
                                 requested,
                             )
                         else:
-                            logger.warning(
-                                "Hard memory pressure but no models loaded."
-                            )
+                            logger.warning("Hard memory pressure but no models loaded.")
                 # soft + all pinned: nothing to do beyond admission pause.
                 break
 
@@ -1149,6 +1452,19 @@ class ProcessMemoryEnforcer:
         static_ceiling = self._get_static_ceiling() if self._running else 0
         dynamic_ceiling = self._get_dynamic_ceiling() if self._running else 0
         current = self._current_usage_bytes() if self._running else 0
+        hot_reserved = self._hot_cache_reserved_bytes() if self._running else 0
+        scheduler_ceiling = (
+            self._scheduler_limit_bytes(ceiling, reserved=hot_reserved)
+            if self._running
+            else 0
+        )
+        scheduler_abort = (
+            self._scheduler_limit_bytes(
+                self._get_abort_limit_bytes(), reserved=hot_reserved
+            )
+            if self._running
+            else 0
+        )
         soft = int(ceiling * self._soft_threshold) if ceiling > 0 else 0
         hard = int(ceiling * self._hard_threshold) if ceiling > 0 else 0
         return {
@@ -1161,6 +1477,12 @@ class ProcessMemoryEnforcer:
             "static_ceiling_formatted": _format_gb(static_ceiling),
             "dynamic_ceiling_bytes": dynamic_ceiling,
             "dynamic_ceiling_formatted": _format_gb(dynamic_ceiling),
+            "hot_cache_reserved_bytes": hot_reserved,
+            "hot_cache_reserved_formatted": _format_gb(hot_reserved),
+            "scheduler_ceiling_bytes": scheduler_ceiling,
+            "scheduler_ceiling_formatted": _format_gb(scheduler_ceiling),
+            "scheduler_abort_limit_bytes": scheduler_abort,
+            "scheduler_abort_limit_formatted": _format_gb(scheduler_abort),
             "soft_threshold": self._soft_threshold,
             "hard_threshold": self._hard_threshold,
             "soft_bytes": soft,

@@ -1,12 +1,14 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jason5545/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.4.3.tar.gz"
-  sha256 "12c6e993d3940c1db1246d5e54de6f41d086cf266f208e6a79809c9fb4e72254"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.4.4.tar.gz"
+  sha256 "ff06063b215cd9f9ea6d311069f13f0523164cbb9eb2d05e29ef5b48d4dcbf48"
   license "Apache-2.0"
 
   head "https://github.com/jason5545/omlx.git", branch: "main"
 
+  option "with-custom-kernel",
+         "Build native custom kernels for GLM-5.2 and MiniMax M3 acceleration"
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
@@ -19,6 +21,15 @@ class Omlx < Formula
   resource "mlx-audio" do
     url "https://github.com/Blaizzy/mlx-audio.git",
       revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
+  end
+
+  # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
+  # language model so the first TTS request does not download into the
+  # Homebrew venv at runtime.
+  resource "en-core-web-sm" do
+    url "https://github.com/explosion/spacy-models/releases/download/" \
+        "en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+    sha256 "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
   end
 
   service do
@@ -34,22 +45,54 @@ class Omlx < Formula
     # Create venv with pip so dependency resolution works properly
     system "python3.11", "-m", "venv", libexec
 
-    # Build Rust-based packages from source with headerpad to prevent
-    # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths).
-    # tokenizers is excluded: its wheel ships a stable-ABI .abi3.so that does
-    # not need Homebrew's dylib ID rewrite, and building from source fails on
-    # macOS 15+ due to PyO3 linker errors (missing Python symbols at link time).
+    # Build native extensions from source with headerpad so Homebrew can
+    # rewrite Mach-O install names to absolute Cellar/opt paths. Rust/maturin
+    # extension builds (cohere_melody) need the linker flag via RUSTFLAGS;
+    # C/C++ extension builds use LDFLAGS.
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
+    ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
+    if build.with?("custom-kernel")
+      kernel_sources = [
+        buildpath/"omlx/custom_kernels/glm_moe_dsa/csrc",
+        buildpath/"omlx/custom_kernels/minimax_m3/csrc",
+      ]
+      unless kernel_sources.all?(&:directory?)
+        odie "--with-custom-kernel requires oMLX custom kernel sources; use --HEAD or a release that includes them"
+      end
+
+      ENV["OMLX_WITH_CUSTOM_KERNEL"] = "1"
+    end
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken", install_spec
+    system libexec/"bin/pip", "install",
+           "--no-binary", "cohere_melody,pydantic-core,rpds-py,tiktoken",
+           install_spec
+
+    if build.with?("custom-kernel")
+      system libexec/"bin/python", "-c", <<~PYTHON
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
+        assert glm_fast.is_native_available(), glm_fast.import_error()
+        assert minimax_fast.is_native_available(), minimax_fast.import_error()
+      PYTHON
+    end
 
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
       inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
       system libexec/"bin/pip", "install", ".[all]"
     end
+
+    # Install the spaCy English model required by misaki for Kokoro TTS.
+    # Homebrew's cached resource path is hash-prefixed, which pip rejects
+    # as an invalid wheel filename. Copy it back to the canonical basename.
+    spacy_model_wheel = buildpath/"en_core_web_sm-3.8.0-py3-none-any.whl"
+    cp resource("en-core-web-sm").cached_download, spacy_model_wheel
+    system libexec/"bin/pip", "install", "--no-deps",
+           spacy_model_wheel
+    system libexec/"bin/python", "-c",
+           "import spacy; spacy.load('en_core_web_sm')"
 
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
     system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
@@ -123,5 +166,7 @@ class Omlx < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/omlx --version")
+    system libexec/"bin/python", "-c",
+           "import spacy; spacy.load('en_core_web_sm')"
   end
 end

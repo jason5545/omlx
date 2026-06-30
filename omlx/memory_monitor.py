@@ -34,12 +34,42 @@ except ImportError:
     HAS_MLX_METAL = False
     mx = None
 
-# MLX >= 0.31 no longer materializes the full fp32 score matrix for
-# head_dim > 128, but local peak measurements still show a tiled score/scratch
-# term. Model it as one fp16 query tile plus the fp32 output buffer.
-_SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD = 128
-_SDPA_TILED_SCRATCH_QUERY_TOKENS = 512
-_SDPA_TILED_SCRATCH_DTYPE_SIZE = 2
+# Mirrors MLX Metal ScaledDotProductAttention::use_fallback for the
+# generation/inference path. Full prefill and short vector kernels support
+# different head dimensions; unsupported cases fall back to an unfused
+# score-matrix allocation.
+_SDPA_VECTOR_QUERY_TOKEN_THRESHOLD = 8
+_SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 80, 128})
+_SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
+# Default bytes/elem for the materialized unfused score matrix when the model's
+# compute dtype is unknown. MLX softmax accumulates in fp32, but the dominant
+# scratch buffer is allocated at the model's compute dtype, not fp32 — measured
+# ~2.1-2.2 bytes/elem on MLX 0.31.2 for a head_dim=256 prefill (fp16/bf16),
+# ~4.4 for fp32. Callers that know the model dtype pass it via
+# ``set_model_info(compute_dtype_size=...)``; this default covers the rare
+# dim-less path and matches the fp16/bf16 majority of MLX inference models.
+_SDPA_FALLBACK_SCORE_DTYPE_SIZE = 2
+
+# Head dims whose multi-token prefill is routed to an O(L) tiled/online-softmax
+# kernel instead of the unfused O(L^2) score-matrix fallback. Populated at
+# runtime by the kernel patch that installs the route (see
+# omlx/patches/sdpa256_attention.py); empty otherwise, so the estimate stays
+# O(L^2) when no such kernel is active. Maps head_dim -> kv_tile (the kernel's
+# KV block width, which bounds the per-chunk score transient).
+_SDPA_TILED_PREFILL_HEAD_DIMS: dict[int, int] = {}
+_SDPA_TILED_MIN_KV_LEN = 8192
+
+
+def register_tiled_prefill_head_dim(
+    head_dim: int, *, min_kv_len: int = 8192, kv_tile: int = 1024
+) -> None:
+    """Register a head_dim whose long-context prefill now uses an O(L) tiled
+    kernel, so the prefill memory estimate stops charging the O(L^2) score
+    matrix for it. Must be called in lockstep with installing the kernel route,
+    or the guard keeps rejecting valid long-context requests."""
+    global _SDPA_TILED_MIN_KV_LEN
+    _SDPA_TILED_PREFILL_HEAD_DIMS[int(head_dim)] = int(kv_tile)
+    _SDPA_TILED_MIN_KV_LEN = int(min_kv_len)
 
 
 @dataclass
@@ -120,7 +150,13 @@ class MemoryMonitor:
         self._num_layers: Optional[int] = None
         self._num_kv_heads: Optional[int] = None
         self._head_dim: Optional[int] = None
-        self._dtype_size: float = 2  # Default float16/bfloat16
+        # KV storage width; may be fractional with TurboQuant.
+        self._dtype_size: float = 2
+        self._kv_bytes_per_token_override: float | None = None
+        # SDPA score-matrix width = model compute/activation dtype, distinct from
+        # _dtype_size (which the scheduler may override to a fractional TurboQuant
+        # KV width). Set via set_model_info(compute_dtype_size=...).
+        self._score_dtype_size: float = _SDPA_FALLBACK_SCORE_DTYPE_SIZE
         self._num_attention_heads: Optional[int] = None
         self._num_kv_cache_layers: Optional[int] = None
 
@@ -299,6 +335,8 @@ class MemoryMonitor:
         dtype_size: float = 2,
         num_attention_heads: Optional[int] = None,
         num_kv_cache_layers: Optional[int] = None,
+        compute_dtype_size: Optional[float] = None,
+        kv_bytes_per_token: Optional[float] = None,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -307,31 +345,56 @@ class MemoryMonitor:
             num_layers: Number of transformer layers
             num_kv_heads: Number of KV attention heads
             head_dim: Dimension per attention head
-            dtype_size: Bytes per element. This may be fractional for
-                quantized KV cache layouts.
+            dtype_size: Bytes per element of the *stored KV cache*. This may
+                be fractional for quantized (e.g. TurboQuant) KV layouts.
             num_attention_heads: Number of query attention heads (for SDPA
                 peak estimation). Defaults to num_kv_heads if not set.
             num_kv_cache_layers: Number of layers that use KVCache
                 (full attention). For hybrid models this may be less than
                 num_layers. Defaults to num_layers.
+            compute_dtype_size: Bytes per element of the model's
+                compute/activation dtype (2 for fp16/bf16, 4 for fp32). Used
+                for the unfused SDPA score-matrix transient, which is allocated
+                at the activation dtype regardless of KV quantization. Defaults
+                to the fp16/bf16 fallback when unknown.
+            kv_bytes_per_token: Optional exact resident KV-cache bytes added
+                per token. Use for compressed-cache architectures such as MLA
+                where stored cache tensors are not representable as uniform
+                ``num_kv_heads * head_dim * 2`` K/V tensors.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
         self._dtype_size = dtype_size
+        self._score_dtype_size = (
+            compute_dtype_size
+            if compute_dtype_size and compute_dtype_size > 0
+            else _SDPA_FALLBACK_SCORE_DTYPE_SIZE
+        )
+        self._kv_bytes_per_token_override = (
+            float(kv_bytes_per_token)
+            if kv_bytes_per_token is not None and kv_bytes_per_token > 0
+            else None
+        )
         self._num_attention_heads = num_attention_heads or num_kv_heads
         self._num_kv_cache_layers = num_kv_cache_layers or num_layers
 
         # Log estimated memory per block
         if num_layers and num_kv_heads and head_dim:
             sample_block_mem = self.estimate_block_memory(64)  # 64 tokens
+            override_note = (
+                ", KV override "
+                f"{format_bytes(int(self._kv_bytes_per_token_override))}/tok"
+                if self._kv_bytes_per_token_override
+                else ""
+            )
             logger.info(
                 f"Model info set: {num_layers} layers "
                 f"({self._num_kv_cache_layers} KVCache), "
                 f"{num_kv_heads} KV heads, "
                 f"{self._num_attention_heads} Q heads, "
                 f"{head_dim} head_dim. Estimated memory per 64-token block: "
-                f"{format_bytes(sample_block_mem)}"
+                f"{format_bytes(sample_block_mem)}{override_note}"
             )
 
     def has_model_info(self) -> bool:
@@ -380,6 +443,15 @@ class MemoryMonitor:
         dim = head_dim or self._head_dim or 128
         dtype = dtype_size or self._dtype_size
 
+        if (
+            self._kv_bytes_per_token_override is not None
+            and num_layers is None
+            and num_kv_heads is None
+            and head_dim is None
+            and dtype_size is None
+        ):
+            return block_size * self._kv_bytes_per_token_override
+
         # Memory per layer: keys + values
         # Shape: (batch=1, kv_heads, block_size, head_dim)
         per_layer = block_size * kv_heads * dim * dtype * 2  # *2 for keys+values
@@ -408,9 +480,30 @@ class MemoryMonitor:
         if not (layers and kv_heads and dim):
             return 0
 
+        if self._kv_bytes_per_token_override is not None:
+            return num_tokens * self._kv_bytes_per_token_override
+
         # KVCache layers: memory grows with num_tokens
         per_token = layers * kv_heads * dim * dtype * 2  # keys + values
         return num_tokens * per_token
+
+    def _uses_fused_sdpa(self, query_tokens: int, kv_len: int) -> bool:
+        hd = self._head_dim or 0
+        n_q = self._num_attention_heads or 0
+        n_kv = self._num_kv_heads or n_q
+        if n_q <= 0 or n_kv <= 0 or hd <= 0 or query_tokens <= 0:
+            return False
+        if kv_len < query_tokens:
+            return False
+
+        if query_tokens <= _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD:
+            gqa_factor = max(1, n_q // n_kv)
+            return (
+                hd in _SDPA_VECTOR_SUPPORTED_HEAD_DIMS
+                and query_tokens * gqa_factor <= 32
+            )
+
+        return hd in _SDPA_FULL_SUPPORTED_HEAD_DIMS
 
     def _estimate_sdpa_activation_bytes(self, query_tokens: int, kv_len: int) -> int:
         hd = self._head_dim or 0
@@ -418,13 +511,30 @@ class MemoryMonitor:
         if n_q == 0 or hd == 0 or query_tokens <= 0:
             return 0
 
+        query_tokens = int(query_tokens)
+        kv_len = max(int(kv_len), 0)
+
         output = n_q * query_tokens * hd * 4
-        if hd <= _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD:
+        if self._uses_fused_sdpa(query_tokens, kv_len):
             return output
 
-        tiled_query = min(query_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
-        scratch = n_q * tiled_query * max(kv_len, 0) * _SDPA_TILED_SCRATCH_DTYPE_SIZE
-        return scratch + output
+        # O(L) tiled-prefill kernel active for this head_dim (e.g. the head_dim
+        # 256 sdpa256 patch): the score matrix is never materialized. The peak
+        # transient is the output plus one KV tile of scores, not the full
+        # [n_q, query_tokens, kv_len] matrix. This matches the kernel's route
+        # gate (query_len > 1, kv_len >= threshold); any query_len <= 1 already
+        # returned above via the fused vector path.
+        kv_tile = _SDPA_TILED_PREFILL_HEAD_DIMS.get(hd)
+        if (
+            kv_tile is not None
+            and query_tokens > 1
+            and kv_len >= _SDPA_TILED_MIN_KV_LEN
+        ):
+            tile_scores = n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
+            return output + tile_scores
+
+        scores = n_q * query_tokens * kv_len * self._score_dtype_size
+        return scores + output
 
     def estimate_prefill_peak_bytes(
         self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0
@@ -439,9 +549,10 @@ class MemoryMonitor:
         cache pool / python heap overhead (absorbed by enforcer's hard
         threshold margin — see MemorySettings.hard_threshold).
 
-        MLX SDPA avoids the old full fp32 score-matrix allocation for
-        head_dim > 128, but high-head-dim kernels still need a tiled scratch
-        term that spans the full key/value context. With prefix-cache hits,
+        MLX SDPA only uses fused full-attention kernels for the head dimensions
+        supported by ``ScaledDotProductAttention::use_fallback``. Unsupported
+        prefill chunks fall back to an unfused fp32 score matrix whose K
+        dimension spans the full key/value context. With prefix-cache hits,
         that context is ``new_tokens + cached_tokens``, not just the new suffix.
         Passing only ``new_tokens`` here silently under-counts long-context
         prefill, exactly where prefix caching makes such requests possible.
@@ -480,7 +591,7 @@ class MemoryMonitor:
         # prompts (smaller than chunk_size) would otherwise be charged the
         # full chunk_size width in the scores tensor, over-estimating by
         # chunk_size / new_tokens — a constant-factor over-count that
-        # raised false-positive 413s on small prompts.
+        # raised false-positive 400s on small prompts.
         eff_chunk = min(chunk_size, new_tokens)
         full_kv_len = new_tokens + max(cached_tokens, 0)
         attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
@@ -501,10 +612,9 @@ class MemoryMonitor:
         in the caller's ``current`` baseline once eval'd); it is the quantity
         the adaptive throttle must keep under the remaining headroom.
 
-        MLX fused SDPA uses the output-buffer estimate for head_dim <= 128.
-        For larger head_dim values, current MLX avoids the old full fp32
-        score matrix but still needs a bounded query-tile scratch term that
-        scales with total ``kv_len``.
+        Fused MLX SDPA uses the output-buffer estimate. Unsupported
+        query/head-dim combinations use the unfused fp32 score-matrix fallback
+        and scale with total ``kv_len``.
 
         Returns 0 when model info is unavailable.
         """
@@ -583,6 +693,67 @@ class MemoryMonitor:
         )
 
 
+def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _pos_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def estimate_mla_kv_bytes_per_token(
+    config: Any,
+    cache_list: Any,
+    dtype_size: float,
+) -> float | None:
+    """Estimate exact resident KV bytes/token for MLA-style caches.
+
+    GLM/DeepSeek MLA models do not store expanded ``num_kv_heads * head_dim``
+    K/V tensors. Their main cache stores a latent key and RoPE value
+    (``kv_lora_rank + qk_rope_head_dim``) with a single KV head. GLM-5.2's DSA
+    indexer adds a second cache on full-indexer layers containing only
+    ``index_head_dim`` keys and zero-width values. Falling back to the standard
+    uniform KV formula over-counts GLM-5.2 by more than an order of magnitude.
+    """
+    kv_lora_rank = _cfg_get(config, "kv_lora_rank")
+    rope_dim = _cfg_get(config, "qk_rope_head_dim")
+    if not (_pos_int(kv_lora_rank) and _pos_int(rope_dim)):
+        return None
+
+    if cache_list is None:
+        return None
+
+    main_cache_layers = 0
+    indexer_cache_layers = 0
+    try:
+        for layer_cache in cache_list:
+            caches = getattr(layer_cache, "caches", None)
+            if caches is None:
+                continue
+            n_caches = len(caches)
+            if n_caches >= 1:
+                main_cache_layers += 1
+            if n_caches >= 2:
+                indexer_cache_layers += 1
+    except Exception:
+        return None
+
+    if main_cache_layers <= 0:
+        return None
+
+    index_head_dim = _cfg_get(config, "index_head_dim", 0) or 0
+    if not _pos_int(index_head_dim):
+        index_head_dim = 0
+
+    elems_per_token = (
+        main_cache_layers * (kv_lora_rank + rope_dim)
+        + indexer_cache_layers * index_head_dim
+    )
+    return float(elems_per_token) * float(dtype_size)
+
+
 def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
     """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
 
@@ -621,31 +792,28 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         # ``n_layer`` alias. Falls back to the top-level config only when no
         # sub-config has either field.
         for sub_attr in ("text_config", "language_config", "llm_config"):
-            sub = getattr(config, sub_attr, None)
+            sub = _cfg_get(config, sub_attr)
             if sub is not None and (
-                getattr(sub, "num_hidden_layers", None)
-                or getattr(sub, "n_layer", None)
+                _cfg_get(sub, "num_hidden_layers") or _cfg_get(sub, "n_layer")
             ):
                 config = sub
                 break
 
         # Extract KV cache dimensions
-        num_layers = getattr(config, "num_hidden_layers", None) or getattr(
-            config, "n_layer", None
+        num_layers = _cfg_get(config, "num_hidden_layers") or _cfg_get(
+            config, "n_layer"
         )
         num_kv_heads = (
-            getattr(config, "num_key_value_heads", None)
-            or getattr(config, "num_attention_heads", None)
-            or getattr(config, "n_head", None)
+            _cfg_get(config, "num_key_value_heads")
+            or _cfg_get(config, "num_attention_heads")
+            or _cfg_get(config, "n_head")
         )
-        head_dim = getattr(config, "head_dim", None)
-        hidden_size = getattr(config, "hidden_size", None) or getattr(
-            config, "n_embd", None
-        )
+        head_dim = _cfg_get(config, "head_dim")
+        hidden_size = _cfg_get(config, "hidden_size") or _cfg_get(config, "n_embd")
 
         # Calculate head_dim if not directly available
         if head_dim is None and hidden_size and num_kv_heads:
-            num_heads = getattr(config, "num_attention_heads", None) or num_kv_heads
+            num_heads = _cfg_get(config, "num_attention_heads") or num_kv_heads
             head_dim = hidden_size // num_heads
 
         # Determine dtype size
@@ -658,14 +826,15 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
 
         # Extract num_attention_heads (query heads) for SDPA peak estimation
         num_attention_heads = (
-            getattr(config, "num_attention_heads", None)
-            or getattr(config, "n_head", None)
+            _cfg_get(config, "num_attention_heads")
+            or _cfg_get(config, "n_head")
             or num_kv_heads
         )
 
         # Count KVCache layers for hybrid models. Mirrors
         # Scheduler._set_model_info_for_monitor: recurse into CacheList so
         # wrapped full-attention layers are counted, not just bare KVCache.
+        cache_list = None
         num_kv_cache_layers = num_layers
         if hasattr(model, "make_cache"):
             try:
@@ -685,13 +854,14 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
             except Exception:
                 pass
 
+        kv_bytes_per_token = estimate_mla_kv_bytes_per_token(
+            config, cache_list, dtype_size
+        )
+
         # Truthiness alone isn't enough — MagicMock proxies leaking through the
         # descent (test scaffolds that don't fully spec ``model.config``) are
         # truthy but fail any later numeric comparison (``> 128`` etc.) deep
         # inside MemoryMonitor. Insist on real positive integers before calling.
-        def _pos_int(v: Any) -> bool:
-            return isinstance(v, int) and not isinstance(v, bool) and v > 0
-
         if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
             monitor.set_model_info(
                 num_layers=num_layers,
@@ -700,6 +870,10 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 dtype_size=dtype_size,
                 num_attention_heads=num_attention_heads,
                 num_kv_cache_layers=num_kv_cache_layers,
+                # This path uses the uncompressed base dtype for KV, so
+                # dtype_size already equals the compute/activation dtype.
+                compute_dtype_size=dtype_size,
+                kv_bytes_per_token=kv_bytes_per_token,
             )
             logger.debug(
                 f"Model info for memory estimation: "

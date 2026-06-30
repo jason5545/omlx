@@ -73,6 +73,28 @@ class BatchedEngine(BaseEngine):
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
 
+    async def _preflight_or_raise_with_eviction(
+        self,
+        scheduler: Any,
+        *,
+        num_prompt_tokens: int,
+        request_id: str | None,
+    ) -> None:
+        eviction_request = scheduler.preflight_eviction_request(
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
+        if eviction_request is not None and self._prefill_eviction_callback is not None:
+            logger.info(
+                "Running preflight LRU eviction for request %s",
+                eviction_request.request_id,
+            )
+            await self._prefill_eviction_callback(eviction_request)
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
+
     @property
     def model_name(self) -> str:
         """Get the model name."""
@@ -210,8 +232,8 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
         from ..utils.model_loading import (
-            maybe_load_custom_quantization,
             maybe_apply_pre_load_patches,
+            maybe_load_custom_quantization,
         )
 
         # Build tokenizer config with model-specific fixes
@@ -244,6 +266,7 @@ class BatchedEngine(BaseEngine):
             return load(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
+                trust_remote_code=self._trust_remote_code,
             )
 
         loop = asyncio.get_running_loop()
@@ -279,6 +302,24 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
+        # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
+        # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
+        # below their context window. Installed after TurboQuant so it is the
+        # outer wrapper and only grabs non-quantized 256 prefill; all other
+        # cases (incl. TurboQuant caches, other head dims, decode, short
+        # prefill) fall through to the prior SDPA unchanged. Passthrough-safe to
+        # install unconditionally — the route is strictly gated. Disable via
+        # model_settings.sdpa256_prefill_enabled = False.
+        if getattr(self._model_settings, "sdpa256_prefill_enabled", True) is not False:
+            try:
+                from ..patches.sdpa256_attention import (
+                    apply_sdpa256_attention_patch,
+                )
+
+                apply_sdpa256_attention_patch()
+            except Exception:
+                logger.debug("sdpa256 attention patch not applied", exc_info=True)
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
             copy.copy(self._scheduler_config)
@@ -305,15 +346,17 @@ class BatchedEngine(BaseEngine):
         await self._engine.engine.start()
 
         # TurboQuant KV cache: propagate bits to scheduler
+        scheduler = self._engine.engine.scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
-                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
-                self._engine.engine.scheduler._turboquant_skip_last = getattr(
+                scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
-                self._engine.engine.scheduler._set_model_info_for_monitor()
+                scheduler._set_model_info_for_monitor()
+        scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -338,7 +381,15 @@ class BatchedEngine(BaseEngine):
                             pass
                         set_mtp_active(False)
                         try:
-                            draft_model, _ = load(specprefill_draft)
+                            draft_tokenizer_config = get_tokenizer_config(
+                                specprefill_draft,
+                                trust_remote_code=self._trust_remote_code,
+                            )
+                            draft_model, _ = load(
+                                specprefill_draft,
+                                tokenizer_config=draft_tokenizer_config,
+                                trust_remote_code=self._trust_remote_code,
+                            )
                             # Materialize frozen buffers (RoPE freqs, etc.)
                             # on the loader thread. mlx_lm.load only does
                             # mx.eval(model.parameters()) and leaves siblings
@@ -645,6 +696,8 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
                     cached_tokens=output.cached_tokens,
+                    generated_at=getattr(output, "generated_at", None),
+                    generated_until=getattr(output, "generated_until", None),
                 )
         except GeneratorExit:
             # Client disconnected
@@ -780,8 +833,8 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_tokens, request_id=request_id
+        await self._preflight_or_raise_with_eviction(
+            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
     async def preflight_completion(
@@ -810,8 +863,8 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_tokens, request_id=request_id
+        await self._preflight_or_raise_with_eviction(
+            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
     async def stream_chat(

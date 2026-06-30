@@ -19,6 +19,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from omlx.engine_core import AsyncEngineCore, EngineConfig, EngineCore
+from omlx.exceptions import PrefillMemoryExceededError
+from omlx.output_collector import RequestOutputCollector
 from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
 
@@ -353,7 +355,42 @@ class TestEngineCoreAddRequest:
                 engine.close()
 
     @pytest.mark.asyncio
-    async def test_add_request_with_default_sampling_params(self, mock_model, mock_tokenizer):
+    async def test_add_request_cleans_up_if_scheduler_insert_fails(
+        self, mock_model, mock_tokenizer
+    ):
+        """If the scheduler insert fails/cancels after the collector is created,
+        add_request must drop the tracking (and abort) so no phantom collector
+        leaks that the reaper can't see — it was never stamped finished
+        (#1154). BaseException in the guard also covers the real
+        trigger: CancelledError when a client disconnects before streaming."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                await engine.start()
+                engine.scheduler.add_request = MagicMock(
+                    side_effect=RuntimeError("insert boom")
+                )
+                engine.scheduler.abort_request = MagicMock(return_value=True)
+
+                with pytest.raises(RuntimeError):
+                    await engine.add_request(prompt="Hello")
+
+                # No phantom tracking left behind for any request.
+                assert engine._output_collectors == {}
+                assert engine._stream_states == {}
+                assert engine._finished_events == {}
+                assert engine._finished_at == {}
+                # The partial scheduler insert was aborted (idempotent).
+                engine.scheduler.abort_request.assert_called_once()
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_with_default_sampling_params(
+        self, mock_model, mock_tokenizer
+    ):
         """Test add_request() uses default sampling params when none provided."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
@@ -647,7 +684,12 @@ class TestEngineCoreClose:
             timeout_future = MagicMock()
             timeout_future.result.side_effect = concurrent.futures.TimeoutError
             executor = MagicMock()
-            executor.submit.side_effect = [ok_future, ok_future, timeout_future]
+            executor.submit.side_effect = [
+                ok_future,
+                ok_future,
+                ok_future,
+                timeout_future,
+            ]
             engine._mlx_executor = executor
 
             with (
@@ -783,7 +825,9 @@ class TestEngineCoreErrorPropagation:
     """Tests for error propagation from engine loop to requests."""
 
     @pytest.mark.asyncio
-    async def test_error_output_propagates_to_collector(self, mock_model, mock_tokenizer):
+    async def test_error_output_propagates_to_collector(
+        self, mock_model, mock_tokenizer
+    ):
         """Test that engine loop errors are sent to request collectors."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
@@ -860,6 +904,51 @@ class TestEngineCoreErrorPropagation:
                 engine.close()
 
     @pytest.mark.asyncio
+    async def test_stream_outputs_restores_prefill_memory_error(
+        self, mock_model, mock_tokenizer
+    ):
+        """Structured capacity errors must survive the RequestOutput boundary."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+
+                request_id = await engine.add_request(
+                    prompt="Hello",
+                    sampling_params=SamplingParams(max_tokens=50),
+                )
+
+                collector = engine._output_collectors[request_id]
+                collector.put(
+                    RequestOutput(
+                        request_id=request_id,
+                        finished=True,
+                        finish_reason="error",
+                        error="Prefill context too large for available memory",
+                        error_code="prefill_memory_exceeded",
+                        error_metadata={
+                            "request_id": request_id,
+                            "estimated_bytes": 123,
+                            "limit_bytes": 100,
+                        },
+                    )
+                )
+
+                with pytest.raises(PrefillMemoryExceededError) as exc:
+                    async for _ in engine.stream_outputs(request_id):
+                        pass
+
+                assert exc.value.request_id == request_id
+                assert exc.value.estimated_bytes == 123
+                assert exc.value.limit_bytes == 100
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
     async def test_generate_raises_on_error(self, mock_model, mock_tokenizer):
         """Test generate() raises RuntimeError when error output received."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
@@ -901,6 +990,56 @@ class TestEngineCoreErrorPropagation:
 
                 assert final_output is not None
                 assert final_output.error == "Memory limit exceeded during prefill"
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_generate_restores_prefill_memory_error(
+        self, mock_model, mock_tokenizer
+    ):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+
+                request_id = await engine.add_request(
+                    prompt="Hello",
+                    sampling_params=SamplingParams(max_tokens=50),
+                )
+                engine._output_collectors[request_id].put(
+                    RequestOutput(
+                        request_id=request_id,
+                        finished=True,
+                        finish_reason="error",
+                        error="Prefill context too large for available memory",
+                        error_code="prefill_memory_exceeded",
+                        error_metadata={
+                            "request_id": request_id,
+                            "estimated_bytes": 123,
+                            "limit_bytes": 100,
+                        },
+                    )
+                )
+                engine._finished_events[request_id].set()
+
+                async def _reuse_existing_request(*args, **kwargs):
+                    return request_id
+
+                engine.add_request = _reuse_existing_request  # type: ignore[method-assign]
+
+                with pytest.raises(PrefillMemoryExceededError) as exc:
+                    await engine.generate(
+                        prompt="ignored",
+                        sampling_params=SamplingParams(max_tokens=50),
+                    )
+
+                assert exc.value.request_id == request_id
+                assert exc.value.estimated_bytes == 123
+                assert exc.value.limit_bytes == 100
             finally:
                 await engine.stop()
                 engine.close()
@@ -1140,6 +1279,7 @@ class TestGlobalMLXExecutor:
         """
         import threading
         import time
+
         from omlx.engine_core import get_mlx_executor
 
         executor = get_mlx_executor()
@@ -1172,8 +1312,10 @@ class TestGlobalMLXExecutor:
 
         # All tasks completed
         assert set(results) == {
-            "engine_a_step1", "engine_b_step1",
-            "engine_a_step2", "engine_b_step2",
+            "engine_a_step1",
+            "engine_b_step1",
+            "engine_a_step2",
+            "engine_b_step2",
         }
         # Critical: no two tasks ever ran at the same time
         assert max_concurrent == 1, (
@@ -1241,9 +1383,9 @@ class TestGlobalMLXExecutor:
                 engine1.close()
                 engine2.close()
 
-        assert total_steps >= 4, (
-            f"Expected at least 4 steps from two engines, got {total_steps}"
-        )
+        assert (
+            total_steps >= 4
+        ), f"Expected at least 4 steps from two engines, got {total_steps}"
         # With per-engine executors (#1248), two engines CAN run concurrently.
         # max_concurrent >= 2 means both engines overlapped at least once.
         assert max_concurrent >= 2, (
@@ -1325,9 +1467,7 @@ class TestStepBurst:
                 decode_burst_budget_single_s=budget,
                 decode_burst_budget_s=budget,
             )
-            return EngineCore(
-                model=mock_model, tokenizer=mock_tokenizer, config=config
-            )
+            return EngineCore(model=mock_model, tokenizer=mock_tokenizer, config=config)
 
     def test_max_steps_1_runs_single_step(self, mock_model, mock_tokenizer):
         """max_steps=1 disables bursting -> exactly one scheduler.step()."""
@@ -1407,18 +1547,14 @@ class TestStepBurst:
 
     def test_breaks_on_budget(self, mock_model, mock_tokenizer):
         """Elapsed budget ends the burst (also caps slow prefill-chunk steps)."""
-        engine = self._make_engine(
-            mock_model, mock_tokenizer, max_steps=8, budget=0.05
-        )
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=8, budget=0.05)
         try:
             engine.scheduler.step = MagicMock(
                 return_value=SchedulerOutput(has_work=True)
             )
             engine.scheduler.has_requests = MagicMock(return_value=True)
             # deadline = monotonic()(=100.0) + 0.05; next check (=200.0) exceeds it.
-            with patch(
-                "omlx.engine_core.time.monotonic", side_effect=[100.0, 200.0]
-            ):
+            with patch("omlx.engine_core.time.monotonic", side_effect=[100.0, 200.0]):
                 outs = engine._step_burst()
             assert len(outs) == 1
             assert engine.scheduler.step.call_count == 1
@@ -1427,9 +1563,7 @@ class TestStepBurst:
 
     def test_budget_zero_disables_bursting(self, mock_model, mock_tokenizer):
         """budget<=0 (with max_steps>1) still runs a single step."""
-        engine = self._make_engine(
-            mock_model, mock_tokenizer, max_steps=8, budget=0.0
-        )
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=8, budget=0.0)
         try:
             engine.scheduler.step = MagicMock(
                 return_value=SchedulerOutput(has_work=True)
@@ -1486,3 +1620,150 @@ class TestStepBurst:
             assert len(outs) == 1
         finally:
             engine.close()
+
+
+class TestOrphanedCollectorReaping:
+    """Reaping of output collectors orphaned by a client disconnect (#1154).
+
+    When a client disconnects mid-stream the SSE generator chain is abandoned
+    rather than closed, so stream_outputs()'s cleanup finally only runs at GC
+    time and the collector lingers in _output_collectors — the dashboard then
+    shows the request as "Generating" indefinitely. _reap_orphaned_collectors()
+    drops such orphans after a grace period.
+    """
+
+    def test_reaps_only_stale_finished_collectors(self, mock_model, mock_tokenizer):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                now = 1000.0
+
+                # orphan: finished long ago, consumer never cleaned up.
+                orphan = RequestOutputCollector()
+                orphan.put(
+                    RequestOutput(
+                        request_id="orphan",
+                        finished=True,
+                        finish_reason="abort",
+                        new_text="partial",
+                    )
+                )
+                engine._output_collectors["orphan"] = orphan
+                engine._finished_events["orphan"] = asyncio.Event()
+                engine._finished_at["orphan"] = now - 100.0
+
+                # fresh: just finished, still within grace (consumer may drain).
+                engine._output_collectors["fresh"] = RequestOutputCollector()
+                engine._finished_events["fresh"] = asyncio.Event()
+                engine._finished_at["fresh"] = now - 1.0
+
+                # active: still generating, never marked finished.
+                engine._output_collectors["active"] = RequestOutputCollector()
+                engine._finished_events["active"] = asyncio.Event()
+
+                reaped = engine._reap_orphaned_collectors(now=now, grace=5.0)
+
+                assert reaped == 1
+                # stale orphan dropped from every tracking dict
+                assert "orphan" not in engine._output_collectors
+                assert "orphan" not in engine._finished_events
+                assert "orphan" not in engine._finished_at
+                # within-grace and still-active requests are retained
+                assert "fresh" in engine._output_collectors
+                assert "active" in engine._output_collectors
+                # pop-only: a consumer still holding the orphan reference keeps
+                # its buffered output — the reaper must NOT clear() it.
+                assert orphan.output is not None
+                assert orphan.output.new_text == "partial"
+            finally:
+                engine.close()
+
+    def test_mark_request_finished_stamps_once_and_signals(
+        self, mock_model, mock_tokenizer
+    ):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                event = asyncio.Event()
+                engine._finished_events["r1"] = event
+
+                engine._mark_request_finished("r1")
+                assert event.is_set()
+                assert "r1" in engine._finished_at
+                first = engine._finished_at["r1"]
+
+                # setdefault semantics: a repeated signal must not reset the
+                # grace clock (otherwise an orphan could never age out).
+                engine._mark_request_finished("r1")
+                assert engine._finished_at["r1"] == first
+            finally:
+                engine.close()
+
+    def test_cleanup_request_removes_finished_stamp(self, mock_model, mock_tokenizer):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                engine._output_collectors["r1"] = RequestOutputCollector()
+                engine._finished_events["r1"] = asyncio.Event()
+                engine._finished_at["r1"] = 123.0
+
+                engine._cleanup_request("r1")
+
+                # normal consumer cleanup also clears the finish stamp so the
+                # reaper never revisits a request the consumer already handled.
+                assert "r1" not in engine._finished_at
+                assert "r1" not in engine._output_collectors
+            finally:
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_generate_drains_via_held_reference_if_reaped(
+        self, mock_model, mock_tokenizer
+    ):
+        """generate() captures the collector BEFORE awaiting, so the pop-only
+        reaper removing the dict entry once the request finishes cannot lose a
+        completed result when generate() is slow to resume under load (#1154).
+        Without the early capture, the post-await re-fetch would return None and
+        raise — the streaming path was already safe; this extends it to generate().
+        """
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+
+                task = asyncio.create_task(
+                    engine.generate(
+                        prompt="Hello",
+                        sampling_params=SamplingParams(max_tokens=5),
+                    )
+                )
+                # Let generate() add the request and capture the collector
+                # reference (it captures before awaiting the finished event).
+                await asyncio.sleep(0.05)
+                request_id = list(engine._output_collectors.keys())[0]
+                collector = engine._output_collectors[request_id]
+
+                # Deliver the completed result, then simulate the reaper popping
+                # the dict entry BEFORE generate() resumes to drain it.
+                collector.put(
+                    RequestOutput(
+                        request_id=request_id,
+                        finished=True,
+                        finish_reason="stop",
+                        new_text="done",
+                    )
+                )
+                engine._output_collectors.pop(request_id)
+                engine._finished_events[request_id].set()
+
+                result = await task
+                assert result is not None
+                assert result.new_text == "done"
+            finally:
+                await engine.stop()
+                engine.close()

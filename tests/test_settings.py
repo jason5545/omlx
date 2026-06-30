@@ -33,6 +33,7 @@ from omlx.settings import (
     get_system_memory,
     init_settings,
     reset_settings,
+    resolve_default_base_path,
 )
 
 
@@ -49,6 +50,7 @@ class TestServerSettings:
         assert settings.sse_keepalive_mode == "chunk"
         assert settings.auto_start_on_launch is True
         assert settings.burst_decode_mode == "balanced"
+        assert settings.preserve_mid_system_cache is True
 
     def test_custom_values(self):
         """Test custom values."""
@@ -76,6 +78,7 @@ class TestServerSettings:
             "sse_keepalive_mode": "chunk",
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
+            "preserve_mid_system_cache": True,
         }
 
     def test_from_dict_sse_keepalive_mode(self):
@@ -96,6 +99,17 @@ class TestServerSettings:
         """A settings.json without burst_decode_mode falls back to the default."""
         settings = ServerSettings.from_dict({})
         assert settings.burst_decode_mode == DEFAULT_BURST_DECODE_MODE
+
+    def test_from_dict_preserve_mid_system_cache(self):
+        """preserve_mid_system_cache round-trips through from_dict / to_dict."""
+        settings = ServerSettings.from_dict({"preserve_mid_system_cache": False})
+        assert settings.preserve_mid_system_cache is False
+        assert settings.to_dict()["preserve_mid_system_cache"] is False
+
+    def test_from_dict_preserve_mid_system_cache_default(self):
+        """Missing preserve_mid_system_cache keeps the cache-friendly default."""
+        settings = ServerSettings.from_dict({})
+        assert settings.preserve_mid_system_cache is True
 
     def test_from_dict_auto_start_on_launch(self):
         """auto_start_on_launch round-trips through from_dict / to_dict."""
@@ -1621,13 +1635,8 @@ class TestHelperFunctions:
         memory = get_system_memory()
         assert isinstance(memory, int)
 
-    def test_get_system_memory_uses_sysconf_before_psutil(self):
+    def test_get_system_memory_uses_sysconf_before_compat(self):
         """macOS should not depend on psutil's HOST_VM_INFO64 adapter."""
-
-        class BrokenPsutil:
-            @staticmethod
-            def virtual_memory():
-                raise RuntimeError("host_statistics64 failed")
 
         def fake_sysconf(name):
             if name == "SC_PHYS_PAGES":
@@ -1636,22 +1645,22 @@ class TestHelperFunctions:
                 return 4096
             raise ValueError(name)
 
-        with patch.dict("sys.modules", {"psutil": BrokenPsutil}), patch(
-            "omlx.settings.os.sysconf", side_effect=fake_sysconf
+        with (
+            patch("omlx.settings.os.sysconf", side_effect=fake_sysconf),
+            patch(
+                "omlx.utils.psutil_compat.get_total_memory",
+                side_effect=AssertionError("compat should not be called"),
+            ),
         ):
             assert get_system_memory() == 123 * 4096
 
-    def test_get_system_memory_falls_back_to_psutil_when_sysconf_fails(self):
-        class FakeVirtualMemory:
-            total = 32 * 1024**3
-
-        class FakePsutil:
-            @staticmethod
-            def virtual_memory():
-                return FakeVirtualMemory()
-
-        with patch.dict("sys.modules", {"psutil": FakePsutil}), patch(
-            "omlx.settings.os.sysconf", side_effect=ValueError("unsupported")
+    def test_get_system_memory_falls_back_to_compat_when_sysconf_fails(self):
+        with (
+            patch("omlx.settings.os.sysconf", side_effect=ValueError("unsupported")),
+            patch(
+                "omlx.utils.psutil_compat.get_total_memory",
+                return_value=32 * 1024**3,
+            ),
         ):
             assert get_system_memory() == 32 * 1024**3
 
@@ -1681,6 +1690,57 @@ class TestHelperFunctions:
         """Test SSD capacity with tilde path expansion."""
         capacity = get_ssd_capacity("~/")
         assert capacity > 0
+
+
+class TestResolveDefaultBasePath:
+    """Tests for resolve_default_base_path()."""
+
+    def test_falls_back_to_default_when_nothing_configured(self, monkeypatch):
+        monkeypatch.delenv("OMLX_BASE_PATH", raising=False)
+        monkeypatch.setattr(
+            "omlx.settings.BASE_PATH_BOOTSTRAP_FILE",
+            Path("/nonexistent/oMLX/base-path"),
+        )
+        assert resolve_default_base_path() == Path.home() / ".omlx"
+
+    def test_uses_bootstrap_file_when_present(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("OMLX_BASE_PATH", raising=False)
+        custom_base = tmp_path / "external-ssd" / "omlx-data"
+        bootstrap_file = tmp_path / "base-path"
+        bootstrap_file.write_text(f"{custom_base}\n", encoding="utf-8")
+        monkeypatch.setattr("omlx.settings.BASE_PATH_BOOTSTRAP_FILE", bootstrap_file)
+
+        assert resolve_default_base_path() == custom_base.resolve()
+
+    def test_env_var_wins_over_bootstrap_file(self, monkeypatch, tmp_path):
+        env_base = tmp_path / "env-base"
+        bootstrap_base = tmp_path / "bootstrap-base"
+        bootstrap_file = tmp_path / "base-path"
+        bootstrap_file.write_text(str(bootstrap_base), encoding="utf-8")
+        monkeypatch.setattr("omlx.settings.BASE_PATH_BOOTSTRAP_FILE", bootstrap_file)
+        monkeypatch.setenv("OMLX_BASE_PATH", str(env_base))
+
+        assert resolve_default_base_path() == env_base.resolve()
+
+    def test_empty_bootstrap_file_falls_back_to_default(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("OMLX_BASE_PATH", raising=False)
+        bootstrap_file = tmp_path / "base-path"
+        bootstrap_file.write_text("   \n", encoding="utf-8")
+        monkeypatch.setattr("omlx.settings.BASE_PATH_BOOTSTRAP_FILE", bootstrap_file)
+
+        assert resolve_default_base_path() == Path.home() / ".omlx"
+
+    def test_global_settings_load_uses_resolver_when_no_base_path_given(
+        self, monkeypatch, tmp_path
+    ):
+        resolved = tmp_path / "resolved-base"
+        monkeypatch.setattr(
+            "omlx.settings.resolve_default_base_path", lambda: resolved
+        )
+
+        settings = GlobalSettings.load()
+
+        assert settings.base_path == resolved
 
 
 class TestSettingsVersionMigration:
@@ -1817,9 +1877,7 @@ class TestSamplingSettings:
         d = unset.to_dict()
         assert d["max_context_window_policy"] is None
         # Setting an explicit value round-trips
-        with_policy = SamplingSettings.from_dict(
-            {"max_context_window_policy": 128_000}
-        )
+        with_policy = SamplingSettings.from_dict({"max_context_window_policy": 128_000})
         assert with_policy.max_context_window_policy == 128_000
         assert with_policy.to_dict()["max_context_window_policy"] == 128_000
 
@@ -1975,9 +2033,7 @@ class TestIntegrationSettings:
 
     def test_from_dict_explicit_null_overrides_default(self):
         """Explicit None for a *_model field must be preserved."""
-        settings = IntegrationSettings.from_dict(
-            {"codex_model": None, "pi_model": "x"}
-        )
+        settings = IntegrationSettings.from_dict({"codex_model": None, "pi_model": "x"})
         assert settings.codex_model is None
         assert settings.pi_model == "x"
 
@@ -1996,7 +2052,7 @@ class TestIntegrationSettings:
     def test_markitdown_defaults(self):
         settings = IntegrationSettings()
         assert settings.markitdown_enabled is True
-        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_expose_model is False
         assert settings.markitdown_max_file_size_mb == 25
         assert settings.markitdown_max_files_per_request == 5
         assert settings.markitdown_pdf_processing_engine == "markitdown"
@@ -2019,7 +2075,7 @@ class TestIntegrationSettings:
     def test_markitdown_from_dict_backward_compat(self):
         settings = IntegrationSettings.from_dict({})
         assert settings.markitdown_enabled is True
-        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_expose_model is False
         assert settings.markitdown_max_file_size_mb == 25
         assert settings.markitdown_max_files_per_request == 5
         assert settings.markitdown_pdf_processing_engine == "markitdown"

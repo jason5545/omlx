@@ -1,5 +1,16 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = [
+    "setuptools>=61.0",
+    "wheel",
+    "cmake>=3.27",
+    # Pin nanobind to match the ABI version MLX 0.31.2 was built with
+    # (MLX pins nanobind v2.12.0 / ABI v19 via FetchContent in its CMakeLists.txt).
+    # A newer nanobind (e.g. 2.13.0 / ABI v20) isolates the `mlx` NB_DOMAIN, so
+    # custom kernel extensions (omlx.custom_kernels.*) reject every mlx.core.array
+    # at the type caster with `incompatible function arguments`.
+    "nanobind==2.12.0",
+    "mlx==0.31.2",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,17 +39,19 @@ classifiers = [
 ]
 
 dependencies = [
-    # Keep MLX pinned; Homebrew installs the stock PyPI wheel for correctness.
+    # Vanilla MLX v0.31.2; optional custom kernels live under
+    # omlx.custom_kernels.* when built for release.
     "mlx==0.31.2",
-    # mlx-lm from commit (39c4019, v0.31.3) - short-prompt think-token fix,
-    # Mellum support, and prior BatchGenerator/cache fixes.
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@39c4019f67402c6448eba0d789b5d834460046dd",
+    # mlx-lm from commit (2ed2231, v0.31.3) - DeepSeek/GLM DSA indexer
+    # RoPE fix, trust_remote_code load gate, transformers 5.7.0 compatibility,
+    # and prior BatchGenerator/cache fixes.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    "transformers>=5.0.0",
+    "transformers>=5.7.0",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -78,14 +91,15 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (c9a6743, main) — includes Gemma4 shared-KV/load fixes,
-    # Qwen quantized KV cache prompt-state fixes, Qwen3-VL visual mask/deepstack
-    # chunked-prefill fixes, Phi 3.5 VL EOS fixes, and speculative prefill fixes.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@c9a6743e5f059be36362d8e4a78171bbf91f18bc",
+    # Cohere Command/Cohere2 output parser for reasoning and tool calls
+    "cohere_melody>=0.9.0",
+    # mlx-vlm from commit 78b96eb. MiniMax M3 support is vendored under
+    # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.9 (5d70fae) - bstnxbt repo. Apple G17 NAX verify,
-    # PR #37 prefix snapshot metrics, CopySpec mode, and Qwen text wrapper fix.
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@5d70faebe3d0af0a3dae76fcc15cc731f7ba46da",
+    # dflash-mlx v0.1.10 (9ca0028) - bstnxbt repo. Apple G17 NAX verify,
+    # prefix snapshot metrics, CopySpec mode, and full-context draft-layer cache checks.
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@9ca002898b48e14c9727dec17299f497e8467870",
     "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 
@@ -95,7 +109,7 @@ grammar = [
     "xgrammar>=0.1.32",
 ]
 mcp = [
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
 ]
 modelscope = [
     "modelscope>=1.10.0",
@@ -127,7 +141,7 @@ paroquant = [
 # git-pinned mlx-lm (v0.31.3). build.py installs mlx-audio + paroquant
 # separately via --no-deps post-resolution.
 bundle = [
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
     "modelscope>=1.10.0",
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
@@ -151,7 +165,7 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
     "venvstacks>=0.7.0",
     # The torch-stub smoke test (tests/test_torch_stub.py) gates
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
@@ -170,7 +184,7 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
     "venvstacks>=0.7.0",
     "xgrammar==0.2.0",
     "apache-tvm-ffi==0.1.11",
@@ -195,12 +209,15 @@ include = ["omlx*"]
 "omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
+"omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
-# mlx-lm is pinned to a git commit; override transitive pins
-# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+# mlx and mlx-lm are git-pinned; override transitive pins
+# (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@39c4019f67402c6448eba0d789b5d834460046dd",
+    "mlx==0.31.2",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5",
 ]
 
 [tool.black]

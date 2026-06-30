@@ -2,7 +2,6 @@
 """Tests for model discovery functionality."""
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -132,6 +131,38 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_qwen2_causal_lm_embedding(self, tmp_path):
+        """Qwen2ForCausalLM with an embedding-named dir is an embedding (#686).
+
+        jina-code-embeddings ships a Qwen2ForCausalLM architecture without
+        lm_head weights, so it must classify as an embedding model rather than
+        a chat LLM.
+        """
+        embed_dir = tmp_path / "jina-code-embeddings-1.5b"
+        embed_dir.mkdir()
+        config = {
+            "model_type": "qwen2",
+            "architectures": ["Qwen2ForCausalLM"],
+        }
+        (embed_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(embed_dir) == "embedding"
+
+    def test_qwen2_causal_lm_without_embedding_name_is_llm(self, tmp_path):
+        """Qwen2ForCausalLM without an embedding-named dir stays an LLM (#686).
+
+        Regression guard: adding Qwen2ForCausalLM to the embedding-arch set must
+        not reclassify ordinary Qwen2/Qwen2.5 chat models, which is gated by the
+        _is_causal_lm_embedding directory-name heuristic.
+        """
+        llm_dir = tmp_path / "Qwen2.5-7B-Instruct"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "qwen2",
+            "architectures": ["Qwen2ForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
     def test_detect_lfm2_text_model_is_llm(self, tmp_path):
         """LFM2 text checkpoints share model_type with non-text variants."""
         llm_dir = tmp_path / "LFM2-1.2B"
@@ -210,6 +241,44 @@ class TestDetectModelType:
             "model_type": "qwen2_5_vl",
             "architectures": ["Qwen2_5_VLForConditionalGeneration"],
             "vision_config": {"hidden_size": 1152},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_diffusion_gemma_as_vlm(self, tmp_path):
+        """DiffusionGemma is served by mlx-vlm even without vision_config."""
+        config = {
+            "model_type": "diffusion_gemma",
+            "canvas_length": 256,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_cohere2_moe_as_vlm_without_vision_config(self, tmp_path):
+        """Cohere2 MoE is text-only but implemented by mlx-vlm."""
+        config = {
+            "model_type": "cohere2_moe",
+            "architectures": ["Cohere2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_minimax_m3_vl_as_vlm(self, tmp_path):
+        """MiniMax M3 VL is served by mlx-vlm."""
+        config = {
+            "model_type": "minimax_m3_vl",
+            "architectures": ["MiniMaxM3VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1280},
+            "text_config": {"hidden_size": 6144},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_minimax_m3_text_as_vlm_native_text(self, tmp_path):
+        """MiniMax M3 text-only checkpoints are implemented by mlx-vlm."""
+        config = {
+            "model_type": "minimax_m3",
+            "architectures": ["MiniMaxM3ForCausalLM"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
