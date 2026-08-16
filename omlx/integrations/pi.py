@@ -42,18 +42,7 @@ class PiIntegration(Integration):
 
     @staticmethod
     def _is_reasoning_model(model: str | None) -> bool:
-        value = (model or "").lower()
-        return bool(
-            re.search(
-                r"(^|[^a-z0-9])("
-                r"thinking|reasoning|"
-                r"o[134]|r1|"
-                r"qwen[-_.]?3|qwen3|"
-                r"deepseek|glm[-_.]?[45]|glm[45]"
-                r")([^a-z0-9]|$)",
-                value,
-            )
-        )
+        return bool(re.search(r"\b(thinking|o1|o3|r1)\b", (model or "").lower()))
 
     def configure(self, ctx: IntegrationContext) -> None:
         def update_models(config: dict) -> None:
@@ -63,10 +52,6 @@ class PiIntegration(Integration):
                 "api": "openai-completions",
                 "apiKey": ctx.auth_token,
                 "authHeader": True,
-                "compat": {
-                    "supportsReasoningEffort": True,
-                    "maxTokensField": "max_tokens",
-                },
             }
             if ctx.model:
                 reasoning = (
@@ -86,15 +71,6 @@ class PiIntegration(Integration):
                         "cacheWrite": 0,
                     },
                 }
-                if reasoning:
-                    # Pi represents "off" by omitting reasoningEffort unless
-                    # a string mapping is present. oMLX accepts "off" and uses
-                    # it to disable template thinking. Pi also hides xhigh
-                    # unless it is explicitly mapped.
-                    model_entry["thinkingLevelMap"] = {
-                        "off": "off",
-                        "xhigh": "xhigh",
-                    }
                 if ctx.context_window:
                     model_entry["contextWindow"] = ctx.context_window
                 if ctx.max_tokens:

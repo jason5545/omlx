@@ -31,8 +31,15 @@ from omlx.api.embedding_utils import (
     truncate_embedding,
 )
 from omlx.engine.embedding import EmbeddingEngine
+from omlx.exceptions import InvalidRequestError
 from omlx.model_discovery import detect_model_type
 from omlx.models.embedding import EmbeddingOutput
+
+IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+    "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
 
 
 class TestEmbeddingModels:
@@ -83,7 +90,7 @@ class TestEmbeddingModels:
         request = EmbeddingRequest(
             items=[
                 EmbeddingInputItem(text="hello"),
-                EmbeddingInputItem(image="https://example.com/image.jpg"),
+                EmbeddingInputItem(image=IMAGE_DATA_URI),
             ],
             model="test-model",
         )
@@ -238,19 +245,19 @@ class TestEmbeddingUtils:
         result = normalize_embedding_items(
             [
                 EmbeddingInputItem(text="hello"),
-                EmbeddingInputItem(image="https://example.com/image.jpg"),
+                EmbeddingInputItem(image=IMAGE_DATA_URI),
                 EmbeddingInputItem(
                     text="hello",
-                    image="https://example.com/image.jpg",
+                    image=IMAGE_DATA_URI,
                 ),
             ]
         )
         assert result == [
             {"text": "hello"},
-            {"image": "https://example.com/image.jpg"},
+            {"image": IMAGE_DATA_URI},
             {
                 "text": "hello",
-                "image": "https://example.com/image.jpg",
+                "image": IMAGE_DATA_URI,
             },
         ]
 
@@ -716,8 +723,8 @@ class TestEmbeddingCompileFallback:
         mock_generate.assert_not_called()
         assert result.embeddings[0] == pytest.approx([0.7, 0.8, 0.9], abs=1e-5)
 
-    def test_custom_processor_receives_image_items_unchanged(self):
-        """Custom processors should receive raw image strings unchanged."""
+    def test_custom_processor_receives_valid_image_items_unchanged(self):
+        """Custom processors should receive validated data URI strings unchanged."""
         import mlx.core as mx
         from omlx.models.embedding import MLXEmbeddingModel
 
@@ -743,10 +750,10 @@ class TestEmbeddingCompileFallback:
 
         inputs = [
             {"text": "hello"},
-            {"image": "https://example.com/image.jpg"},
+            {"image": IMAGE_DATA_URI},
             {
                 "text": "hello",
-                "image": "https://example.com/image.jpg",
+                "image": IMAGE_DATA_URI,
             },
         ]
         result = model.embed(inputs)
@@ -755,6 +762,20 @@ class TestEmbeddingCompileFallback:
             inputs, return_tensors="mlx"
         )
         assert result.embeddings[0] == pytest.approx([0.3, 0.4, 0.5], abs=1e-5)
+
+    def test_custom_processor_rejects_remote_image_url(self):
+        """Image embedding refs reject remote URLs before processor handling."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = MagicMock()
+        model.processor = MagicMock(spec=[])
+
+        with pytest.raises(InvalidRequestError):
+            model.embed([{"image": "https://example.com/image.jpg"}])
 
     def test_custom_processor_counts_image_only_tokens_from_prepared_inputs(self):
         """Image-only custom processor inputs should contribute to usage stats."""
@@ -781,7 +802,7 @@ class TestEmbeddingCompileFallback:
         )
         model.processor = processor
 
-        result = model.embed([{"image": "https://example.com/image.jpg"}])
+        result = model.embed([{"image": IMAGE_DATA_URI}])
 
         assert result.total_tokens == 4
 
@@ -797,7 +818,56 @@ class TestEmbeddingCompileFallback:
         model.processor = MagicMock()
 
         with pytest.raises(ValueError, match="does not support image inputs"):
-            model.embed([{"image": "https://example.com/image.jpg"}])
+            model.embed([{"image": IMAGE_DATA_URI}])
+
+    def test_try_compile_respects_disable_env(self, monkeypatch):
+        """OMLX_EMBEDDING_COMPILE=0 should skip mx.compile for root-cause probes."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        monkeypatch.setenv("OMLX_EMBEDDING_COMPILE", "0")
+        model = MLXEmbeddingModel("test-model")
+        model.model = MagicMock()
+
+        with patch("omlx.models.embedding.mx") as mock_mx:
+            result = model._try_compile()
+
+        assert result is False
+        assert model._compiled_embed is None
+        mock_mx.compile.assert_not_called()
+
+    def test_close_releases_compiled_model_and_processor_resources(self):
+        """close() should drop wrapper references before clearing MLX caches."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model.model = MagicMock()
+        model.processor = MagicMock()
+        model._loaded = True
+        model._hidden_size = 384
+        model._using_native = False
+        model._is_compiled = True
+        model._compiled_embed = MagicMock()
+        model._remap_input_ids_to_inputs = True
+
+        with patch("omlx.models.embedding.gc.collect") as collect, \
+             patch("omlx.models.embedding.mx") as mock_mx, \
+             patch(
+                 "omlx.models.embedding.clear_thread_compile_cache"
+             ) as clear_compile_cache:
+            model.close()
+
+        assert model.model is None
+        assert model.processor is None
+        assert model._compiled_embed is None
+        assert model._loaded is False
+        assert model._hidden_size is None
+        assert model._using_native is False
+        assert model._is_compiled is False
+        assert model._remap_input_ids_to_inputs is False
+        mock_mx.synchronize.assert_called_once()
+        mock_mx.clear_cache.assert_called_once()
+        clear_compile_cache.assert_called_once()
+        assert collect.call_count == 2
 
 
 class TestEmbeddingEngine:
@@ -822,6 +892,8 @@ class TestEmbeddingEngine:
             mock_model.load.assert_called_once()
 
             asyncio.run(engine.stop())
+            mock_model.close.assert_called_once()
+            assert engine._model is None
 
     def test_engine_embed(self):
         """Test embedding generation through engine."""
@@ -856,6 +928,44 @@ class TestEmbeddingEngine:
 
         with pytest.raises(RuntimeError, match="Engine not started"):
             asyncio.run(engine.embed(["Hello"]))
+
+    def test_engine_embed_groups_by_length_and_restores_caller_order(self):
+        """A batch pads to its longest member, so inputs are embedded length-sorted.
+
+        The caller's order must survive that: every embedding comes back on the
+        input it was produced from, or a document silently receives its
+        neighbour's vector.
+        """
+        import asyncio
+
+        from omlx.engine.embedding import EmbeddingEngine
+        from omlx.models.embedding import EmbeddingOutput
+
+        texts = ["cccc", "a", "eeeeeeee", "bb", "dddddd", "a", "", "fffffffffff"]
+        seen_batches = []
+
+        def fake_embed(inputs, **kwargs):
+            seen_batches.append(list(inputs))
+            # the vector identifies the text it was produced from
+            return EmbeddingOutput(
+                embeddings=[[float(len(t))] for t in inputs],
+                total_tokens=sum(len(t) for t in inputs),
+                dimensions=1,
+            )
+
+        engine = EmbeddingEngine("test-model")
+        mock_model = MagicMock()
+        mock_model.embed.side_effect = fake_embed
+        engine._model = mock_model
+        engine._batch_size = 3
+
+        output = asyncio.run(engine.embed(texts))
+
+        assert [v[0] for v in output.embeddings] == [float(len(t)) for t in texts]
+
+        embedded = [t for batch in seen_batches for t in batch]
+        assert sorted(embedded, key=len) == embedded
+        assert sorted(embedded) == sorted(texts)
 
     def test_engine_get_stats(self):
         """Test engine statistics."""

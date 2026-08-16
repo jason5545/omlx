@@ -36,6 +36,7 @@ in ``maybe_apply_pre_load_patches`` which satisfies that requirement.
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Any
 
 import mlx.core as mx
@@ -144,73 +145,10 @@ def _register_mtp_classes_for_vlm(q35moe_lang: Any) -> None:
             else:
                 self.mlp = MoeMLP(args.hidden_size, args.intermediate_size)
 
-        def __call__(
-            self,
-            x,
-            mask=None,
-            cache=None,
-            position_ids=None,
-            position_offset=None,
-        ):
-            if position_offset is not None:
-                r = self._attn_with_offset(
-                    self.input_layernorm(x), mask, cache, int(position_offset)
-                )
-            else:
-                r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+        def __call__(self, x, mask=None, cache=None, position_ids=None):
+            r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
             h = x + r
             return h + self.mlp(self.post_attention_layernorm(h))
-
-        def _attn_with_offset(self, x, mask, cache, offset):
-            from mlx_vlm.models.base import scaled_dot_product_attention
-
-            attn = self.self_attn
-            B, L, _ = x.shape
-
-            q_proj_output = attn.q_proj(x)
-            queries, gate = mx.split(
-                q_proj_output.reshape(B, L, attn.num_attention_heads, -1),
-                2,
-                axis=-1,
-            )
-            gate = gate.reshape(B, L, -1)
-            keys, values = attn.k_proj(x), attn.v_proj(x)
-            queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
-            keys = attn.k_norm(
-                keys.reshape(B, L, attn.num_key_value_heads, -1)
-            ).transpose(0, 2, 1, 3)
-            values = values.reshape(B, L, attn.num_key_value_heads, -1).transpose(
-                0, 2, 1, 3
-            )
-
-            inv_freq = attn.rotary_emb.inv_freq
-            positions = mx.arange(offset, offset + L).astype(mx.float32)
-            freqs = positions[:, None] * inv_freq[None, :].astype(mx.float32)
-            emb = mx.concatenate([freqs, freqs], axis=-1)
-            cos = mx.cos(emb)[None, None, :, :]
-            sin = mx.sin(emb)[None, None, :, :]
-
-            rotary_dim = cos.shape[-1]
-            q_rot, q_pass = queries[..., :rotary_dim], queries[..., rotary_dim:]
-            k_rot, k_pass = keys[..., :rotary_dim], keys[..., rotary_dim:]
-            dtype = queries.dtype
-
-            def _rotate_half(v):
-                half = v.shape[-1] // 2
-                return mx.concatenate([-v[..., half:], v[..., :half]], axis=-1)
-
-            q_rot = ((q_rot * cos) + (_rotate_half(q_rot) * sin)).astype(dtype)
-            k_rot = ((k_rot * cos) + (_rotate_half(k_rot) * sin)).astype(dtype)
-            queries = mx.concatenate([q_rot, q_pass], axis=-1)
-            keys = mx.concatenate([k_rot, k_pass], axis=-1)
-
-            if cache is not None:
-                keys, values = cache.update_and_fetch(keys, values)
-            out = scaled_dot_product_attention(
-                queries, keys, values, cache=cache, scale=attn.scale, mask=mask
-            )
-            out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
-            return attn.o_proj(out * mx.sigmoid(gate))
 
     class MTPModule(nn.Module):
         """Multi-Token Prediction head (mlx-lm PR 990) for VLM Qwen3.5-MoE.
@@ -233,15 +171,7 @@ def _register_mtp_classes_for_vlm(q35moe_lang: Any) -> None:
             ]
             self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        def __call__(
-            self,
-            hidden_states,
-            next_token_ids,
-            embed_tokens,
-            cache=None,
-            position_offset=None,
-            return_hidden=False,
-        ):
+        def __call__(self, hidden_states, next_token_ids, embed_tokens, cache=None):
             embeds = embed_tokens(next_token_ids)
             e = self.pre_fc_norm_embedding(embeds)
             h = self.pre_fc_norm_hidden(hidden_states)
@@ -252,12 +182,9 @@ def _register_mtp_classes_for_vlm(q35moe_lang: Any) -> None:
 
             mask = create_attention_mask(fused, cache[0] if cache else None)
             for layer, c in zip(self.layers, cache):
-                fused = layer(fused, mask, c, position_offset=position_offset)
+                fused = layer(fused, mask, c)
 
-            normed = self.norm(fused)
-            if return_hidden:
-                return normed, fused
-            return normed
+            return self.norm(fused)
 
     q35moe_lang.MTPDecoderLayer = MTPDecoderLayer
     q35moe_lang.MTPModule = MTPModule
@@ -301,6 +228,18 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
         )
         if n_mtp > 0 and attach_enabled:
             self.mtp = q35moe_lang.MTPModule(args)
+        if self._omlx_mtp_decode_enabled:
+            # Depth-k chained drafting works on this path: mtp_forward
+            # supports return_hidden below, and rollback uses mlx-vlm's
+            # stock rollback_speculative_cache (native partial accepts).
+            from ..mlx_lm_mtp import get_mtp_depth
+
+            self._omlx_mtp_chain = True
+            self._omlx_mtp_depth = get_mtp_depth()
+            # Qwen3_5MoeModel inherits the dense Qwen3_5Model.__call__, so
+            # the prompt-priming capture wrap installed by the dense runtime
+            # already runs here — it only needs the host backref to engage.
+            self.model._omlx_mtp_prime_host = weakref.ref(self)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         """Backbone forward with optional MTP-cycle return shape.
@@ -351,25 +290,32 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
             shared_kv_states={} if return_shared_kv else None,
         )
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache, **kwargs):
-        result = self.mtp(
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        """MTP-head forward (see mlx_lm_mtp.qwen35_model for the depth-k
+        chain contract: return_hidden yields the head's post-norm hidden for
+        chaining; logits_keep limits the lm_head to the last N positions)."""
+        mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
             self.model.embed_tokens,
             mtp_cache,
-            **kwargs,
         )
-        if isinstance(result, tuple) and len(result) == 2:
-            mtp_out, mtp_hidden = result
-        else:
-            mtp_out = result
-            mtp_hidden = None
+        logits_source = mtp_out
+        if logits_keep and logits_source.shape[1] > logits_keep:
+            logits_source = logits_source[:, -logits_keep:, :]
         if self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(mtp_out)
+            logits = self.model.embed_tokens.as_linear(logits_source)
         else:
-            logits = self.lm_head(mtp_out)
-        if mtp_hidden is not None:
-            return logits, mtp_hidden
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, mtp_out
         return logits
 
     def make_mtp_cache(self):
@@ -417,9 +363,27 @@ def _patch_vlm_model_adapter() -> None:
     def mtp(self):
         return getattr(self._language_model, "mtp", None)
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache, **kwargs):
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        # Forward the depth-k chain kwargs only when set: chain drafting is
+        # only enabled on language models whose runtime patch supports them
+        # (dense qwen3_5), so a stock/MoE mtp_forward never sees them.
+        if return_hidden or logits_keep:
+            return self._language_model.mtp_forward(
+                hidden_states,
+                next_token_ids,
+                mtp_cache,
+                return_hidden=return_hidden,
+                logits_keep=logits_keep,
+            )
         return self._language_model.mtp_forward(
-            hidden_states, next_token_ids, mtp_cache, **kwargs
+            hidden_states, next_token_ids, mtp_cache
         )
 
     def make_mtp_cache(self):
@@ -480,9 +444,17 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        # Backbone MoE: convert fused gate_up_proj → switch_mlp.{gate,up,down}.
+        num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
+
+        # Backbone MoE: fused gate_up_proj (Qwen3.6) or per-expert tensors
+        # (Ornith / raw Qwen3.5). Unfuse the fused form; fall back to
+        # per-expert stacking when fused keys are absent.
         for l in range(self.config.text_config.num_hidden_layers):
-            _unfuse_layer_experts(weights, f"model.language_model.layers.{l}.mlp")
+            prefix = f"model.language_model.layers.{l}.mlp"
+            if f"{prefix}.switch_mlp.gate_proj.weight" in weights:
+                continue  # already in switch_mlp form
+            if not _unfuse_layer_experts(weights, prefix):
+                _stack_per_expert(weights, prefix, num_experts)
 
         # MTP MoE layers: discover via weight keys.
         # Two possible prefixes:
@@ -498,7 +470,6 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
                 }
             )
 
-        num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
         for prefix_root in ("mtp.layers.", "language_model.mtp.layers."):
             for layer_idx in _discover_mtp_layers(prefix_root):
                 prefix = f"{prefix_root}{layer_idx}.mlp"

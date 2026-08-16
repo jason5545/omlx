@@ -174,6 +174,7 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
+    distributed_inference_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -193,6 +194,10 @@ class ServerSettings:
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
+            distributed_inference_enabled=data.get(
+                "distributed_inference_enabled",
+                False,
+            ),
         )
 
 
@@ -203,6 +208,9 @@ class ModelSettings:
     model_dirs: list[str] = field(default_factory=list)  # [] means ~/.omlx/models
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
     model_fallback: bool = False  # Use default model when requested model not found
+    hide_helper_models: bool = (
+        False  # Hide dFlash/Assistant/Draft helper models from /v1/models
+    )
 
     def get_model_dirs(self, base_path: Path) -> list[Path]:
         """
@@ -238,6 +246,7 @@ class ModelSettings:
             "model_dirs": self.model_dirs,
             "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
             "model_fallback": self.model_fallback,
+            "hide_helper_models": self.hide_helper_models,
         }
 
     @classmethod
@@ -251,6 +260,7 @@ class ModelSettings:
             model_dirs=model_dirs,
             model_dir=data.get("model_dir"),
             model_fallback=data.get("model_fallback", False),
+            hide_helper_models=data.get("hide_helper_models", False),
         )
 
 
@@ -263,6 +273,17 @@ class SchedulerSettings:
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
     chunked_prefill: bool = False
+    # What the prefill memory guard optimizes under pressure:
+    #   "context" (default) — shrink prefill steps down to the floor so the
+    #     largest possible prompt still completes (slower near the ceiling).
+    #   "speed" — never shrink; keep full-size steps and only admit prompts
+    #     that fit at full speed (smaller effective context limit).
+    prefill_priority: str = "context"
+    # When True (default), prefill yields GPU time to running decodes:
+    # prompts are force-chunked under contention, chunks are capped while
+    # any engine decodes, and each chunk accrues a decode time debt repaid
+    # before the next chunk runs. Off restores the pre-fairness behavior.
+    decode_fairness: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -280,10 +301,15 @@ class SchedulerSettings:
         if value is None:
             value = 8
         embedding_batch_size = data.get("embedding_batch_size", 32)
+        prefill_priority = data.get("prefill_priority", "context")
+        if prefill_priority not in ("context", "speed"):
+            prefill_priority = "context"
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
+            prefill_priority=prefill_priority,
+            decode_fairness=bool(data.get("decode_fairness", True)),
         )
 
 
@@ -297,6 +323,47 @@ class CacheSettings:
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
+    # None selects the policy automatically: use an SSD sidecar when the SSD
+    # cache is enabled, otherwise keep GDN state embedded with the main cache.
+    # True/False preserve the legacy explicit split/embedded choices.
+    gdn_ssd_split_enabled: bool | None = None
+    gdn_ssd_pending_max_size: str = "512MB"
+    gdn_sidecar_state_dtype: str = "rht_int16"
+
+    def get_gdn_snapshot_storage(self) -> str:
+        """Return the user-facing GDN storage policy."""
+        if self.gdn_ssd_split_enabled is None:
+            return "auto"
+        if self.gdn_ssd_split_enabled is True:
+            return "ssd_sidecar"
+        if self.gdn_ssd_split_enabled is False:
+            return "embedded"
+        return str(self.gdn_ssd_split_enabled)
+
+    def set_gdn_snapshot_storage(self, mode: str) -> None:
+        """Set auto/ssd_sidecar/embedded while retaining legacy plumbing."""
+        normalized = str(mode).strip().lower()
+        if normalized == "auto":
+            self.gdn_ssd_split_enabled = None
+        elif normalized in {"ssd", "ssd_sidecar"}:
+            self.gdn_ssd_split_enabled = True
+        elif normalized in {"hot", "embedded"}:
+            self.gdn_ssd_split_enabled = False
+        else:
+            raise ValueError(
+                "gdn_snapshot_storage must be one of: "
+                "auto, ssd_sidecar, embedded"
+            )
+
+    def get_gdn_ssd_split_enabled(self) -> bool:
+        """Resolve the effective low-level SSD-sidecar switch."""
+        if self.gdn_ssd_split_enabled is True:
+            return True
+        if self.gdn_ssd_split_enabled is False:
+            return False
+        if self.gdn_ssd_split_enabled is not None:
+            return False
+        return self.enabled and not self.hot_cache_only
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
         """
@@ -336,6 +403,12 @@ class CacheSettings:
         return {
             "enabled": self.enabled,
             "hot_cache_only": self.hot_cache_only,
+            # Keep the legacy effective bool for older readers while the mode
+            # key lets current readers retain the auto policy across reloads.
+            "gdn_ssd_split_enabled": self.get_gdn_ssd_split_enabled(),
+            "gdn_snapshot_storage": self.get_gdn_snapshot_storage(),
+            "gdn_ssd_pending_max_size": self.gdn_ssd_pending_max_size,
+            "gdn_sidecar_state_dtype": self.gdn_sidecar_state_dtype,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -349,9 +422,43 @@ class CacheSettings:
         if isinstance(hot_cache_max_size, str) and hot_cache_max_size.lower() == "auto":
             hot_cache_max_size = "0"
 
+        storage_mode = data.get("gdn_snapshot_storage")
+        if storage_mode is None:
+            legacy_split = data.get("gdn_ssd_split_enabled")
+        else:
+            normalized_mode = str(storage_mode).strip().lower()
+            if normalized_mode == "auto":
+                legacy_split = None
+            elif normalized_mode in {"ssd", "ssd_sidecar"}:
+                legacy_split = True
+            elif normalized_mode in {"hot", "embedded"}:
+                legacy_split = False
+            else:
+                # Preserve the invalid value for validate() instead of making
+                # settings-file loading raise before a useful error is shown.
+                legacy_split = normalized_mode
+            legacy_value = data.get("gdn_ssd_split_enabled")
+            if (
+                normalized_mode != "auto"
+                and "gdn_ssd_split_enabled" in data
+                and legacy_value is not legacy_split
+            ):
+                legacy_split = "conflict"
+
+        legacy_settings = "gdn_ssd_split_enabled" in data and storage_mode is None
         return cls(
             enabled=data.get("enabled", True),
             hot_cache_only=data.get("hot_cache_only", False),
+            gdn_ssd_split_enabled=legacy_split,
+            gdn_ssd_pending_max_size=data.get(
+                "gdn_ssd_pending_max_size", "512MB"
+            ),
+            gdn_sidecar_state_dtype=str(
+                data.get(
+                    "gdn_sidecar_state_dtype",
+                    "fp32" if legacy_settings else "rht_int16",
+                )
+            ).lower(),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
@@ -693,8 +800,6 @@ class UISettings:
 class ClaudeCodeSettings:
     """Claude Code integration settings."""
 
-    context_scaling_enabled: bool = False
-    target_context_size: int = 200000  # Claude Code default (200k)
     # Mode: "cloud" = native claude.ai subscription, "local" = route through omlx.
     # Default is "cloud" so upgrades don't silently route traffic to omlx.
     mode: str = "cloud"
@@ -705,8 +810,6 @@ class ClaudeCodeSettings:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "context_scaling_enabled": self.context_scaling_enabled,
-            "target_context_size": self.target_context_size,
             "mode": self.mode,
             "opus_model": self.opus_model,
             "sonnet_model": self.sonnet_model,
@@ -717,8 +820,6 @@ class ClaudeCodeSettings:
     def from_dict(cls, data: dict[str, Any]) -> ClaudeCodeSettings:
         """Create from dictionary."""
         return cls(
-            context_scaling_enabled=data.get("context_scaling_enabled", False),
-            target_context_size=data.get("target_context_size", 200000),
             mode=data.get("mode", "cloud"),
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),
@@ -742,6 +843,15 @@ class IntegrationSettings:
     markitdown_max_file_size_mb: int = 25
     markitdown_max_files_per_request: int = 5
     markitdown_pdf_processing_engine: str = "markitdown"
+    # "ddgs" (all engines) | "ddgs_custom" | "duckduckgo" | "brave" | "searxng"
+    web_search_provider: str = "ddgs"
+    web_search_brave_api_key: str = ""
+    web_search_searxng_url: str = ""
+    web_search_ddgs_backends: str = ""  # comma-separated, used by ddgs_custom
+    web_search_max_results: int = 3  # 1..10
+    web_search_content_mode: str = "snippet"  # "snippet" | "full"
+    web_search_content_truncate: bool = True
+    web_search_content_max_chars: int = 20000
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -758,6 +868,14 @@ class IntegrationSettings:
             "markitdown_max_file_size_mb": self.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": self.markitdown_max_files_per_request,
             "markitdown_pdf_processing_engine": self.markitdown_pdf_processing_engine,
+            "web_search_provider": self.web_search_provider,
+            "web_search_brave_api_key": self.web_search_brave_api_key,
+            "web_search_searxng_url": self.web_search_searxng_url,
+            "web_search_ddgs_backends": self.web_search_ddgs_backends,
+            "web_search_max_results": self.web_search_max_results,
+            "web_search_content_mode": self.web_search_content_mode,
+            "web_search_content_truncate": self.web_search_content_truncate,
+            "web_search_content_max_chars": self.web_search_content_max_chars,
         }
 
     @classmethod
@@ -779,6 +897,18 @@ class IntegrationSettings:
             ),
             markitdown_pdf_processing_engine=data.get(
                 "markitdown_pdf_processing_engine", "markitdown"
+            ),
+            web_search_provider=data.get("web_search_provider", "ddgs"),
+            web_search_brave_api_key=data.get("web_search_brave_api_key", ""),
+            web_search_searxng_url=data.get("web_search_searxng_url", ""),
+            web_search_ddgs_backends=data.get("web_search_ddgs_backends", ""),
+            web_search_max_results=data.get("web_search_max_results", 3),
+            web_search_content_mode=data.get("web_search_content_mode", "snippet"),
+            web_search_content_truncate=data.get(
+                "web_search_content_truncate", True
+            ),
+            web_search_content_max_chars=data.get(
+                "web_search_content_max_chars", 20000
             ),
         )
 
@@ -967,6 +1097,21 @@ class GlobalSettings:
             self.cache.ssd_cache_max_size = ssd_cache_max
         if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
             self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
+        if gdn_storage := os.getenv("OMLX_GDN_SNAPSHOT_STORAGE"):
+            try:
+                self.cache.set_gdn_snapshot_storage(gdn_storage)
+            except ValueError as exc:
+                logger.warning(str(exc))
+        elif gdn_ssd_split := os.getenv("OMLX_GDN_SSD_SPLIT_ENABLED"):
+            self.cache.gdn_ssd_split_enabled = gdn_ssd_split.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+        if gdn_ssd_pending_max := os.getenv("OMLX_GDN_SSD_PENDING_MAX_SIZE"):
+            self.cache.gdn_ssd_pending_max_size = gdn_ssd_pending_max
+        if gdn_sidecar_dtype := os.getenv("OMLX_GDN_SIDECAR_STATE_DTYPE"):
+            self.cache.gdn_sidecar_state_dtype = gdn_sidecar_dtype.lower()
         if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
             try:
                 self.cache.initial_cache_blocks = int(initial_blocks)
@@ -1033,7 +1178,7 @@ class GlobalSettings:
                 markitdown_pdf_processing_engine.strip() or "markitdown"
             )
 
-    def _apply_cli_overrides(self, args: Any) -> None:
+    def _apply_cli_overrides(self, args: Any, *, include_api_key: bool = True) -> None:
         """
         Apply CLI argument overrides.
 
@@ -1067,28 +1212,54 @@ class GlobalSettings:
         ):
             self.scheduler.embedding_batch_size = args.embedding_batch_size
 
-        # Memory guard settings
+        # Memory guard settings. Naming a tier or a ceiling on the command
+        # line also turns the guard on. With a saved
+        # ``prefill_memory_guard: false`` these flags used to be a silent
+        # no-op — the enforcer reports a ceiling of 0 with the guard off, so
+        # the tier the user asked for governed nothing.
         if hasattr(args, "memory_guard") and args.memory_guard is not None:
-            self.memory.memory_guard_tier = args.memory_guard
+            if args.memory_guard == "off":
+                self.memory.prefill_memory_guard = False
+            else:
+                self.memory.memory_guard_tier = args.memory_guard
+                self.memory.prefill_memory_guard = True
         if hasattr(args, "memory_guard_gb") and args.memory_guard_gb is not None:
             self.memory.memory_guard_tier = "custom"
             self.memory.memory_guard_custom_ceiling_gb = float(args.memory_guard_gb)
+            self.memory.prefill_memory_guard = True
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
             self.cache.enabled = args.cache_enabled
-        if hasattr(args, "ssd_cache_dir") and args.ssd_cache_dir is not None:
-            self.cache.ssd_cache_dir = args.ssd_cache_dir
-        if hasattr(args, "ssd_cache_max_size") and args.ssd_cache_max_size is not None:
-            self.cache.ssd_cache_max_size = args.ssd_cache_max_size
+
+        # ``paged_ssd_cache_*`` are the public CLI names. Keep the older
+        # internal names as fallbacks for callers that still build a namespace
+        # directly.
+        paged_cache_dir = getattr(args, "paged_ssd_cache_dir", None)
+        if paged_cache_dir is not None:
+            self.cache.ssd_cache_dir = paged_cache_dir
+            self.cache.enabled = True
+        elif (cache_dir := getattr(args, "ssd_cache_dir", None)) is not None:
+            self.cache.ssd_cache_dir = cache_dir
+
+        cache_max_size = getattr(args, "paged_ssd_cache_max_size", None)
+        if cache_max_size is None:
+            cache_max_size = getattr(args, "ssd_cache_max_size", None)
+        if cache_max_size is not None:
+            self.cache.ssd_cache_max_size = cache_max_size
+
+        if hasattr(args, "hot_cache_max_size") and args.hot_cache_max_size is not None:
+            self.cache.hot_cache_max_size = args.hot_cache_max_size
         if (
             hasattr(args, "initial_cache_blocks")
             and args.initial_cache_blocks is not None
         ):
             self.cache.initial_cache_blocks = args.initial_cache_blocks
+        if getattr(args, "no_cache", False):
+            self.cache.enabled = False
 
         # Auth settings
-        if hasattr(args, "api_key") and args.api_key is not None:
+        if include_api_key and hasattr(args, "api_key") and args.api_key is not None:
             self.auth.api_key = args.api_key
 
         # MCP settings
@@ -1180,12 +1351,27 @@ class GlobalSettings:
         }
 
         try:
-            with open(settings_file, "w", encoding="utf-8") as f:
+            if os.name == "posix" and settings_file.exists():
+                settings_file.chmod(0o600)
+            with os.fdopen(
+                os.open(settings_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                "w",
+                encoding="utf-8",
+            ) as f:
                 json.dump(data, f, indent=2)
             logger.info(f"Saved settings to {settings_file}")
         except OSError as e:
             logger.error(f"Failed to save settings to {settings_file}: {e}")
             raise
+
+    def save_cli_overrides(self, args: Any) -> None:
+        """Persist explicit non-secret CLI configuration without freezing env state."""
+        persisted = type(self)(base_path=self.base_path)
+        settings_file = self.base_path / "settings.json"
+        if settings_file.exists():
+            persisted._load_from_file(settings_file)
+        persisted._apply_cli_overrides(args, include_api_key=False)
+        persisted.save()
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""
@@ -1299,6 +1485,39 @@ class GlobalSettings:
             )
 
         # Cache validation
+        if self.cache.gdn_ssd_split_enabled is True and self.cache.hot_cache_only:
+            errors.append(
+                "gdn_ssd_split_enabled cannot be used with hot_cache_only"
+            )
+
+        try:
+            gdn_pending_size = parse_size(self.cache.gdn_ssd_pending_max_size)
+            if gdn_pending_size <= 0:
+                errors.append("gdn_ssd_pending_max_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid gdn_ssd_pending_max_size: {e}")
+
+        if self.cache.gdn_sidecar_state_dtype not in {
+            "fp32",
+            "bf16",
+            "int8",
+            "rht_int8",
+            "rht_int16",
+        }:
+            errors.append(
+                "gdn_sidecar_state_dtype must be one of: "
+                "fp32, bf16, int8, rht_int8, rht_int16"
+            )
+        if not (
+            self.cache.gdn_ssd_split_enabled is None
+            or self.cache.gdn_ssd_split_enabled is True
+            or self.cache.gdn_ssd_split_enabled is False
+        ):
+            errors.append(
+                "gdn_snapshot_storage must be one of: "
+                "auto, ssd_sidecar, embedded"
+            )
+
         if self.cache.ssd_cache_max_size.lower() != "auto":
             try:
                 size = parse_size(self.cache.ssd_cache_max_size)
@@ -1354,11 +1573,6 @@ class GlobalSettings:
             )
 
         # Claude Code validation
-        if self.claude_code.target_context_size <= 0:
-            errors.append(
-                f"Invalid target_context_size: "
-                f"{self.claude_code.target_context_size} (must be > 0)"
-            )
         valid_modes = {"local", "cloud"}
         if self.claude_code.mode not in valid_modes:
             errors.append(
@@ -1431,6 +1645,8 @@ class GlobalSettings:
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
+            prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
+            decode_fairness=self.scheduler.decode_fairness,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,
@@ -1438,6 +1654,11 @@ class GlobalSettings:
                 self.base_path
             ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
+            gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
+            gdn_ssd_pending_max_bytes=parse_size(
+                self.cache.gdn_ssd_pending_max_size
+            ),
+            gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
         )
 
     def to_dict(self) -> dict[str, Any]:

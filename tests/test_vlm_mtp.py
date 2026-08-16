@@ -18,6 +18,41 @@ import pytest
 from omlx.speculative import vlm_mtp
 
 
+def test_qwen38_block_fp8_dequantization():
+    from omlx.patches.mlx_vlm_mtp.qwen38_fp8 import dequantize_fp8_weights
+
+    weight_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+    weights = {
+        weight_key: mx.to_fp8(mx.ones((130, 129), dtype=mx.float32)),
+        f"{weight_key}_scale_inv": mx.array(
+            [[0.5, 1.0], [2.0, 4.0]], dtype=mx.bfloat16
+        ),
+    }
+
+    out = dequantize_fp8_weights(weights)
+    expected = mx.ones((130, 129), dtype=mx.bfloat16)
+    expected[:128, :128] *= 0.5
+    expected[:128, 128:] *= 1.0
+    expected[128:, :128] *= 2.0
+    expected[128:, 128:] *= 4.0
+
+    assert not any(key.endswith("weight_scale_inv") for key in out)
+    assert out[weight_key].dtype == mx.bfloat16
+    assert mx.array_equal(out[weight_key], expected).item()
+
+
+def test_qwen38_block_fp8_rejects_invalid_scale_grid():
+    from omlx.patches.mlx_vlm_mtp.qwen38_fp8 import dequantize_fp8_weights
+
+    with pytest.raises(ValueError, match="Invalid FP8 scale shape"):
+        dequantize_fp8_weights(
+            {
+                "proj.weight": mx.to_fp8(mx.ones((129, 129))),
+                "proj.weight_scale_inv": mx.ones((1, 2)),
+            }
+        )
+
+
 def _fake_drafter_model(model_type: str = "gemma4_assistant") -> MagicMock:
     """Build a stand-in for Gemma4AssistantDraftModel that satisfies the
     minimum API used by VLMMTPDrafter."""
@@ -194,6 +229,102 @@ def test_run_vlm_mtp_decode_single_scalar_array_unwraps_to_int():
     m_single.assert_called_once()
     m_batch.assert_not_called()
     assert m_single.call_args.kwargs["first_bonus"] == 42
+
+
+class TestMTPRoundClearDrainsGPUWork:
+    """The per-token cache clear must drain the round's GPU work first.
+
+    mlx-vlm submits the MTP verify hidden state and the drafter's state
+    arrays with mx.async_eval, so mx.clear_cache() at the yield boundary can
+    release Metal buffers an in-flight command buffer still references (#300).
+    The drain has to name mlx-vlm's own thread-local stream: that is the
+    stream ``_mtp_rounds`` dispatches the verify/rollback forwards on
+    (``with mx.stream(generation_stream)``), and it is a different object from
+    mlx-lm's generation_stream. The helper's second, no-argument
+    mx.synchronize() covers the engine stream the scheduler advances the
+    generator under.
+    """
+
+    @staticmethod
+    def _recorder() -> tuple[list, object]:
+        streams: list = []
+        return streams, patch.object(
+            vlm_mtp,
+            "_sync_and_clear_cache",
+            side_effect=lambda stream=None: streams.append(stream),
+        )
+
+    def _assert_vlm_stream(self, streams: list, expected_calls: int) -> None:
+        from mlx_lm.generate import generation_stream as mlx_lm_stream
+
+        assert len(streams) == expected_calls, (
+            f"expected {expected_calls} synchronized clear(s), got {streams!r}"
+        )
+        assert all(s is vlm_mtp._vlm_generation_stream for s in streams), (
+            "MTP round cleared the Metal buffer cache without draining "
+            f"mlx-vlm's stream: {streams!r}"
+        )
+        assert vlm_mtp._vlm_generation_stream is not mlx_lm_stream
+
+    def test_single_round_loop_drains_before_every_token_yield(self):
+        """Each token yielded by ``_mtp_rounds`` is preceded by a synchronized
+        clear; the wrapper's own first_bonus yield needs none (no round has
+        run yet)."""
+        drafter = vlm_mtp.VLMMTPDrafter(
+            _fake_drafter_model("gemma4_assistant"), "mtp", "/p"
+        )
+        streams, recording = self._recorder()
+
+        with (
+            recording,
+            patch.object(
+                vlm_mtp, "_mtp_rounds", return_value=iter([(11, None), (22, None)])
+            ),
+            patch.object(vlm_mtp, "_buffer_mtp_target_cache"),
+        ):
+            gen = vlm_mtp.run_vlm_mtp_decode(
+                target_language_model=MagicMock(),
+                drafter=drafter,
+                prompt_cache=[],
+                hidden=mx.zeros((1, 1, 8)),
+                shared_kv_states={},
+                first_bonus=7,
+                max_tokens=4,
+                sampler=MagicMock(),
+            )
+            assert next(gen) == 7
+            assert streams == [], "first_bonus yield must not clear the cache"
+            assert next(gen) == 11
+            self._assert_vlm_stream(streams, 1)
+            assert next(gen) == 22
+            self._assert_vlm_stream(streams, 2)
+
+    def test_batch_round_loop_drains_before_every_round_yield(self):
+        drafter = vlm_mtp.VLMMTPDrafter(
+            _fake_drafter_model("gemma4_assistant"), "mtp", "/p"
+        )
+        streams, recording = self._recorder()
+        yielded = [([1, None, 3], None), ([None, None, None], None)]
+
+        with (
+            recording,
+            patch.object(vlm_mtp, "_mtp_rounds_batch", return_value=iter(yielded)),
+        ):
+            out = list(
+                vlm_mtp.run_vlm_mtp_decode(
+                    target_language_model=MagicMock(),
+                    drafter=drafter,
+                    prompt_cache=[],
+                    hidden=mx.zeros((3, 1, 8)),
+                    shared_kv_states={},
+                    first_bonus=mx.array([1, 2, 3]),
+                    max_tokens=4,
+                    sampler=MagicMock(),
+                )
+            )
+
+        assert out == [[1, 2, 3], [1, None, 3], [None, None, None]]
+        self._assert_vlm_stream(streams, 2)
 
 
 @pytest.mark.parametrize(
@@ -437,6 +568,132 @@ def test_moe_vlm_runtime_sanitize_unfuses_gate_up_by_midpoint():
     up_key = "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
     assert bool(mx.all(result[gate_key] == gate_up[:, :3, :]).item())
     assert bool(mx.all(result[up_key] == gate_up[:, 3:, :]).item())
+
+
+def _per_expert_vlm_self(num_experts=2, num_hidden_layers=1):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=num_hidden_layers,
+                num_experts=num_experts,
+            )
+        )
+    )
+
+
+def test_moe_vlm_sanitize_stacks_per_expert_backbone(monkeypatch):
+    """Ornith / raw Qwen3.5 ship backbone MoE layers as per-expert tensors.
+    The model-level sanitize must stack them into switch_mlp form."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_model
+    from mlx_vlm.models.qwen3_5_moe import qwen3_5_moe
+
+    monkeypatch.setattr(qwen35_moe_vlm_model, "_APPLIED", False)
+    if hasattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched"):
+        monkeypatch.delattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched")
+    assert qwen35_moe_vlm_model.apply() is True
+
+    pfx_in = "model.language_model.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        weights[f"{pfx_in}.experts.{e}.gate_proj.weight"] = mx.zeros((8, 4))
+        weights[f"{pfx_in}.experts.{e}.up_proj.weight"] = mx.zeros((8, 4))
+        weights[f"{pfx_in}.experts.{e}.down_proj.weight"] = mx.zeros((4, 8))
+
+    result = qwen3_5_moe.Model.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.model.layers.0.mlp"
+    assert result[f"{pfx}.switch_mlp.gate_proj.weight"].shape == (2, 8, 4)
+    assert result[f"{pfx}.switch_mlp.down_proj.weight"].shape == (2, 4, 8)
+    assert not any(f"{pfx}.experts." in k for k in result)
+
+
+def test_moe_vlm_sanitize_stacks_per_expert_backbone_quantized(monkeypatch):
+    """A per-expert *quantized* backbone carries .scales/.biases. The
+    model-level sanitize must stack all three, leaving no orphan keys."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_model
+    from mlx_vlm.models.qwen3_5_moe import qwen3_5_moe
+
+    monkeypatch.setattr(qwen35_moe_vlm_model, "_APPLIED", False)
+    if hasattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched"):
+        monkeypatch.delattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched")
+    assert qwen35_moe_vlm_model.apply() is True
+
+    pfx_in = "model.language_model.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            weights[f"{pfx_in}.experts.{e}.{proj}.weight"] = mx.zeros((8, 4))
+            weights[f"{pfx_in}.experts.{e}.{proj}.scales"] = mx.zeros((8, 1))
+            weights[f"{pfx_in}.experts.{e}.{proj}.biases"] = mx.zeros((8, 1))
+
+    result = qwen3_5_moe.Model.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.model.layers.0.mlp"
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        for suffix in ("weight", "scales", "biases"):
+            key = f"{pfx}.switch_mlp.{proj}.{suffix}"
+            assert key in result, key
+            assert result[key].shape[0] == 2
+    assert not any(f"{pfx}.experts." in k for k in result)
+
+
+def test_moe_vlm_sanitize_stacks_per_expert_mtp_quantized(monkeypatch):
+    """A per-expert *quantized* MTP head also carries .scales/.biases.
+    The model-level VLM sanitize path must keep parity with the runtime
+    sanitize path and stack all three suffixes."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_model
+    from mlx_vlm.models.qwen3_5_moe import qwen3_5_moe
+
+    monkeypatch.setattr(qwen35_moe_vlm_model, "_APPLIED", False)
+    if hasattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched"):
+        monkeypatch.delattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched")
+    assert qwen35_moe_vlm_model.apply() is True
+
+    pfx_in = "mtp.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            weights[f"{pfx_in}.experts.{e}.{proj}.weight"] = mx.zeros((8, 4))
+            weights[f"{pfx_in}.experts.{e}.{proj}.scales"] = mx.zeros((8, 1))
+            weights[f"{pfx_in}.experts.{e}.{proj}.biases"] = mx.zeros((8, 1))
+
+    result = qwen3_5_moe.Model.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.mtp.layers.0.mlp"
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        for suffix in ("weight", "scales", "biases"):
+            key = f"{pfx}.switch_mlp.{proj}.{suffix}"
+            assert key in result, key
+            assert result[key].shape[0] == 2
+    assert not any(f"{pfx}.experts." in k for k in result)
+
+
+def test_moe_vlm_runtime_sanitize_stacks_per_expert_backbone():
+    """The runtime sanitize wrapper must also stack per-expert backbone
+    layers (parity with the model-level patch and the LLM patch)."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_runtime
+
+    class FakeModel:
+        pass
+
+    fake_outer = SimpleNamespace(Model=FakeModel)
+    qwen35_moe_vlm_runtime._patch_vlm_outer_model_sanitize(fake_outer)
+
+    pfx_in = "model.language_model.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        weights[f"{pfx_in}.experts.{e}.gate_proj.weight"] = mx.zeros((8, 4))
+        weights[f"{pfx_in}.experts.{e}.up_proj.weight"] = mx.zeros((8, 4))
+        weights[f"{pfx_in}.experts.{e}.down_proj.weight"] = mx.zeros((4, 8))
+
+    result = FakeModel.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.model.layers.0.mlp"
+    assert result[f"{pfx}.switch_mlp.gate_proj.weight"].shape == (2, 8, 4)
+    assert result[f"{pfx}.switch_mlp.up_proj.weight"].shape == (2, 8, 4)
+    assert result[f"{pfx}.switch_mlp.down_proj.weight"].shape == (2, 4, 8)
+    assert not any(f"{pfx}.experts." in k for k in result)
 
 
 # ---------------------------------------------------------------------------

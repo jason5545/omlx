@@ -35,7 +35,11 @@ from typing import (
 
 import mlx.core as mx
 
-from .exceptions import PrefillMemoryExceededError
+from .exceptions import (
+    PrefillMemoryAbortedError,
+    PrefillMemoryExceededError,
+    describe_ceiling_binding,
+)
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
@@ -45,17 +49,26 @@ from .utils.compile_cache import (
     compile_cache_clear_available,
 )
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
+from .utils.hardware import format_bytes
 
 logger = logging.getLogger(__name__)
 
 
 def _raise_request_output_error(output: RequestOutput) -> None:
-    if output.error_code == "prefill_memory_exceeded":
+    if output.error_code in ("prefill_memory_exceeded", "prefill_memory_aborted"):
         metadata = output.error_metadata or {}
         request_id = metadata.get("request_id")
         estimated_bytes = metadata.get("estimated_bytes")
         limit_bytes = metadata.get("limit_bytes")
-        raise PrefillMemoryExceededError(
+        # Both are memory-guard outcomes and share the HTTP 400 mapping; the
+        # aborted subclass only changes the wording (admitted then killed
+        # mid-prefill vs rejected before it started).
+        error_type = (
+            PrefillMemoryAbortedError
+            if output.error_code == "prefill_memory_aborted"
+            else PrefillMemoryExceededError
+        )
+        raise error_type(
             message=output.error or "Prefill memory exceeded",
             request_id=str(request_id) if request_id is not None else output.request_id,
             estimated_bytes=(
@@ -257,6 +270,11 @@ class EngineCore:
         self._wake_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
+
+        # Drop transient aliases after ownership moves to the engine/scheduler
+        # graph, so close()/deep_reset() can make that graph unreachable.
+        model = None
+        tokenizer = None
 
         logger.debug(f"Engine {self._engine_id} initialized")
 
@@ -490,7 +508,9 @@ class EngineCore:
 
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 # Fail all requests and remove from scheduler to prevent
-                # infinite loop (has_requests() must return False).
+                # infinite loop (has_requests() must go False; a pending
+                # idle reclaim may hold it True for one extra step, which
+                # drains and clears it).
                 failed_ids = await loop.run_in_executor(
                     self._mlx_executor, self.scheduler.fail_all_requests
                 )
@@ -524,6 +544,8 @@ class EngineCore:
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
+        skip_cache_store: bool = False,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Add a request for processing.
@@ -554,6 +576,7 @@ class EngineCore:
             request_id=request_id,
             prompt=prompt,
             sampling_params=sampling_params,
+            tools=tools,
             images=images,
             videos=videos,
             vlm_inputs_embeds=vlm_inputs_embeds,
@@ -561,6 +584,7 @@ class EngineCore:
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            skip_cache_store=skip_cache_store,
         )
 
         # SpecPrefill: resolve per-request settings.
@@ -675,27 +699,57 @@ class EngineCore:
 
         request_ids = list(self._output_collectors.keys())
         ceiling = 0
+        watermark = 0
         sched = self.scheduler
         if sched is not None:
             ceiling = int(getattr(sched, "_memory_hard_limit_bytes", 0) or 0)
+            watermark = int(getattr(sched, "_memory_hard_watermark_bytes", 0) or 0)
         usage = get_phys_footprint()
         usage_gb = usage / (1024**3)
         ceiling_gb = ceiling / (1024**3) if ceiling > 0 else 0.0
+        watermark_gb = watermark / (1024**3) if watermark > 0 else 0.0
+        # Name the component ceiling that actually produced this abort. A
+        # generic "loosen memory_guard_tier" leaves users who are already on
+        # `aggressive` with nothing to try (#2362); the ladder points at the
+        # constraint that is really binding, or falls back to the same
+        # generic advice when the enforcer has not propagated a breakdown.
+        binding, advice = describe_ceiling_binding(
+            static=int(getattr(sched, "_memory_static_ceiling_bytes", 0) or 0),
+            dynamic=int(getattr(sched, "_memory_dynamic_ceiling_bytes", 0) or 0),
+            metal_cap=int(getattr(sched, "_memory_metal_cap_bytes", 0) or 0),
+            tier=str(getattr(sched, "_memory_guard_tier", "") or ""),
+            current=usage,
+            fmt=format_bytes,
+            tail="reduce context length",
+        )
+        advice = f"{advice}."
+        ceiling_label = f"{binding} ceiling" if binding != "effective" else "ceiling"
         for rid in request_ids:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
-                if ceiling > 0:
+                # Name the watermark that actually tripped; printing only the
+                # ceiling reads as "usage below limit yet aborted" (#2321).
+                if watermark > 0 and ceiling > 0:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
-                        f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                        "Reduce context size or lower memory_guard_tier."
+                        f"(usage {usage_gb:.1f} GB, abort threshold "
+                        f"(hard watermark) {watermark_gb:.1f} GB, "
+                        f"{ceiling_label} {ceiling_gb:.1f} GB). "
+                        f"{advice}"
+                    )
+                elif ceiling > 0:
+                    error_msg = (
+                        f"Request aborted: process memory limit exceeded "
+                        f"(usage {usage_gb:.1f} GB, "
+                        f"{ceiling_label} {ceiling_gb:.1f} GB). "
+                        f"{advice}"
                     )
                 else:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
                         f"(usage {usage_gb:.1f} GB). "
-                        "Reduce context size or lower memory_guard_tier."
+                        f"{advice}"
                     )
                 collector.put(
                     RequestOutput(
@@ -704,6 +758,21 @@ class EngineCore:
                         finish_reason="error",
                         new_text=f"\n\n[Error: {error_msg}]",
                         error=error_msg,
+                        # Without a code this surfaced as a bare RuntimeError:
+                        # the JSON keepalive wrapper never saw a memory error,
+                        # so the response generator died mid-body and the
+                        # client got a truncated read plus a 500 traceback
+                        # instead of the same actionable 400 the pre-flight
+                        # guard returns.
+                        error_code="prefill_memory_aborted",
+                        error_metadata={
+                            "request_id": rid,
+                            # Only the limit is reported: the exception's
+                            # estimated_bytes means "predicted peak", and this
+                            # abort fires on measured usage, which the message
+                            # already states.
+                            "limit_bytes": watermark or ceiling or None,
+                        },
                     )
                 )
             self._mark_request_finished(rid)
@@ -897,10 +966,13 @@ class EngineCore:
 
         # Drain all outputs and get the last one (using the captured reference)
         final_output = None
+        first_token_at = None
         while True:
             output = collector.get_nowait()
             if output is None:
                 break
+            if first_token_at is None and output.generated_at is not None:
+                first_token_at = output.generated_at
             final_output = output
 
         # Cleanup
@@ -912,6 +984,7 @@ class EngineCore:
         if final_output.error:
             _raise_request_output_error(final_output)
 
+        final_output.first_token_at = first_token_at
         return final_output
 
     def generate_batch_sync(
@@ -1185,6 +1258,9 @@ class AsyncEngineCore:
         config: Optional[EngineConfig] = None,
     ):
         self.engine = EngineCore(model, tokenizer, config)
+        # Drop wrapper-local aliases after EngineCore takes ownership.
+        model = None
+        tokenizer = None
 
     @property
     def _mlx_executor(self):

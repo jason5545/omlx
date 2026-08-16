@@ -188,7 +188,6 @@ def convert_anthropic_to_internal(
     tokenizer: Any | None = None,
     preserve_images: bool = False,
     native_reasoning_content: bool = False,
-    preserve_reasoning_content: bool = True,
     consolidate_system_messages: bool = True,
 ) -> list[dict[str, Any]]:
     """
@@ -210,8 +209,6 @@ def convert_anthropic_to_internal(
             as a ``reasoning_content`` field on assistant messages (Qwen 3.6+
             templates).  If False, inline each block as ``<think>...</think>``
             in the message content as a fallback.
-        preserve_reasoning_content: If False, drop historical thinking blocks
-            while preserving visible text/tool content.
         consolidate_system_messages: If True, merge inline system messages into
             the leading system block. Server code can set this to False and let
             template capability probing decide whether mid-system messages can
@@ -288,7 +285,7 @@ def convert_anthropic_to_internal(
                             # order (Anthropic emits thinking first, so appending
                             # preserves the natural ordering).
                             thinking_text = block_dict.get("thinking", "")
-                            if thinking_text and preserve_reasoning_content:
+                            if thinking_text:
                                 if native_reasoning_content:
                                     thinking_parts.append(thinking_text)
                                 else:
@@ -358,11 +355,7 @@ def convert_anthropic_to_internal(
                             # blocks.  Fallback keeps the legacy <think> inline
                             # behaviour in source order.
                             thinking_text = block_dict.get("thinking", "")
-                            if (
-                                thinking_text
-                                and preserve_reasoning_content
-                                and not native_reasoning_content
-                            ):
+                            if thinking_text and not native_reasoning_content:
                                 text_parts.append(f"<think>\n{thinking_text}\n</think>")
                         elif block_type == "document":
                             text_parts.append(_decode_document_block(block_dict))
@@ -427,7 +420,7 @@ def convert_anthropic_to_internal(
                     # Native mode: collect for reasoning_content (assistant only).
                     # Fallback: inline as <think>...</think> in source order.
                     thinking_text = block_dict.get("thinking", "")
-                    if thinking_text and preserve_reasoning_content:
+                    if thinking_text:
                         if native_reasoning_content and role == "assistant":
                             thinking_parts.append(thinking_text)
                         elif not native_reasoning_content:

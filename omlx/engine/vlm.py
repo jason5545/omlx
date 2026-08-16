@@ -46,17 +46,33 @@ from ..api.utils import (
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
+from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
 )
-from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
+from .base import (
+    BaseEngine,
+    GenerationOutput,
+    _clear_teardown_references,
+    _run_scheduler_preflight_with_cleanup_retry,
+    _warn_scheduler_unreachable_once,
+)
 
 logger = logging.getLogger(__name__)
 
 # OCR model types that require special handling.
-OCR_MODEL_TYPES = {"deepseekocr", "deepseekocr_2", "dots_ocr", "glm_ocr"}
+# unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
+# unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to
+# match VLMBatchedEngine.model_type (== vlm_model.config.model_type).
+OCR_MODEL_TYPES = {
+    "deepseekocr",
+    "deepseekocr_2",
+    "unlimited-ocr",
+    "dots_ocr",
+    "glm_ocr",
+}
 
 # OCR model types and their default markdown conversion prompts.
 # When an OCR model receives a generic user prompt with an image,
@@ -64,6 +80,9 @@ OCR_MODEL_TYPES = {"deepseekocr", "deepseekocr_2", "dots_ocr", "glm_ocr"}
 OCR_MODEL_PROMPTS: Dict[str, str] = {
     "deepseekocr": "Convert the document to markdown.",
     "deepseekocr_2": "Convert the document to markdown.",
+    # baidu/Unlimited-OCR upstream-documented single-page baseline. Multi-page
+    # / PDF workflows use "Multi page parsing." (pass it explicitly).
+    "unlimited-ocr": "document parsing.",
     "dots_ocr": "Convert this page to clean Markdown while preserving reading order.",
     "glm_ocr": "Text Recognition:",
 }
@@ -103,6 +122,10 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "temperature": 0.0,
         "max_tokens": 8192,
     },
+    "unlimited-ocr": {
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
     "dots_ocr": {
         "temperature": 0.0,
         "max_tokens": 8192,
@@ -120,6 +143,30 @@ def _read_config_model_type(model_path: str | Path) -> str | None:
         return None
     model_type = data.get("model_type")
     return model_type if isinstance(model_type, str) else None
+
+
+def _is_missing_chat_template_error(exc: ValueError) -> bool:
+    """True when apply_chat_template failed because no chat template is set.
+
+    transformers raises ValueError both for a missing template and for real
+    render errors (e.g. continue_final_message combined with
+    add_generation_prompt). Only the missing-template case may fall back to
+    mlx-vlm's plain rendering; anything else must propagate. Both the
+    tokenizer and the processor spellings must match: the vision render
+    prefers the processor's apply_chat_template, the counting render uses
+    the tokenizer.
+    """
+    message = str(exc)
+    return (
+        # tokenizer wording (transformers tokenizers; the pair mlx-vlm's
+        # prompt_utils._missing_template_error also matches)
+        "chat_template is not set" in message
+        or "no template argument was passed" in message
+        # processor wording (transformers ProcessorMixin; mlx-vlm processors
+        # that render their own template, e.g. phi3_v)
+        or "does not have a chat template" in message
+        or "No chat template found" in message
+    )
 
 
 def _apply_minimax_m3_thinking_mode(
@@ -493,11 +540,47 @@ _AUDIO_CONFIG_KEYS = (
 )
 
 
+def _resolve_optiq_vision_sidecar(model_dir: Path) -> Path | None:
+    """Resolve the OptiQ multimodal sidecar declared by ``config.json``."""
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        return None
+
+    optiq_vision = config.get("optiq_vision")
+    if not isinstance(optiq_vision, dict):
+        return None
+    relative_path = optiq_vision.get("sidecar")
+    if not isinstance(relative_path, str) or not relative_path:
+        return None
+
+    model_root = model_dir.resolve()
+    sidecar = (model_root / relative_path).resolve()
+    try:
+        sidecar.relative_to(model_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"OptiQ vision sidecar must stay inside the model directory: "
+            f"{relative_path}"
+        ) from exc
+    if sidecar.suffix != ".safetensors":
+        raise ValueError(f"OptiQ vision sidecar must be a safetensors file: {sidecar}")
+    if not sidecar.is_file():
+        raise FileNotFoundError(f"OptiQ vision sidecar not found: {sidecar}")
+    return sidecar
+
+
 def _has_audio_weights(model_dir: Path) -> bool:
     """Return True iff any safetensors shard contains audio_tower / embed_audio keys."""
     import safetensors
 
-    for sf in model_dir.glob("*.safetensors"):
+    weight_files = list(model_dir.glob("*.safetensors"))
+    sidecar = _resolve_optiq_vision_sidecar(model_dir)
+    if sidecar is not None and all(sf.resolve() != sidecar for sf in weight_files):
+        weight_files.append(sidecar)
+
+    for sf in weight_files:
         try:
             with safetensors.safe_open(str(sf), framework="np") as f:
                 for k in f.keys():
@@ -569,6 +652,70 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         yield
     finally:
         _vu.load_config = original
+
+
+@contextlib.contextmanager
+def _load_optiq_vision_sidecar_on_load(model_dir: Path):
+    """Include a config-declared OptiQ sidecar in mlx-vlm strict loading.
+
+    Pinned mlx-vlm only globs ``*.safetensors`` in the model root, while
+    current OptiQ VLM checkpoints keep their unquantized multimodal weights
+    under ``optiq/``. Root-level legacy sidecars remain a no-op because the
+    native glob already loads them.
+    """
+    sidecar = _resolve_optiq_vision_sidecar(model_dir)
+    if sidecar is None or sidecar.parent == model_dir.resolve():
+        yield
+        return
+
+    sidecar_weights = mx.load(str(sidecar))
+    if not isinstance(sidecar_weights, dict):
+        raise ValueError(f"OptiQ vision sidecar must contain named tensors: {sidecar}")
+
+    import mlx.nn as _nn
+
+    original_load_weights = _nn.Module.load_weights
+    injected = False
+
+    def _patched_load_weights(self, weights_items, *args, **kwargs):
+        nonlocal injected
+        if injected or isinstance(weights_items, str):
+            return original_load_weights(self, weights_items, *args, **kwargs)
+
+        model_weights = list(weights_items)
+        model_keys = {
+            item[0]
+            for item in model_weights
+            if isinstance(item, (tuple, list))
+            and len(item) >= 2
+            and isinstance(item[0], str)
+        }
+        duplicates = model_keys.intersection(sidecar_weights)
+        if duplicates:
+            sample = ", ".join(sorted(duplicates)[:3])
+            raise ValueError(
+                f"OptiQ vision sidecar duplicates model weights: {sample}"
+            )
+
+        injected = True
+        result = original_load_weights(
+            self,
+            [*model_weights, *sidecar_weights.items()],
+            *args,
+            **kwargs,
+        )
+        logger.info(
+            "Loaded %d OptiQ multimodal sidecar weights from %s",
+            len(sidecar_weights),
+            sidecar,
+        )
+        return result
+
+    _nn.Module.load_weights = _patched_load_weights
+    try:
+        yield
+    finally:
+        _nn.Module.load_weights = original_load_weights
 
 
 def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
@@ -697,16 +844,27 @@ _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
 
+def _should_pack_minimax_m3_shared_expert(args: Any) -> bool:
+    """Resolve the explicit MiniMax shared-expert layout override."""
+    configured = getattr(args, "pack_shared_expert", None)
+    if configured is not None:
+        return bool(configured)
+    return bool(
+        args.n_shared_experts == 1
+        and args.shared_intermediate_size == args.intermediate_size
+    )
+
+
 @contextlib.contextmanager
 def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
 
     mlx-vlm's MiniMax M3 loader can pack ``shared_experts`` into the routed
-    ``switch_mlp`` when ``Model.sanitize`` runs.  MLX-format checkpoints skip
-    sanitize upstream, but current MiniMax-M3-4bit weights are still stored in
-    the unpacked MoE layout, so strict loading sees those tensors as unknown.
-    Hide only the safetensors ``format=mlx`` metadata during this load so the
-    upstream sanitize path runs before quantization and load_weights.
+    ``switch_mlp`` when ``Model.sanitize`` runs. MLX-format checkpoints skip
+    sanitize upstream, while MiniMax checkpoints can carry either packed or
+    explicitly unpacked mixed-bit MoE weights. Hide only the safetensors
+    ``format=mlx`` metadata during this load so the configured sanitize path
+    runs before quantization and load_weights.
     """
     if _read_config_model_type(model_dir) != MINIMAX_M3_VL_MODEL_TYPE:
         yield
@@ -757,11 +915,7 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
         return handle
 
     def _pack_mlx_unpacked_moe_weights(weights: dict, args: Any) -> int:
-        pack_shared = (
-            args.n_shared_experts == 1
-            and args.shared_intermediate_size == args.intermediate_size
-        )
-        if not pack_shared:
+        if not _should_pack_minimax_m3_shared_expert(args):
             return 0
 
         packed = 0
@@ -1026,10 +1180,9 @@ def _smart_resize_tokens(
 def _read_image_dims(part: dict) -> Optional[tuple]:
     """Best-effort, decode-free ``(width, height)`` for an OpenAI image part.
 
-    Handles ``data:`` base64 URIs, raw base64, and local file paths via a lazy
-    ``PIL.Image.open`` (reads the header only, not pixels). Returns ``None`` for
-    anything that would need a network fetch or that fails to parse, so callers
-    fall back to the conservative per-image upper bound."""
+    Handles only ``data:`` base64 URIs. Returns ``None`` for anything else so
+    callers fall back to the conservative per-image upper bound without opening
+    request-supplied paths or fetching remote URLs."""
     import base64 as _b64
     import binascii
     import io as _io
@@ -1039,32 +1192,34 @@ def _read_image_dims(part: dict) -> Optional[tuple]:
     obj = part.get("image_url")
     if obj is None:
         obj = part.get("input_image") or part.get("image")
-    url = obj if isinstance(obj, str) else (obj.get("url") if isinstance(obj, dict) else None)
+    url = (
+        obj
+        if isinstance(obj, str)
+        else (obj.get("url") if isinstance(obj, dict) else None)
+    )
     if not isinstance(url, str) or not url:
         return None
 
     raw = None
     s = url.strip()
     if s.startswith("data:"):
-        _, sep, encoded = s.partition(",")
-        if sep == ",":
-            try:
-                raw = _b64.b64decode(encoded, validate=True)
-            except (binascii.Error, ValueError):
-                return None
-    elif s.startswith(("http://", "https://")):
-        return None  # no network in preflight
-    else:
+        prefix, sep, encoded = s.partition(",")
+        prefix_lower = prefix.lower()
+        if (
+            sep != ","
+            or not prefix_lower.startswith("data:image/")
+            or ";base64" not in prefix_lower
+        ):
+            return None
         try:
-            raw = _b64.b64decode(s, validate=True)
+            raw = _b64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError):
-            raw = None  # not base64 -> treat as path below
+            return None
+    else:
+        return None
 
     try:
-        if raw is not None:
-            with _Image.open(_io.BytesIO(raw)) as im:
-                return im.size  # (width, height)
-        with _Image.open(s) as im:
+        with _Image.open(_io.BytesIO(raw)) as im:
             return im.size
     except Exception:
         return None
@@ -1160,19 +1315,16 @@ class VLMBatchedEngine(BaseEngine):
         num_prompt_tokens: int,
         request_id: str | None,
     ) -> None:
-        eviction_request = scheduler.preflight_eviction_request(
+        await _run_scheduler_preflight_with_cleanup_retry(
+            scheduler,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
-        )
-        if eviction_request is not None and self._prefill_eviction_callback is not None:
-            logger.info(
-                "Running preflight LRU eviction for request %s",
-                eviction_request.request_id,
-            )
-            await self._prefill_eviction_callback(eviction_request)
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_prompt_tokens,
-            request_id=request_id,
+            eviction_callback=self._prefill_eviction_callback,
+            executor=getattr(
+                getattr(getattr(self, "_engine", None), "engine", None),
+                "_mlx_executor",
+                None,
+            ),
         )
 
     @property
@@ -1358,18 +1510,9 @@ class VLMBatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_vlm_sync():
-            try:
-                from ..utils.model_loading import maybe_apply_pre_load_patches
-
-                maybe_apply_pre_load_patches(
-                    self._model_name,
-                    model_settings=self._model_settings,
-                    for_vlm=True,
-                )
-            except Exception as e:
-                logger.debug(f"executor pre-load patches skipped: {e}")
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
+            apply_pixtral_torch_free_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
@@ -1390,14 +1533,42 @@ class VLMBatchedEngine(BaseEngine):
                         trust_remote_code=self._trust_remote_code,
                     )
 
-                return vlm_load(
-                    self._model_name, trust_remote_code=self._trust_remote_code
-                )
+                with _load_optiq_vision_sidecar_on_load(
+                    Path(self._model_name)
+                ):
+                    return vlm_load(
+                        self._model_name,
+                        trust_remote_code=self._trust_remote_code,
+                    )
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
             get_mlx_executor(), _load_vlm_sync
         )
+
+        if self.model_type == "unlimited-ocr":
+            from ..utils.tokenizer import (
+                create_streaming_detokenizer,
+                repair_misconverted_unlimited_ocr_tokenizer,
+            )
+
+            tokenizer_obj = getattr(self._processor, "tokenizer", self._processor)
+            if repair_misconverted_unlimited_ocr_tokenizer(
+                tokenizer_obj,
+                model_path=self._model_name,
+            ):
+                # mlx-vlm also keeps a processor-level detokenizer for its own
+                # generation helpers.  Replace that stale SPM instance even
+                # though oMLX's scheduler creates fresh request-local copies.
+                self._processor.detokenizer = create_streaming_detokenizer(
+                    tokenizer_obj,
+                    model_path=self._model_name,
+                )
+                logger.warning(
+                    "Repaired misconverted Unlimited-OCR tokenizer metadata "
+                    "in memory for %s",
+                    self._model_name,
+                )
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
@@ -1406,6 +1577,44 @@ class VLMBatchedEngine(BaseEngine):
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
+
+        # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
+        # The repacked safetensors carries 2-bit biases for format compat;
+        # the t5 symmetric kernel (scale*(q-1)) never reads them.
+        try:
+            from ..patches.bonsai_t5_load import free_t5_biases
+
+            freed = await loop.run_in_executor(
+                get_mlx_executor(), free_t5_biases, self._vlm_model
+            )
+            if freed > 0:
+                logger.info(
+                    "t5 bias tensors freed: %.0f MB recovered", freed / 1e6
+                )
+        except Exception:
+            logger.debug("t5 bias free skipped", exc_info=True)
+
+        # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
+        # gate and up projections so decode runs 2 gather_qmm launches per
+        # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
+        # mlx-vlm target-verify helper for a fused-aware version. Runs on
+        # the MLX executor because it rewrites weights in place.
+        if (
+            getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_moe_gate_up import (
+                    apply_qwen35_moe_gate_up_fusion,
+                )
+
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    apply_qwen35_moe_gate_up_fusion,
+                    self._vlm_model,
+                )
+            except Exception:
+                logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
 
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
@@ -1447,6 +1656,12 @@ class VLMBatchedEngine(BaseEngine):
             self._tokenizer = copy.deepcopy(self._processor.tokenizer)
         else:
             self._tokenizer = copy.deepcopy(self._processor)
+        if self._tokenizer is None or not callable(
+            getattr(self._tokenizer, "encode", None)
+        ):
+            raise RuntimeError(
+                f"VLM processor for {self._model_name} did not provide a usable tokenizer"
+            )
 
         if self.is_diffusion_model:
             self._inject_tool_calling(self._tokenizer)
@@ -1459,22 +1674,12 @@ class VLMBatchedEngine(BaseEngine):
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
 
-        # Apply post-load transforms (IndexCache, MTP draft depth, mtp.safetensors)
-        from ..utils.model_loading import apply_post_load_transforms
-
-        apply_post_load_transforms(
-            self._adapter,
-            self._model_settings,
-            model_path=self._model_name,
-        )
-
         # Create scheduler config
         scheduler_config = (
             copy.copy(self._scheduler_config)
             if self._scheduler_config
             else SchedulerConfig()
         )
-        scheduler_config.model_name = self._model_name
 
         engine_config = EngineConfig(
             model_name=self._model_name,
@@ -1492,23 +1697,6 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
-
-        if (
-            self._model_settings is not None
-            and getattr(self._model_settings, "mtp_enabled", False)
-        ):
-            if getattr(self._adapter, "mtp_available", False):
-                logger.info(
-                    "VLM+MTP enabled and active for %s "
-                    "(adapter exposes native hooks)",
-                    self._model_name,
-                )
-            else:
-                logger.warning(
-                    "VLM+MTP unavailable for %s because adapter lacks native "
-                    "hooks; continuing with VLM engine without MTP",
-                    self._model_name,
-                )
 
         # TurboQuant KV cache
         scheduler = self._engine.engine.scheduler
@@ -1539,6 +1727,91 @@ class VLMBatchedEngine(BaseEngine):
                 apply_sdpa256_attention_patch()
             except Exception:
                 logger.debug("sdpa256 attention patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 head_dim=256 causal prefill -> native steel FA kernel.
+        # Installed after sdpa256 so matched Qwen dense attention takes the
+        # simdgroup-MMA path, while unsupported cases fall through unchanged.
+        if (
+            getattr(self._model_settings, "fa256_steel_prefill_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_fa256_attention import (
+                    apply_qwen35_fa256_attention_patch,
+                )
+
+                apply_qwen35_fa256_attention_patch()
+            except Exception:
+                logger.debug("Qwen FA-256 steel patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 Gated DeltaNet prefill -> optimized Metal kernel.
+        # Decode and masked paths keep the original mlx-vlm kernel.
+        gdn_prefill_enabled = getattr(
+            self._model_settings,
+            "gdn_prefill_enabled",
+            getattr(self._model_settings, "gdn_chunked_prefill_enabled", True),
+        )
+        if gdn_prefill_enabled is not False:
+            try:
+                from ..patches.qwen35_gdn_chunked import (
+                    apply_qwen35_gdn_prefill_patch,
+                )
+
+                apply_qwen35_gdn_prefill_patch()
+            except Exception:
+                logger.debug("GDN prefill patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 q4 MLP prefill -> native qmm tile tuned for long batches.
+        # Decode and target-verify paths keep the original QuantizedLinear.
+        if (
+            getattr(self._model_settings, "qwen35_q4_mlp_prefill_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_q4_mlp import (
+                    apply_muse_glimmer_q4_prefill_patch,
+                    apply_qwen35_q4_mlp_patch,
+                    apply_qwen35_q4_prefill_linear_patch,
+                )
+
+                apply_qwen35_q4_mlp_patch()
+                apply_qwen35_q4_prefill_linear_patch()
+                # Muse Glimmer rides the same native qmm tile (MLP plus the
+                # q/gate/o attention projections); no-op unless the muse
+                # compat patch installed the vendored module.
+                apply_muse_glimmer_q4_prefill_patch()
+            except Exception:
+                logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 sparse MoE prefill -> native weighted-sum after sorted
+        # SwitchGLU. Decode and target-verify keep the original path.
+        if (
+            getattr(self._model_settings, "qwen35_moe_weighted_sum_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_moe_weighted_sum import (
+                    apply_qwen35_moe_weighted_sum_patch,
+                )
+
+                apply_qwen35_moe_weighted_sum_patch()
+            except Exception:
+                logger.debug(
+                    "Qwen MoE weighted-sum patch not applied", exc_info=True
+                )
+
+        if (
+            getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_ragged_decode import (
+                    apply_qwen35_ragged_decode_patch,
+                )
+
+                apply_qwen35_ragged_decode_patch()
+            except Exception:
+                logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
@@ -1551,9 +1824,10 @@ class VLMBatchedEngine(BaseEngine):
             )
             if specprefill_enabled and specprefill_draft:
                 try:
-                    from mlx_lm import load as mlx_lm_load
-
-                    from ..utils.model_loading import maybe_load_custom_quantization
+                    from ..utils.model_loading import (
+                        lm_load_compat as mlx_lm_load,
+                        maybe_load_custom_quantization,
+                    )
                     from ..utils.tokenizer import get_tokenizer_config
 
                     def _load_draft():
@@ -1665,13 +1939,20 @@ class VLMBatchedEngine(BaseEngine):
         # final worker-thread MLX reclaim. Otherwise the VLM wrapper can keep
         # model weights or cached feature arrays alive until after the reclaim
         # pass has already run.
-        self._engine = None
-        self._vlm_model = None
-        self._processor = None
-        self._adapter = None
-        self._tokenizer = None
-        self._vlm_mtp_drafter = None
-        self._diffusion_family = None
+        _clear_teardown_references(
+            self,
+            none_attrs=(
+                "_engine",
+                "_vlm_model",
+                "_processor",
+                "_adapter",
+                "_tokenizer",
+                "_grammar_compiler",
+                "_vlm_mtp_drafter",
+                "_diffusion_family",
+            ),
+            false_attrs=("_grammar_compiler_init_attempted",),
+        )
 
         if engine:
             if hasattr(engine, "engine") and engine.engine is not None:
@@ -1695,6 +1976,21 @@ class VLMBatchedEngine(BaseEngine):
         """
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
+            return
+
+        # MiniMax M3's template contains generic <tool_call> text in comments
+        # and examples, so upstream inference incorrectly selects json_tools.
+        # Use the same oMLX protocol adapter as distributed ranks.
+        from ..adapter.output_parser import (
+            install_minimax_m3_tokenizer_protocol,
+        )
+
+        if install_minimax_m3_tokenizer_protocol(
+            tokenizer,
+            self._model_name,
+            {"model_type": self.model_type} if self.model_type else None,
+        ):
+            logger.info("VLM tool calling enabled: parser=minimax_m3")
             return
 
         # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
@@ -2187,6 +2483,7 @@ class VLMBatchedEngine(BaseEngine):
         audio: list | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
+        is_partial: bool | None = None,
     ) -> Tuple[
         List[int],
         Optional[mx.array],
@@ -2205,7 +2502,11 @@ class VLMBatchedEngine(BaseEngine):
         Args:
             messages: Chat messages (text-only, media already extracted)
             images: List of PIL Image objects
-            audio: List of audio data (BytesIO, file paths, or numpy arrays)
+            audio: List of audio data (BytesIO buffers, tuples, or numpy arrays)
+            is_partial: Explicit partial-mode signal from the API server.
+                ``True``/``False`` — the server has already decided.  ``None``
+                (default) — auto-detect from ``messages`` for direct engine
+                callers.
 
         Returns:
             Tuple of (
@@ -2224,7 +2525,7 @@ class VLMBatchedEngine(BaseEngine):
             - image_cache_key_ranges: Per-image-turn cache key boundaries with
               cumulative image hashes
         """
-        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.prompt_utils import apply_chat_template, get_chat_template
         from mlx_vlm.utils import load_audio as _load_audio
         from mlx_vlm.utils import prepare_inputs
 
@@ -2240,9 +2541,8 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         # Normalize audio to numpy float32 arrays expected by processor.
-        # extract_images_from_messages produces BytesIO / file-path strings, but
-        # the processor's __call__ expects numpy arrays or (array, sample_rate)
-        # tuples. load_audio handles all three source types.
+        # Request-facing string paths are rejected before this point; remaining
+        # sources are inline buffers, arrays, or (array, sample_rate) tuples.
         if audio:
             if any(not isinstance(a, tuple) for a in audio):
                 from ..patches.mlx_audio_compat import (
@@ -2293,12 +2593,20 @@ class VLMBatchedEngine(BaseEngine):
                 if image_count > 0:
                     image_message_ranges.append((idx, image_count))
 
-        # Strip partial field from messages (VLM always uses add_generation_prompt=True)
+        if is_partial is None:
+            # get_message_json() keeps only (role, content), so the flag has to
+            # be read from the pre-format messages for direct engine callers.
+            is_partial = detect_and_strip_partial(messages)
+        # Tool and reasoning_content turns are appended verbatim by
+        # _format_messages_for_vlm_template(), so a residual key can survive
+        # formatting; the chat template must never see the non-standard field.
         detect_and_strip_partial(formatted_messages)
         template_kwargs = {
             "tokenize": False,
-            "add_generation_prompt": True,
+            "add_generation_prompt": not is_partial,
         }
+        if is_partial:
+            template_kwargs["continue_final_message"] = True
         if self._enable_thinking is not None:
             template_kwargs["enable_thinking"] = self._enable_thinking
         # Per-model/request kwargs override global defaults (e.g. enable_thinking,
@@ -2326,26 +2634,35 @@ class VLMBatchedEngine(BaseEngine):
             prompt = template_target.apply_chat_template(
                 formatted_messages, **template_kwargs
             )
-        except ValueError:
-            # Processor has apply_chat_template but no chat_template set
-            # (e.g. mlx-vlm custom processor without processor_config.json).
-            # Fall back to processor.tokenizer which holds the actual template.
-            fallback = getattr(self._processor, "tokenizer", None)
-            if fallback is not None and fallback is not template_target:
-                try:
-                    prompt = fallback.apply_chat_template(
-                        formatted_messages, **template_kwargs
-                    )
-                except TypeError:
-                    if chat_template_kwargs:
-                        for key in chat_template_kwargs:
-                            template_kwargs.pop(key, None)
-                    template_kwargs.pop("enable_thinking", None)
-                    prompt = fallback.apply_chat_template(
-                        formatted_messages, **template_kwargs
-                    )
-            else:
+        except ValueError as exc:
+            if not _is_missing_chat_template_error(exc):
                 raise
+            # Processor/tokenizer has apply_chat_template but no chat_template
+            # set. Some OCR checkpoints (e.g. raw baidu/Unlimited-OCR) ship no
+            # chat template at all. mlx-vlm's get_chat_template handles this by
+            # rendering the messages into a plain prompt (the <image> tokens are
+            # already in the message content from get_message_json), preferring
+            # processor.chat_template -> processor.tokenizer.chat_template ->
+            # plain rendering, so it subsumes the tokenizer fallback too.
+            template_kwargs.pop("tokenize", None)
+            template_kwargs.pop("add_generation_prompt", None)
+            # get_chat_template() has no continue_final_message equivalent, so
+            # partial mode cannot be honoured on this fallback. Drop the kwarg
+            # and say so rather than passing it through as an unknown argument.
+            template_kwargs.pop("continue_final_message", None)
+            if is_partial:
+                logger.warning(
+                    "Partial mode requested but %s exposes no chat template; "
+                    "mlx-vlm plain rendering always starts a new assistant "
+                    "turn, so the final message will not be continued.",
+                    self._model_name,
+                )
+            prompt = get_chat_template(
+                self._processor,
+                formatted_messages,
+                add_generation_prompt=True,
+                **template_kwargs,
+            )
 
         # Tokenize text and preprocess images and audio
         inputs = prepare_inputs(
@@ -2610,21 +2927,26 @@ class VLMBatchedEngine(BaseEngine):
         """Apply chat template for text-only messages (no images).
 
         Args:
-            is_partial: Accepted for API parity with BatchedEngine but not
-                acted upon — VLM always uses ``add_generation_prompt=True``.
-                The ``partial`` key is still cleaned from message dicts.
+            is_partial: Explicit partial-mode signal from the API server.
+                ``True``/``False`` — the server has already decided; the
+                ``partial`` key is cleaned from message dicts but no detection
+                is performed.  ``None`` (default) — auto-detect from messages
+                for direct engine callers.
         """
         if hasattr(self._tokenizer, "apply_chat_template"):
-            # Strip partial field (VLM always uses add_generation_prompt=True)
             if is_partial is None:
-                detect_and_strip_partial(messages)
+                is_partial = detect_and_strip_partial(messages)
             else:
+                # Server already resolved partial; just clean residual keys
+                # so the chat template never sees the non-standard field.
                 for msg in messages:
                     msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": True,
+                "add_generation_prompt": not is_partial,
             }
+            if is_partial:
+                template_kwargs["continue_final_message"] = True
             if tools:
                 template_kwargs["tools"] = tools
             if self._enable_thinking is not None:
@@ -2642,9 +2964,94 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs.pop("tools", None)
                 template_kwargs.pop("enable_thinking", None)
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
+            except ValueError as exc:
+                if not _is_missing_chat_template_error(exc):
+                    raise
+                # Tokenizer exposes apply_chat_template but has no chat_template
+                # set (e.g. raw baidu/Unlimited-OCR ships none). Fall back to
+                # mlx-vlm's plain-message rendering, matching the vision path.
+                from mlx_vlm.prompt_utils import get_chat_template
+
+                if is_partial:
+                    logger.warning(
+                        "Partial mode requested but %s exposes no chat "
+                        "template; mlx-vlm plain rendering always starts a "
+                        "new assistant turn, so the final message will not "
+                        "be continued.",
+                        self._model_name,
+                    )
+                return get_chat_template(
+                    self._processor,
+                    messages,
+                    add_generation_prompt=True,
+                )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
+
+    @staticmethod
+    def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pop SpecPrefill per-request overrides out of ``kwargs``.
+
+        The engine's ``add_request`` accepts these as dedicated arguments, so
+        they must be forwarded explicitly rather than left in ``**kwargs``.
+        Shared by ``generate`` and ``stream_generate`` so both request paths
+        honour SpecPrefill overrides identically.
+        """
+        specprefill_kwargs: dict[str, Any] = {}
+        for key in (
+            "specprefill",
+            "specprefill_keep_pct",
+            "specprefill_threshold",
+            "specprefill_system_end",
+        ):
+            if kwargs.get(key) is not None:
+                specprefill_kwargs[key] = kwargs.pop(key)
+        return specprefill_kwargs
+
+    def _inject_specprefill_system_end(
+        self,
+        messages: list[dict[str, Any]],
+        prompt: str | list[int],
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Compute the system-prompt token boundary and add it to ``kwargs``.
+
+        SpecPrefill protects the system-prompt region from token dropping. The
+        boundary is derived by subtracting the non-system prompt token count
+        from the full prompt token count (system-only messages usually can't be
+        templated on their own). Shared by ``chat`` and ``stream_chat`` so the
+        non-streaming path protects the system prompt identically. No-op unless
+        the model has SpecPrefill enabled and the request has a system prompt.
+
+        ``prompt`` is the already-tokenized VLM prompt (a list of token IDs,
+        per ``_process_chat_messages``), so the full-prompt count is just its
+        length rather than a re-encode.
+        """
+        specprefill_model_enabled = (
+            getattr(self._model_settings, "specprefill_enabled", False)
+            if self._model_settings
+            else False
+        )
+        if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
+            return
+        non_system = [
+            m for m in messages if m.get("role") not in ("system", "developer")
+        ]
+        if len(non_system) < len(messages) and non_system:
+            try:
+                non_system_prompt = self._tokenizer.apply_chat_template(
+                    non_system,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                full_tokens = len(prompt)
+                non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+                system_end = full_tokens - non_system_tokens
+                if system_end > 0:
+                    kwargs["specprefill_system_end"] = system_end
+            except Exception as e:
+                logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
     async def generate(
         self,
@@ -2715,14 +3122,18 @@ class VLMBatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
-            thinking_soft_start_ratio=kwargs.get("thinking_soft_start_ratio"),
-            thinking_soft_max_bias=kwargs.get("thinking_soft_max_bias", 0.0),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
+
+        # SpecPrefill: forward per-request overrides to the engine, mirroring
+        # stream_generate so the non-streaming path is not silently ignored.
+        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -2732,6 +3143,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            tools=tools,
+            **specprefill_kwargs,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -2743,6 +3156,7 @@ class VLMBatchedEngine(BaseEngine):
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
+            first_token_at=output.first_token_at,
         )
 
     async def stream_generate(
@@ -2820,31 +3234,17 @@ class VLMBatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
-            thinking_soft_start_ratio=kwargs.get("thinking_soft_start_ratio"),
-            thinking_soft_max_bias=kwargs.get("thinking_soft_max_bias", 0.0),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
 
         # SpecPrefill: pass per-request overrides
-        specprefill_kwargs = {}
-        if kwargs.get("specprefill") is not None:
-            specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
-        if kwargs.get("specprefill_keep_pct") is not None:
-            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop(
-                "specprefill_keep_pct"
-            )
-        if kwargs.get("specprefill_threshold") is not None:
-            specprefill_kwargs["specprefill_threshold"] = kwargs.pop(
-                "specprefill_threshold"
-            )
-        if kwargs.get("specprefill_system_end") is not None:
-            specprefill_kwargs["specprefill_system_end"] = kwargs.pop(
-                "specprefill_system_end"
-            )
+        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -2855,6 +3255,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            tools=tools,
             **specprefill_kwargs,
         )
 
@@ -2945,6 +3347,9 @@ class VLMBatchedEngine(BaseEngine):
             kwargs,
         )
 
+        # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
+        self._inject_specprefill_system_end(messages, prompt, kwargs)
+
         return await self.generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -2959,6 +3364,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=image_hash,
             vlm_cache_key_start=image_cache_key_start,
             vlm_cache_key_ranges=image_cache_key_ranges,
+            tools=tools,
             **kwargs,
         )
 
@@ -3161,32 +3567,8 @@ class VLMBatchedEngine(BaseEngine):
             kwargs,
         )
 
-        # SpecPrefill: compute system prompt token count for protection.
-        # Can't template system-only messages (most templates require user),
-        # so compute by subtracting non-system from full prompt tokens.
-        specprefill_model_enabled = (
-            getattr(self._model_settings, "specprefill_enabled", False)
-            if self._model_settings
-            else False
-        )
-        if specprefill_model_enabled and kwargs.get("specprefill") is not False:
-            non_system = [
-                m for m in messages if m.get("role") not in ("system", "developer")
-            ]
-            if len(non_system) < len(messages) and non_system:
-                try:
-                    non_system_prompt = self._tokenizer.apply_chat_template(
-                        non_system,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    full_tokens = len(prompt)
-                    non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
-                    system_end = full_tokens - non_system_tokens
-                    if system_end > 0:
-                        kwargs["specprefill_system_end"] = system_end
-                except Exception as e:
-                    logger.debug(f"SpecPrefill: system_end calc failed: {e}")
+        # SpecPrefill: protect the system-prompt region from token dropping.
+        self._inject_specprefill_system_end(messages, prompt, kwargs)
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -3202,6 +3584,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=image_hash,
             vlm_cache_key_start=image_cache_key_start,
             vlm_cache_key_ranges=image_cache_key_ranges,
+            tools=tools,
             **kwargs,
         ):
             yield output
@@ -3279,6 +3662,7 @@ class VLMBatchedEngine(BaseEngine):
         text_messages, images, audio = extract_images_from_messages(messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        partial = kwargs.pop("is_partial", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -3298,6 +3682,7 @@ class VLMBatchedEngine(BaseEngine):
             audio=audio if audio else None,
             chat_template_kwargs=ct_kwargs,
             tools=template_tools,
+            is_partial=partial,
         )
 
         if images:

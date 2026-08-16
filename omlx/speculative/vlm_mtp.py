@@ -44,6 +44,13 @@ import mlx.nn as nn
 
 from mlx_vlm.speculative import load_drafter as _vlm_load_drafter
 
+# The round loops dispatch their target-verify and cache-rollback forwards
+# inside ``with mx.stream(generation_stream)``, using mlx-vlm's own
+# thread-local stream — a different object from mlx-lm's generation_stream
+# and from the per-engine stream. Draining the MTP work means draining this
+# one, resolved on the thread that advances the round loop.
+from mlx_vlm.speculative.common import generation_stream as _vlm_generation_stream
+
 # PR #1169 (f96138e) moved the MTP round loop helpers from ``mlx_vlm.generate``
 # into ``mlx_vlm.speculative.utils``. Import directly from the new location —
 # the symbols are still ``_``-prefixed but this is now their canonical home.
@@ -55,6 +62,7 @@ except Exception:  # pragma: no cover - compatibility with older mlx-vlm
     def _buffer_mtp_target_cache(*_args: Any, **_kwargs: Any) -> None:
         return None
 
+from ..utils.metal_sync import _sync_and_clear_cache
 from ..utils.model_loading import materialize_lazy_state
 
 logger = logging.getLogger(__name__)
@@ -247,6 +255,43 @@ class _MTPResetBindingProxy:
         return self._drafter.reset(target_model, *args, **kwargs)
 
 
+def vlm_mtp_positioned_sampling_available(target_language_model: Any) -> bool:
+    """True when mlx-vlm's round loop will see ``speculative_logits_from_hidden``.
+
+    The positioned ``sample_target`` verify path — the application point for
+    per-request logits processors on the vlm_mtp path — is only consulted
+    when the object mlx-vlm resolves as ``lm`` exposes
+    ``speculative_logits_from_hidden``. That object is not the inner
+    language model: ``run_vlm_mtp_decode`` wraps adapters in
+    ``_VLMAdapterMTPProxy``, which for mRoPE adapters (Qwen VLMs)
+    intentionally hides the inner model's ``speculative_*`` fast paths so
+    verify keeps mRoPE position handling. Checking the inner model
+    directly would report the hook as available while the round loop
+    falls back to plain vectorized sampling — silently dropping the
+    processors (#2399).
+
+    This helper mirrors the proxy's visibility rules exactly; the
+    equivalence is pinned by tests against the real proxy resolution.
+    """
+    adapter_lm = getattr(target_language_model, "_language_model", None)
+    if adapter_lm is None:
+        # No adapter: the model itself is handed to the round loop, and
+        # mlx-vlm resolves ``lm = model.language_model`` when present.
+        inner = getattr(target_language_model, "language_model", None)
+        lm = inner if inner is not None else target_language_model
+        return hasattr(lm, "speculative_logits_from_hidden")
+    # Adapter case: rounds receive _VLMAdapterMTPProxy, which hides
+    # ``language_model`` outside drafter reset, so mlx-vlm uses the proxy
+    # itself as ``lm``. Attribute lookup tries the adapter first, then
+    # falls through to the inner model — unless the adapter uses mRoPE,
+    # in which case ``speculative_*`` names are blocked at the proxy.
+    if hasattr(target_language_model, "speculative_logits_from_hidden"):
+        return True
+    if bool(getattr(target_language_model, "_uses_mrope", False)):
+        return False
+    return hasattr(adapter_lm, "speculative_logits_from_hidden")
+
+
 def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:
     """Load an MTP drafter (gemma4_assistant or qwen3_5_mtp); return None
     and log if the artifact is the wrong kind. Soft-fails so a misconfigured
@@ -362,7 +407,15 @@ def run_vlm_mtp_decode(
             # _mtp_rounds_batch in mlx_vlm/speculative/utils.py). On large
             # targets like Gemma 4 31B the buffer pool balloons between
             # those flushes (issue #1416). Clearing per round bounds it.
-            mx.clear_cache()
+            #
+            # The round leaves work in flight on two streams at this yield
+            # boundary: mlx-vlm async_evals the verify hidden state and the
+            # drafter's state arrays. The helper drains the stream it is
+            # given plus the current default stream, so passing mlx-vlm's
+            # stream covers the verify forwards while the default-stream
+            # drain covers the engine stream the scheduler advances this
+            # generator under (``with mx.stream(self._stream)``).
+            _sync_and_clear_cache(_vlm_generation_stream)
             yield tokens
         return
 
@@ -387,5 +440,6 @@ def run_vlm_mtp_decode(
         draft_block_size=draft_block_size,
         token_dtype=token_dtype,
     ):
-        mx.clear_cache()
+        # Same two-stream drain as the batched branch above.
+        _sync_and_clear_cache(_vlm_generation_stream)
         yield tok

@@ -688,8 +688,6 @@ class TestStatsSecurity:
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 9981
         mock_settings.auth.api_key = "super-secret-key"
-        mock_settings.claude_code.context_scaling_enabled = True
-        mock_settings.claude_code.target_context_size = 200000
 
         mock_metrics = MagicMock()
         mock_metrics.get_snapshot.return_value = {
@@ -712,6 +710,22 @@ class TestStatsSecurity:
 
         # api_key is included for admin-only CLI snippet generation in the dashboard
         assert result["api_key"] == "super-secret-key"
+
+    def test_activity_response_does_not_build_runtime_cache_observability(self):
+        active_models = {"models": [{"id": "model-a"}]}
+
+        with (
+            patch.object(
+                admin_routes,
+                "_build_active_models_data",
+                return_value=active_models,
+            ),
+            patch.object(admin_routes, "_build_runtime_cache_observability") as build_runtime_cache,
+        ):
+            result = asyncio.run(admin_routes.get_server_activity(is_admin=True))
+
+        assert result == {"active_models": active_models}
+        build_runtime_cache.assert_not_called()
 
     def test_active_models_data_ignores_enforcer_status_error(self):
         """Admin stats should not fail when memory telemetry is unavailable."""
@@ -742,8 +756,6 @@ class TestStatsSecurity:
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 8000
         mock_settings.auth.api_key = ""
-        mock_settings.claude_code.context_scaling_enabled = False
-        mock_settings.claude_code.target_context_size = 200000
 
         mock_metrics = MagicMock()
         mock_metrics.get_snapshot.return_value = {
@@ -775,8 +787,6 @@ class TestStatsSecurity:
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 8000
         mock_settings.auth.api_key = ""
-        mock_settings.claude_code.context_scaling_enabled = False
-        mock_settings.claude_code.target_context_size = 200000
 
         mock_metrics = MagicMock()
         mock_metrics.get_snapshot.return_value = {
@@ -891,42 +901,20 @@ class TestRuntimeCacheObservability:
         assert payload["total_num_files"] == 10
         assert payload["total_size_bytes"] == 12288
         assert payload["effective_block_sizes"] == [1024, 2048]
-        assert payload["models"] == [
-            {
-                "id": "model-a",
-                "block_size": 1024,
-                "indexed_blocks": 12,
-                "indexed_blocks_display": "12",
-                "has_sub_block_cache": False,
-                "partial_block_skips": 0,
-                "partial_tokens_skipped": 0,
-                "last_partial_tokens_skipped": 0,
-                "last_tokens_to_next_block": 0,
-                "num_files": 3,
-                "total_size_bytes": 4096,
-                "max_size_bytes": 0,
-                "hot_cache_max_bytes": 0,
-                "hot_cache_size_bytes": 0,
-                "hot_cache_entries": 0,
-            },
-            {
-                "id": "model-b",
-                "block_size": 2048,
-                "indexed_blocks": 4,
-                "indexed_blocks_display": "4",
-                "has_sub_block_cache": False,
-                "partial_block_skips": 0,
-                "partial_tokens_skipped": 0,
-                "last_partial_tokens_skipped": 0,
-                "last_tokens_to_next_block": 0,
-                "num_files": 7,
-                "total_size_bytes": 8192,
-                "max_size_bytes": 0,
-                "hot_cache_max_bytes": 0,
-                "hot_cache_size_bytes": 0,
-                "hot_cache_entries": 0,
-            },
-        ]
+        rows = {row["id"]: row for row in payload["models"]}
+        assert rows["model-a"]["block_size"] == 1024
+        assert rows["model-a"]["indexed_blocks"] == 12
+        assert rows["model-a"]["num_files"] == 3
+        assert rows["model-a"]["total_size_bytes"] == 4096
+        assert rows["model-b"]["block_size"] == 2048
+        assert rows["model-b"]["indexed_blocks"] == 4
+        assert rows["model-b"]["num_files"] == 7
+        assert rows["model-b"]["total_size_bytes"] == 8192
+        for row in rows.values():
+            assert row["gdn_checkpoint_loads"] == 0
+            assert row["gdn_checkpoint_walkbacks"] == 0
+            assert row["gdn_last_restore"] is None
+            assert row["gdn_staging"]["sidecar_count"] == 0
         manager_a.get_stats_for_model.assert_called_once_with("/models/model-a")
         manager_b.get_stats_for_model.assert_called_once_with("/models/model-b")
 
@@ -1129,7 +1117,7 @@ class TestGlobalSettingsValidation:
             admin_routes.GlobalSettingsRequest(idle_timeout_seconds=-1)
 
     def test_idle_timeout_rejects_below_minimum(self):
-        # Minimum is 60s — anything smaller is not a meaningful idle window.
+        # Minimum is 60s — anything smaller (except 0) is not meaningful.
         with pytest.raises(ValidationError):
             admin_routes.GlobalSettingsRequest(idle_timeout_seconds=30)
 
@@ -1139,9 +1127,31 @@ class TestGlobalSettingsValidation:
         # model_fields_set should include it when explicitly passed.
         assert "idle_timeout_seconds" in req.model_fields_set
 
+    def test_idle_timeout_accepts_zero_as_disabled(self):
+        # 0 means "no limit" (disabled) — normalizes to None.
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=0)
+        assert req.idle_timeout_seconds is None
+        assert "idle_timeout_seconds" in req.model_fields_set
+
+    def test_idle_timeout_accepts_empty_string_as_disabled(self):
+        # Empty string from cleared textbox normalizes to None.
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds="")
+        assert req.idle_timeout_seconds is None
+        assert "idle_timeout_seconds" in req.model_fields_set
+
     def test_idle_timeout_accepts_valid_value(self):
         req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=1800)
         assert req.idle_timeout_seconds == 1800
+
+    @pytest.mark.parametrize("value", ["60", 60.0])
+    def test_idle_timeout_preserves_integer_coercion(self, value):
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=value)
+        assert req.idle_timeout_seconds == 60
+
+    @pytest.mark.parametrize("value", [False, True])
+    def test_idle_timeout_rejects_boolean(self, value):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(idle_timeout_seconds=value)
 
     def test_context_window_policy_rejects_negative(self):
         with pytest.raises(ValidationError):

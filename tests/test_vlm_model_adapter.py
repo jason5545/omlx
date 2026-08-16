@@ -124,28 +124,6 @@ class TestVLMModelAdapter:
         vlm.language_model.make_cache.assert_called_once()
         assert cache is vlm.language_model.make_cache.return_value
 
-    def test_mtp_hooks_delegate_to_language_model(self):
-        """Test Native MTP hooks are exposed through the VLM adapter."""
-        from omlx.models.vlm import VLMModelAdapter
-
-        vlm = self._make_mock_vlm_model()
-        vlm.language_model.mtp = object()
-        vlm.language_model.mtp_forward = MagicMock(return_value="mtp-logits")
-        vlm.language_model.make_mtp_cache = MagicMock(return_value=["mtp-cache"])
-        adapter = VLMModelAdapter(vlm)
-
-        assert adapter.language_model is vlm.language_model
-        assert adapter.mtp_available is True
-        assert adapter.make_mtp_cache() == ["mtp-cache"]
-        assert adapter.mtp_forward("hidden", "tokens", ["cache"]) == "mtp-logits"
-
-        vlm.language_model.make_mtp_cache.assert_called_once()
-        vlm.language_model.mtp_forward.assert_called_once_with(
-            "hidden",
-            "tokens",
-            ["cache"],
-        )
-
     def test_set_pending_embeddings(self):
         """Test set_pending_embeddings stores state."""
         from omlx.models.vlm import VLMModelAdapter
@@ -197,22 +175,6 @@ class TestVLMModelAdapter:
         call_args = vlm.language_model.call_args
         assert call_args[0][0] is input_ids
         assert call_args[1]["cache"] is cache
-
-    def test_forward_return_hidden_preserves_tuple(self):
-        """Native MTP verify calls need ``(logits, hidden)`` to pass through."""
-        from omlx.models.vlm import VLMModelAdapter
-
-        vlm = self._make_mock_vlm_model()
-        adapter = VLMModelAdapter(vlm)
-
-        vlm.language_model.return_value = ("logits", "hidden")
-        result = adapter(
-            MockMXArray(shape=(1, 2)),
-            cache=[MagicMock()],
-            return_hidden=True,
-        )
-
-        assert result == ("logits", "hidden")
 
     def test_forward_text_only_uses_language_model_directly(self):
         """Text-only decode passes cache directly to language_model."""
@@ -573,6 +535,42 @@ class TestPerRequestMRoPEDecode:
         assert pos_ids[1, 0].item() == 80.0
         assert pos_ids[1, 1].item() == 81.0
 
+    def test_mrope_multi_token_window_advances_positions(self):
+        """Regression: each row of an mRoPE window must advance from its start.
+
+        Multi-token windows (speculative-decode verify) previously broadcast each
+        row's start offset across the whole window, so every position in the
+        window was rope-rotated at the first position. That silently corrupted the
+        keys the verify wrote back into the cache. The consuming attention builds
+        its own positions as arange(offset, offset + L) when none are supplied;
+        the positions we pass must match that.
+        """
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        assert adapter._uses_minimax_m3_positions is False
+
+        adapter.set_batch_rope_deltas(mx.array([-50.0, 0.0]))
+
+        input_ids = mx.zeros((2, 2), dtype=mx.int32)
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array([100, 80])
+        cache = [cache_layer]
+
+        adapter(input_ids, cache=cache)
+
+        call_kwargs = vlm.language_model.call_args[1]
+        pos_ids = call_kwargs["position_ids"]
+        assert pos_ids.shape == (3, 2, 2)
+        for section in range(3):
+            assert pos_ids[section, 0, 0].item() == 50.0
+            assert pos_ids[section, 0, 1].item() == 51.0
+            assert pos_ids[section, 1, 0].item() == 80.0
+            assert pos_ids[section, 1, 1].item() == 81.0
+
     def test_get_last_rope_deltas(self):
         """get_last_rope_deltas extracts value from language model."""
         import mlx.core as mx
@@ -587,6 +585,54 @@ class TestPerRequestMRoPEDecode:
 
         vlm.language_model._rope_deltas = None
         assert adapter.get_last_rope_deltas() == 0.0
+
+    def test_mrope_scalar_offset_fallback_initializes_position_state(self):
+        """Regression #2387: MiniCPM-o text-only prefill with scalar cache offsets.
+
+        MiniCPM-o detects as mRoPE (mlx-vlm injects mrope_section into its
+        text config) but its SigLIP VisionConfig has no spatial_merge_size,
+        so the borrowed qwen3_vl LanguageModel crashes in get_rope_index()
+        unless position state is initialized first (#241). The mRoPE branch
+        fallback for scalar cache offsets must call _set_position_state.
+        """
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        assert adapter._uses_mrope is True
+
+        input_ids = mx.zeros((1, 16), dtype=mx.int32)
+        cache_layer = MagicMock(spec=["offset"])
+        cache_layer.offset = 0
+        cache = [cache_layer]
+
+        adapter(input_ids, cache=cache)
+
+        vlm._set_position_state.assert_called_once_with(input_ids)
+        call_kwargs = vlm.language_model.call_args[1]
+        assert "position_ids" not in call_kwargs
+
+    def test_mrope_delta_fallback_initializes_position_state(self):
+        """Same as above for the batch-deltas branch with unusable offsets."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        adapter.set_batch_rope_deltas(mx.array([0.0]))
+
+        input_ids = mx.zeros((1, 16), dtype=mx.int32)
+        cache_layer = MagicMock(spec=[])
+        cache = [cache_layer]
+
+        adapter(input_ids, cache=cache)
+
+        vlm._set_position_state.assert_called_once_with(input_ids)
+        call_kwargs = vlm.language_model.call_args[1]
+        assert "position_ids" not in call_kwargs
 
 
 class TestLogitsExtraction:

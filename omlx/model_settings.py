@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, Optional
 
 from .model_profiles import (
     MODEL_SPECIFIC_PROFILE_FIELDS,
+    UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
     filter_universal_fields,
     slugify_profile_api_name,
@@ -26,6 +27,53 @@ logger = logging.getLogger(__name__)
 
 # Current settings file format version
 SETTINGS_VERSION = 1
+
+
+def vlm_mtp_processor_conflicts(data: dict) -> list:
+    """Names of settings that need per-request logits processors and
+    therefore cannot combine with ``vlm_mtp_enabled``.
+
+    The vlm_mtp decode path bypasses mlx-lm BatchGenerator, where logits
+    processors are applied; with any of these set, every request would fall
+    back to BatchGenerator and the toggle would never engage (#2399).
+    Neutral values (repetition 1.0, presence 0.0) build no processor and do
+    not conflict.
+
+    ``thinking_budget_enabled`` is intentionally absent: the vlm_mtp path
+    applies ``ThinkingBudgetProcessor`` at verify time via
+    ``MTPProcessingSampler`` (see omlx/speculative/processing_sampler.py),
+    so a thinking-budget default no longer forces the BatchGenerator
+    fallback.
+    """
+    conflicts = []
+    rep = data.get("repetition_penalty")
+    if rep is not None and rep != 1.0:
+        conflicts.append("repetition_penalty")
+    pres = data.get("presence_penalty")
+    if pres is not None and pres != 0.0:
+        conflicts.append("presence_penalty")
+    if data.get("guided_grammar_enabled"):
+        conflicts.append("guided_grammar_enabled")
+    return conflicts
+
+
+def resolve_vlm_mtp_conflicts(data: dict) -> tuple:
+    """Clear ``vlm_mtp_enabled`` from ``data`` when it conflicts with
+    processor-backed settings; returns ``(data, conflict_names)``.
+
+    The sampling / grammar side wins because those settings shape output
+    content while vlm_mtp only affects speed. Used for settings dicts that
+    predate the exclusivity rule (persisted files, profile merges) so
+    ``ModelSettings.__post_init__`` does not reject the whole blob.
+    """
+    if not data.get("vlm_mtp_enabled"):
+        return data, []
+    conflicts = vlm_mtp_processor_conflicts(data)
+    if not conflicts:
+        return data, []
+    resolved = dict(data)
+    resolved["vlm_mtp_enabled"] = False
+    return resolved, conflicts
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
 
@@ -89,10 +137,13 @@ class ModelSettings:
             for multi-row decode batches whose cache positions are aligned. Unaligned
             continuous batches fall back to standard decoding automatically. Compatible
             model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with
-            dflash_enabled and turboquant_kv_enabled.
+            dflash_enabled.
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
-            "gemma4_assistant" model.
+            "gemma4_assistant" model. Mutually exclusive with processor-backed
+            settings (guided grammar, thinking budget, repetition/presence
+            penalties); requests carrying such per-request parameters fall back
+            to BatchGenerator so the constraints stay enforced (#2399).
         vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
         vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
         is_pinned: Keep model loaded in memory.
@@ -189,16 +240,21 @@ class ModelSettings:
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
     # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
-    # with dflash and turboquant.
+    # with dflash.
     mtp_enabled: bool = False
-    mtp_draft_depth: int = 1
-    mtp_adaptive_depth: bool = False
+    # Maximum chained MTP draft tokens per verify cycle (speculative depth).
+    # None = model-specific default (3 for DeepSeek-V4 and Qwen3.5/3.6).
+    # An adaptive controller picks 1..max per sequence from rolling
+    # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
+    mtp_num_draft_tokens: Optional[int] = None
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
     # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
     # Mutually exclusive with all other speculative paths because the wrapper
-    # bypasses mlx-lm BatchGenerator at decode time.
+    # bypasses mlx-lm BatchGenerator at decode time. Also exclusive with
+    # processor-backed settings (guided grammar, thinking budget, penalties)
+    # — see vlm_mtp_processor_conflicts().
     vlm_mtp_enabled: bool = False
     vlm_mtp_draft_model: Optional[str] = (
         None  # Path / model id of the assistant drafter
@@ -210,6 +266,8 @@ class ModelSettings:
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
+    is_hidden: bool = False  # Hidden from /v1/models (still shown, badged, in admin)
+    is_favorite: bool = False  # Listed first in /v1/models and admin lists
 
     # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
     # loaders are allowed to execute custom Python from the model repository
@@ -222,19 +280,15 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
-        # Native MTP is mutually exclusive with DFlash (also speculative) and
-        # TurboQuant KV (patches the same attention path). Reject combos at
-        # construction time so the conflict surfaces in the admin UI / API
-        # rather than at model load.
+        # Native MTP is mutually exclusive with DFlash (also speculative).
+        # Reject the combo at construction time so the conflict surfaces in
+        # the admin UI / API rather than at model load. TurboQuant KV is
+        # compatible: its attention patch routes MTP's decode-shaped
+        # multi-row verify through the quantized decode kernels.
         if self.mtp_enabled and self.dflash_enabled:
             raise ValueError(
                 "mtp_enabled and dflash_enabled cannot both be True; choose one "
                 "speculative-decoding path per model"
-            )
-        if self.mtp_enabled and self.turboquant_kv_enabled:
-            raise ValueError(
-                "mtp_enabled and turboquant_kv_enabled cannot both be True; "
-                "TurboQuant patches the attention path that MTP relies on"
             )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
@@ -252,13 +306,21 @@ class ModelSettings:
                         f"vlm_mtp_enabled and {name} cannot both be True; "
                         "choose one speculative path per model"
                     )
-        try:
-            self.mtp_draft_depth = int(self.mtp_draft_depth or 1)
-        except (TypeError, ValueError):
-            self.mtp_draft_depth = 1
-        if self.mtp_draft_depth < 1 or self.mtp_draft_depth > 8:
-            raise ValueError("mtp_draft_depth must be between 1 and 8")
-        self.mtp_adaptive_depth = bool(self.mtp_adaptive_depth)
+            # Grammar / penalty defaults materialize as per-request logits
+            # processors, which the vlm_mtp decode path cannot apply —
+            # every request would fall back to BatchGenerator and the
+            # toggle would silently never engage (#2399). Reject the combo
+            # at construction time like the speculative-path conflicts
+            # above. Thinking budget is exempt: it is applied at verify
+            # time via MTPProcessingSampler.
+            processor_conflicts = vlm_mtp_processor_conflicts(self.to_dict())
+            if processor_conflicts:
+                raise ValueError(
+                    "vlm_mtp_enabled cannot be combined with "
+                    f"{', '.join(processor_conflicts)}; these settings "
+                    "require per-request logits processors, which the "
+                    "vlm_mtp decode path does not apply"
+                )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
@@ -352,6 +414,20 @@ class ModelSettingsManager:
             self._settings = {}
 
             for model_id, model_data in models_data.items():
+                # Settings saved before the vlm_mtp exclusivity rule may
+                # combine vlm_mtp_enabled with processor-backed settings;
+                # __post_init__ would raise and the except below would drop
+                # the model's entire settings blob. Keep the content-shaping
+                # settings and turn vlm_mtp off instead.
+                model_data, conflicts = resolve_vlm_mtp_conflicts(model_data)
+                if conflicts:
+                    logger.warning(
+                        "Model '%s': vlm_mtp_enabled disabled on load; it "
+                        "cannot be combined with %s. Unset those settings "
+                        "to re-enable vlm_mtp.",
+                        model_id,
+                        ", ".join(conflicts),
+                    )
                 try:
                     self._settings[model_id] = ModelSettings.from_dict(model_data)
                 except Exception as e:
@@ -686,6 +762,10 @@ class ModelSettingsManager:
         # get_exposed_profile_runtime_settings_for_request(), which can
         # trigger an engine variant reload without persisting base settings.
         merged.update(filter_universal_fields(profile.get("settings", {}) or {}))
+        # A profile overriding penalties / grammar / thinking budget on a
+        # vlm_mtp base model would make __post_init__ raise on this
+        # request-time merge; drop vlm_mtp for the merged view instead.
+        merged, _ = resolve_vlm_mtp_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def _runtime_settings_with_profile_locked(
@@ -694,6 +774,7 @@ class ModelSettingsManager:
         base = self._settings.get(model_id)
         merged = base.to_dict() if base is not None else {}
         merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
+        merged, _ = resolve_vlm_mtp_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:
@@ -1040,9 +1121,16 @@ class ModelSettingsManager:
             current = self._settings.get(model_id)
             if current is None:
                 current = ModelSettings()
-            merged = current.to_dict()
-            for k, v in profile_settings.items():
-                merged[k] = v
+            # Universal fields: the profile is authoritative — absent keys
+            # reset to ModelSettings defaults. Model-specific fields keep
+            # additive overlay so preset/template chips (materialized as
+            # universal-only profiles) never disturb engine settings.
+            merged = {
+                k: v
+                for k, v in current.to_dict().items()
+                if k not in UNIVERSAL_FIELDS_SET
+            }
+            merged.update(filter_profile_fields(profile_settings))
             merged["active_profile_name"] = name
             if settings_sanitizer is not None:
                 settings_sanitizer(merged)
@@ -1199,3 +1287,80 @@ class ModelSettingsManager:
             del self._templates[name]
             self._save_templates()
             return True
+
+
+def forced_ct_keys(settings: "ModelSettings | None") -> set[str]:
+    """Chat-template keys a request is not allowed to override."""
+    if settings is None:
+        return set()
+    return set(settings.forced_ct_kwargs or [])
+
+
+def merge_chat_template_request_kwargs(
+    settings: "ModelSettings | None",
+    request_ct_kwargs: "dict[str, Any] | None" = None,
+) -> "dict[str, Any]":
+    """Merge model/profile defaults with per-request chat-template kwargs.
+
+    Precedence, lowest to highest:
+      1. ``settings.chat_template_kwargs``
+      2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
+      3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
+    """
+    merged: dict[str, Any] = {}
+    forced_keys = forced_ct_keys(settings)
+
+    if settings is not None:
+        if settings.chat_template_kwargs:
+            merged.update(settings.chat_template_kwargs)
+        # Dedicated toggles take precedence over chat_template_kwargs.
+        if settings.enable_thinking is not None:
+            merged["enable_thinking"] = settings.enable_thinking
+        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+        if settings.preserve_thinking is not None:
+            merged["preserve_thinking"] = settings.preserve_thinking
+
+    if request_ct_kwargs:
+        for key, value in request_ct_kwargs.items():
+            if key not in forced_keys:
+                merged[key] = value
+
+    return merged
+
+
+def merge_chat_template_kwargs(
+    settings: "ModelSettings | None",
+    request_ct_kwargs: "dict[str, Any] | None" = None,
+    *,
+    thinking_budget: "int | None" = None,
+    preserve_thinking_default: "bool | None" = None,
+) -> "dict[str, Any]":
+    """Resolve the effective chat_template_kwargs for prompt rendering.
+
+    Precedence, lowest to highest:
+      1. ``settings.chat_template_kwargs``
+      2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
+      3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
+      4. thinking budget activation when ``enable_thinking`` is still unset
+      5. the model's preserve-thinking default when it is supported and unset
+    """
+    merged = merge_chat_template_request_kwargs(settings, request_ct_kwargs)
+
+    if (
+        thinking_budget is None
+        and settings is not None
+        and settings.thinking_budget_enabled
+        and settings.thinking_budget_tokens
+    ):
+        thinking_budget = settings.thinking_budget_tokens
+    if thinking_budget is not None and "enable_thinking" not in merged:
+        merged["enable_thinking"] = True
+
+    if (
+        preserve_thinking_default is True
+        and merged.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged
+    ):
+        merged["preserve_thinking"] = True
+
+    return merged

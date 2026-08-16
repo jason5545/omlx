@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import json
 import logging
 import os
 import queue
 import shutil
+import stat
 import struct
 import threading
 import time
@@ -37,6 +39,10 @@ import numpy as np
 from omlx.utils.formatting import format_bytes
 
 from .interface import CacheManager
+from .pooling_delta import (
+    POOLING_CACHE_DELTA_CLASS,
+    POOLING_CACHE_DELTA_FORMAT_VERSION,
+)
 from .stats import PagedSSDCacheStats
 
 logger = logging.getLogger(__name__)
@@ -155,15 +161,49 @@ _CACHE_FORMAT_VERSION = "3"
 # Versions whose blocks the current code can read. V3 polyfills V2 blocks
 # whose layer data was stored as the legacy 2-tuple `(keys, values)` —
 # they are upgraded to N-tuple markers on read so the rest of omlx core
-# sees a uniform shape. New writes always use V3.
-_READABLE_CACHE_FORMAT_VERSIONS = frozenset({"2", "3"})
+# sees a uniform shape. New writes use V3 unless a PoolingCache block carries
+# the V4 append-only delta representation.
+_READABLE_CACHE_FORMAT_VERSIONS = frozenset(
+    {"2", "3", "5", POOLING_CACHE_DELTA_FORMAT_VERSION}
+)
+
+_GDN_STATE_CODEC_BY_DTYPE = {
+    "fp32": "fp32",
+    "bf16": "bf16_v1",
+    "int8": "int8_rowwise_last_axis_v1",
+    "rht_int8": "rht_int8_rowwise_last_axis_v1",
+    "rht_int16": "rht_int16_rowwise_last_axis_v1",
+}
 
 
 # Layer cache type names whose meta_state should be clamped on save so the
 # rotating buffer's _idx never exceeds the actual buffer length. Restoring a
 # cache where _idx > keys.shape[2] makes BatchRotatingKVCache.merge() either
 # overshoot the RHS or (when omlx pads) leak zero positions into attention.
-_ROTATING_CACHE_TYPES = ("RotatingKVCache", "BatchRotatingKVCache")
+_ROTATING_CACHE_TYPES = (
+    "RotatingKVCache",
+    "BatchRotatingKVCache",
+    "BufferedRotatingKVCache",
+)
+
+_STORAGE_CLASS_NAME_ALIASES = {
+    # mlx-vlm MTP uses this transient target-cache wrapper for rollback
+    # slack. Persist the canonical rotating-cache type so blocks remain
+    # compatible with the model.make_cache() signature.
+    "BufferedRotatingKVCache": "RotatingKVCache",
+}
+
+
+def _storage_layer_cache_types(
+    layer_cache_types: list[str] | tuple[str, ...] | None,
+) -> list[str] | None:
+    """Return type names to persist in new cache block metadata."""
+    if layer_cache_types is None:
+        return None
+    return [
+        _STORAGE_CLASS_NAME_ALIASES.get(cache_type, cache_type)
+        for cache_type in layer_cache_types
+    ]
 
 
 def _canonicalize_layer_cache_types(
@@ -181,6 +221,14 @@ def _canonicalize_layer_cache_types(
     wrapper_to_canonical = {
         "SizedArraysCache": "ArraysCache",
         "PrefillReadyRotatingKVCache": "RotatingKVCache",
+        POOLING_CACHE_DELTA_CLASS: "PoolingCache",
+        # Batch and single-request TurboQuant caches persist the same packed
+        # per-request state (the save path records whichever class name it
+        # extracted; the restore path rebuilds a TurboQuantKVCache from
+        # either). Collapsing them keeps the predicted layout from
+        # refresh_ssd_layer_signature — which always says
+        # "TurboQuantKVCache" — from sweeping valid batch-form blocks.
+        "BatchTurboQuantKVCache": "TurboQuantKVCache",
     }
     return [
         wrapper_to_canonical.get(cache_type, cache_type)
@@ -194,6 +242,10 @@ def _cache_compat_signature(
     num_layers: int = 0,
     block_size: int = 0,
     layer_cache_types: list[str] | None = None,
+    turboquant_kv_bits: float | None = None,
+    cachelist_subtypes: dict[str, list[str]] | None = None,
+    payload_layout: str | None = None,
+    gdn_sidecar_state_dtype: str | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -202,7 +254,288 @@ def _cache_compat_signature(
         "block_size": int(block_size or 0),
         "layer_cache_types": list(layer_cache_types or []),
     }
+    # TurboQuant packed state width depends on the bit depth
+    # (packed_width = ceil(head_dim * bits / 32)), so blocks written at
+    # different bit depths are shape-incompatible (#2045). Only stamped
+    # when TurboQuant is active so non-TurboQuant signatures stay
+    # byte-identical to the previous format.
+    if turboquant_kv_bits is not None:
+        payload["turboquant_kv_bits"] = float(turboquant_kv_bits)
+    # Mixed CacheList layers (a non-sliceable sub next to a KVCache, e.g.
+    # inkling's CacheList(KVCache, ArraysCache(4))) additionally stamp
+    # their sub composition: the flat "CacheList" type name cannot tell a
+    # 2-slot ArraysCache block from a 4-slot one, and restoring the wrong
+    # arity IndexErrors in the model. Only stamped when such layers exist
+    # so other signatures stay byte-identical to the previous format.
+    if cachelist_subtypes:
+        payload["cachelist_subtypes"] = cachelist_subtypes
+    if payload_layout is not None:
+        payload["payload_layout"] = payload_layout
+    if gdn_sidecar_state_dtype is not None:
+        payload["gdn_sidecar_state_dtype"] = gdn_sidecar_state_dtype
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def cache_signature_for(
+    *,
+    model_name: str,
+    num_layers: int,
+    block_size: int,
+    layer_cache_types: list[str],
+    turboquant_kv_bits: float | None = None,
+    cachelist_subtypes: dict[str, list[str]] | None = None,
+    gdn_sidecar_state_dtype: str | None = None,
+) -> str:
+    """Build the legacy/embedded cache compatibility signature.
+
+    This is the public, stateless counterpart of
+    :meth:`PagedSSDCacheManager.cache_signature_for`.  The manager method
+    additionally stamps its configured payload layout and supplies its
+    expected TurboQuant/CacheList values when those arguments are omitted.
+    """
+    return _cache_compat_signature(
+        model_name=model_name,
+        num_layers=num_layers,
+        block_size=block_size,
+        layer_cache_types=layer_cache_types,
+        turboquant_kv_bits=turboquant_kv_bits,
+        cachelist_subtypes=cachelist_subtypes,
+        gdn_sidecar_state_dtype=gdn_sidecar_state_dtype,
+    )
+
+
+def _signature_turboquant_bits(cache_signature: str) -> float | None:
+    """Extract ``turboquant_kv_bits`` from a stored signature, or None."""
+    if not cache_signature:
+        return None
+    try:
+        payload = json.loads(cache_signature)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        # Corrupted/foreign signature that parses as a JSON scalar or list.
+        # Report "no recorded depth" instead of raising: an AttributeError
+        # here would abort the whole stale-signature sweep.
+        return None
+    bits = payload.get("turboquant_kv_bits")
+    if bits is None:
+        return None
+    try:
+        return float(bits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _block_turboquant_bits(
+    layer_cache_types: list[str] | None,
+    layer_meta_states: list[tuple] | None,
+) -> float | None:
+    """Read the bit depth a block's own TurboQuant layers were packed at.
+
+    TurboQuant meta_state is ``(offset, bits, seed, ...)`` — the same tuple
+    the restore path reads back at reconstruction. Deriving the signature
+    stamp from the block itself keeps it truthful even when the manager's
+    expectation is stale or not yet learned.
+    """
+    if not layer_cache_types or not layer_meta_states:
+        return None
+    for i, cache_type in enumerate(layer_cache_types):
+        if cache_type not in ("TurboQuantKVCache", "BatchTurboQuantKVCache"):
+            continue
+        if i >= len(layer_meta_states):
+            continue
+        meta_state = layer_meta_states[i]
+        if isinstance(meta_state, (list, tuple)) and len(meta_state) >= 3:
+            try:
+                return float(meta_state[1])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+_CACHELIST_NON_SLICEABLE_SUB_CLASSES = frozenset(
+    {
+        "ArraysCache",
+        "SizedArraysCache",
+        "PoolingCache",
+        "BatchPoolingCache",
+        "RotatingKVCache",
+        "BatchRotatingKVCache",
+        "PrefillReadyRotatingKVCache",
+        "BufferedRotatingKVCache",
+    }
+)
+
+_ARRAYS_SUB_CLASSES = frozenset({"ArraysCache", "SizedArraysCache"})
+_POOLING_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
+# Sliceable KV sub-cache classes inside a CacheList (4D sequence tensors).
+# Shared with prefix_cache.cachelist_pm_member_plan (single source so the
+# class-level expectation and the shape-level store plan cannot drift).
+# QuantizedKVCache is deliberately absent: its state elements are tuples of
+# packed/scale/bias arrays, so the 4D shape plan can never classify it as
+# sliceable — listing it here would stamp an @pm expectation that stores can
+# never satisfy, sweeping every block on each restart.
+_PM_SLICEABLE_SUB_CLASSES = frozenset({"KVCache", "BatchKVCache"})
+
+# Storage-layout token appended to a mixed CacheList layer's subtype
+# descriptor when the layer uses per-member block storage. Part of the
+# compatibility identity: legacy cumulative blocks lack the token, so the
+# stale-signature sweep invalidates them instead of letting token-hash
+# dedup keep splicing them into per-member chains (#2550 review).
+_PM_LAYOUT_TOKEN = "@pm"
+
+
+def cachelist_pm_class_eligible(sub_class_names: list[str]) -> bool:
+    """Class-level eligibility for per-member CacheList block storage.
+
+    True when every member is either a sliceable KV class or an
+    ArraysCache-style class, with at least one of each. Must stay in sync
+    with ``prefix_cache.cachelist_pm_member_plan`` (which additionally
+    checks live tensor shapes at store time).
+    """
+    if not sub_class_names:
+        return False
+    names = [str(n) for n in sub_class_names]
+    has_slice = any(n in _PM_SLICEABLE_SUB_CLASSES for n in names)
+    has_boundary = any(n in _ARRAYS_SUB_CLASSES for n in names)
+    all_known = all(
+        n in _PM_SLICEABLE_SUB_CLASSES or n in _ARRAYS_SUB_CLASSES for n in names
+    )
+    return has_slice and has_boundary and all_known
+
+
+def _canonical_sub_name(name: Any) -> str:
+    """Canonicalize one CacheList sub-cache class name for signatures."""
+    canonical = _canonicalize_layer_cache_types([str(name or "")])
+    return canonical[0] if canonical else ""
+
+
+def _signature_cachelist_subtypes(cache_signature: str) -> dict | None:
+    """Extract ``cachelist_subtypes`` from a stored signature, or None."""
+    if not cache_signature:
+        return None
+    try:
+        payload = json.loads(cache_signature)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    subtypes = payload.get("cachelist_subtypes")
+    return subtypes if isinstance(subtypes, dict) else None
+
+
+def _block_cachelist_subtypes(
+    cache_data: list[Any] | None,
+    layer_cache_types: list[str] | None,
+    layer_meta_states: list[tuple] | None,
+) -> dict[str, list[str]] | None:
+    """Describe mixed CacheList layers' sub composition from block payload.
+
+    Only layers whose composition contains a non-sliceable sub class are
+    stamped, so signatures of KVCache-only CacheList models (GLM /
+    deepseek_v32) stay byte-identical to the previous format. ArraysCache
+    descriptors carry the slot count (``"ArraysCache:4"``), while pooling
+    descriptors carry the logical state arity (``"PoolingCache:5"``).
+    Both values are part of the persisted layout identity.
+    """
+    if not cache_data or not layer_cache_types:
+        return None
+    subtypes: dict[str, list[str]] = {}
+    for i, cache_type in enumerate(layer_cache_types):
+        if cache_type != "CacheList" or i >= len(cache_data):
+            continue
+        layer_data = cache_data[i]
+        if not (
+            isinstance(layer_data, tuple)
+            and len(layer_data) == 2
+            and layer_data[0] in ("__cache_list__", "__cache_list_pm__")
+            and isinstance(layer_data[1], (list, tuple))
+        ):
+            continue
+        meta_names: list[Any] = []
+        if (
+            layer_meta_states
+            and i < len(layer_meta_states)
+            and isinstance(layer_meta_states[i], (list, tuple))
+            and len(layer_meta_states[i]) >= 1
+            and isinstance(layer_meta_states[i][0], (list, tuple))
+        ):
+            meta_names = list(layer_meta_states[i][0])
+        descriptors: list[str] = []
+        has_non_sliceable = False
+        for j, sub_tensor in enumerate(layer_data[1]):
+            name = _canonical_sub_name(meta_names[j] if j < len(meta_names) else "")
+            element_count = None
+            is_pooling_delta = False
+            if (
+                isinstance(sub_tensor, tuple)
+                and len(sub_tensor) >= 3
+                and sub_tensor[0] == "__nstate__"
+            ):
+                if not name:
+                    name = _canonical_sub_name(sub_tensor[1])
+                if isinstance(sub_tensor[2], (list, tuple)):
+                    element_count = len(sub_tensor[2])
+                    is_pooling_delta = sub_tensor[1] == POOLING_CACHE_DELTA_CLASS
+            elif isinstance(sub_tensor, (list, tuple)):
+                element_count = len(sub_tensor)
+            if name in _CACHELIST_NON_SLICEABLE_SUB_CLASSES:
+                has_non_sliceable = True
+            if name in _ARRAYS_SUB_CLASSES and element_count is not None:
+                descriptors.append(f"ArraysCache:{element_count}")
+            elif name in _POOLING_SUB_CLASSES and element_count is not None:
+                logical_count = element_count - 1 if is_pooling_delta else element_count
+                descriptors.append(f"{name}:{logical_count}")
+            else:
+                descriptors.append(name or "?")
+        if descriptors and has_non_sliceable:
+            if layer_data[0] == "__cache_list_pm__":
+                descriptors.append(_PM_LAYOUT_TOKEN)
+            subtypes[str(i)] = descriptors
+    return subtypes or None
+
+
+def cachelist_subtypes_from_cache_list(
+    cache_list: list[Any] | tuple[Any, ...] | None,
+) -> dict[str, list[str]] | None:
+    """Describe mixed CacheList layers' sub composition from live caches.
+
+    The live-model counterpart of ``_block_cachelist_subtypes`` — produces
+    the expectation the manager compares stored blocks against. Stamps the
+    same layers (composition contains a non-sliceable sub) with the same
+    descriptor format.
+    """
+    if not cache_list:
+        return None
+    subtypes: dict[str, list[str]] = {}
+    for i, cache_obj in enumerate(cache_list):
+        sub_caches = getattr(cache_obj, "caches", None)
+        if type(cache_obj).__name__ != "CacheList" or not sub_caches:
+            continue
+        descriptors: list[str] = []
+        has_non_sliceable = False
+        for sub in sub_caches:
+            name = _canonical_sub_name(type(sub).__name__)
+            if name in _CACHELIST_NON_SLICEABLE_SUB_CLASSES:
+                has_non_sliceable = True
+            if name in _ARRAYS_SUB_CLASSES:
+                slots = getattr(sub, "cache", None)
+                slot_count = len(slots) if isinstance(slots, list) else 0
+                descriptors.append(f"ArraysCache:{slot_count}")
+            elif name in _POOLING_SUB_CLASSES:
+                state = getattr(sub, "state", ())
+                state_count = len(state) if isinstance(state, (list, tuple)) else 0
+                descriptors.append(f"{name}:{state_count}")
+            else:
+                descriptors.append(name or "?")
+        if descriptors and has_non_sliceable:
+            sub_names = [
+                _canonical_sub_name(type(sub).__name__) for sub in sub_caches
+            ]
+            if cachelist_pm_class_eligible(sub_names):
+                descriptors.append(_PM_LAYOUT_TOKEN)
+            subtypes[str(i)] = descriptors
+    return subtypes or None
 
 
 def _clamp_rotating_meta_states(
@@ -269,6 +602,143 @@ def _encode_shape(shape) -> str:
 def _decode_shape(shape_str: str) -> tuple:
     """Decode shape string back to tuple of ints."""
     return tuple(int(d) for d in shape_str.split(","))
+
+
+def _store_nstate_elements_flat(
+    arrays: dict[str, Any],
+    cache_list_meta: dict[str, str],
+    prefix: str,
+    elements,
+) -> None:
+    """Write N elements as ``{prefix}_state_{k}`` keys with a
+    ``{prefix}_state_count`` count marker. Zero-dim shapes are
+    preserved via ``{prefix}_state_{k}_zero_dim``. Composite
+    elements (a bare tuple/list or a nested ``__nstate__``
+    marker) recurse under a ``{elem_key}`` sub-prefix and record
+    a ``{elem_key}_nested`` marker; the flat ``{elem_key}``
+    tensor is deliberately omitted so an older reader hits its
+    ``Missing {elem_key} in arrays`` path and skips the block.
+
+    Module-level on purpose — same recursive-closure cycle bug as
+    ``_load_nstate_flat`` (see that docstring).
+    """
+    cache_list_meta[f"{prefix}_state_count"] = str(len(elements))
+    for k, elem in enumerate(elements):
+        elem_key = f"{prefix}_state_{k}"
+        if elem is None:
+            # None placeholder — store an empty marker tensor
+            # and a sentinel zero_dim entry so the loader can
+            # restore None instead of materializing zeros.
+            arrays[elem_key] = mx.zeros((1,))
+            cache_list_meta[f"{elem_key}_none"] = "1"
+        elif _has_zero_dim(elem):
+            arrays[elem_key] = mx.zeros((1,))
+            cache_list_meta[f"{elem_key}_zero_dim"] = _encode_shape(elem.shape)
+        elif (
+            isinstance(elem, tuple)
+            and len(elem) >= 2
+            and isinstance(elem[0], str)
+            and elem[0] == "__nstate__"
+        ):
+            # Nested ``('__nstate__', class_name, [sub...])``
+            # marker — recurse, no flat tensor written.
+            cache_list_meta[f"{elem_key}_nested"] = "nstate"
+            sub_class = elem[1] if len(elem) >= 2 else None
+            sub_elements = elem[2] if len(elem) >= 3 else []
+            if sub_class:
+                cache_list_meta[f"{elem_key}_state_class_name"] = sub_class
+            _store_nstate_elements_flat(arrays, cache_list_meta, elem_key, sub_elements)
+        elif isinstance(elem, (tuple, list)):
+            # Bare tuple/list of sub-elements — recurse, no flat
+            # tensor written.
+            cache_list_meta[f"{elem_key}_nested"] = "tuple"
+            _store_nstate_elements_flat(arrays, cache_list_meta, elem_key, list(elem))
+        else:
+            if not isinstance(elem, mx.array):
+                raise TypeError(
+                    f"unsupported non-array nstate element "
+                    f"{elem_key}: {type(elem).__name__}"
+                )
+            arrays[elem_key] = elem
+
+
+def _load_nstate_flat(
+    arrays: dict[str, Any],
+    file_metadata: dict[str, str],
+    prefix: str,
+    fallback_class: str | None,
+) -> tuple | None:
+    """Read either V3 ``state_count`` keys or V2 ``keys``/``values``
+    polyfill at ``prefix``. Returns ``('__nstate__', class_name, elements)``
+    on success or None on missing tensors.
+
+    Module-level on purpose: the previous nested-closure version formed a
+    self-referential cycle (recursive closure) that captured ``arrays`` —
+    hundreds of MB of KV tensors — and only gen-2 gc could free it.
+    """
+    count_key = f"{prefix}_state_count"
+    class_name = None
+    if file_metadata:
+        class_name = file_metadata.get(f"{prefix}_state_class_name")
+    if class_name is None:
+        class_name = fallback_class
+
+    elements: list[Any] = []
+    if file_metadata and count_key in file_metadata:
+        # V3 path
+        try:
+            count = int(file_metadata[count_key])
+        except (ValueError, TypeError):
+            return None
+        for k in range(count):
+            elem_key = f"{prefix}_state_{k}"
+            none_marker = f"{elem_key}_none"
+            zd_marker = f"{elem_key}_zero_dim"
+            nested_marker = f"{elem_key}_nested"
+            if file_metadata and none_marker in file_metadata:
+                elements.append(None)
+                continue
+            if file_metadata and nested_marker in file_metadata:
+                # Composite element — recurse, then restore the same
+                # shape it had on save (bare tuple vs __nstate__).
+                sub = _load_nstate_flat(arrays, file_metadata, elem_key, None)
+                if sub is None:
+                    return None
+                if file_metadata[nested_marker] == "tuple":
+                    elements.append(tuple(sub[2]))
+                elif file_metadata[nested_marker] == "nstate":
+                    # Explicit marker on write — preserve the full
+                    # ('__nstate__', class_name, elements) as-is;
+                    # never unwrap (would drop the marker/class_name).
+                    elements.append(sub)
+                else:
+                    # Corrupt/unknown nested marker — fail closed.
+                    return None
+                continue
+            if elem_key not in arrays:
+                logger.error(f"Missing {elem_key} in arrays")
+                return None
+            if file_metadata and zd_marker in file_metadata:
+                elements.append(mx.zeros(_decode_shape(file_metadata[zd_marker])))
+            else:
+                elements.append(arrays[elem_key])
+    else:
+        # V2 polyfill: legacy ``{prefix}_keys`` / ``{prefix}_values``.
+        keys_key = f"{prefix}_keys"
+        values_key = f"{prefix}_values"
+        if keys_key not in arrays or values_key not in arrays:
+            return None
+        k_zd = f"{prefix}_keys_zero_dim"
+        v_zd = f"{prefix}_values_zero_dim"
+        if file_metadata and k_zd in file_metadata:
+            elements.append(mx.zeros(_decode_shape(file_metadata[k_zd])))
+        else:
+            elements.append(arrays[keys_key])
+        if file_metadata and v_zd in file_metadata:
+            elements.append(mx.zeros(_decode_shape(file_metadata[v_zd])))
+        else:
+            elements.append(arrays[values_key])
+    return ("__nstate__", class_name, elements)
 
 
 # --- Safetensors dtype mapping for background-thread-safe serialization ---
@@ -743,6 +1213,150 @@ class PagedSSDCacheIndex:
 
 
 @dataclass
+class GDNCheckpointMetadata:
+    """Metadata for a durable GDN checkpoint sidecar.
+
+    Sidecars intentionally have no safetensors payload inspection path.  The
+    source hash and signature digest are encoded in the directory/file name;
+    size and LRU state come from ``stat`` and are kept in this in-memory index.
+    The descriptive fields are retained for the lifetime of the manager for
+    diagnostics, but are not required to restore the sidecar.
+    """
+
+    source_block_hash: bytes
+    cache_signature_digest: str
+    file_path: Path
+    file_size: int
+    token_count: int
+    model_name: str
+    block_size: int
+    created_at: float
+    last_access: float
+
+    @property
+    def key(self) -> tuple[str, bytes]:
+        return (self.cache_signature_digest, self.source_block_hash)
+
+    def touch(self) -> None:
+        self.last_access = time.time()
+
+
+@dataclass(frozen=True)
+class GDNCheckpointLookup:
+    """Resolved recurrent sidecar plus the namespace decision that found it."""
+
+    file_path: Path
+    requested_state_dtype: str
+    effective_state_codec: str
+    used_legacy_fp32_fallback: bool
+
+
+class GDNCheckpointIndex:
+    """Thread-safe size/LRU index for durable GDN sidecar files."""
+
+    def __init__(self, max_size_bytes: int):
+        self._index: dict[tuple[str, bytes], GDNCheckpointMetadata] = {}
+        self._lru: OrderedDict[tuple[str, bytes], float] = OrderedDict()
+        self._total_size = 0
+        self._max_size = max_size_bytes
+        self._lock = threading.RLock()
+
+    def add(self, metadata: GDNCheckpointMetadata) -> None:
+        with self._lock:
+            key = metadata.key
+            old = self._index.pop(key, None)
+            if old is not None:
+                self._total_size -= old.file_size
+                self._lru.pop(key, None)
+            self._index[key] = metadata
+            self._lru[key] = metadata.last_access
+            self._total_size += metadata.file_size
+
+    def get(
+        self, source_block_hash: bytes, cache_signature_digest: str
+    ) -> GDNCheckpointMetadata | None:
+        with self._lock:
+            return self._index.get((cache_signature_digest, source_block_hash))
+
+    def remove(
+        self, source_block_hash: bytes, cache_signature_digest: str
+    ) -> GDNCheckpointMetadata | None:
+        with self._lock:
+            key = (cache_signature_digest, source_block_hash)
+            metadata = self._index.pop(key, None)
+            if metadata is None:
+                return None
+            self._lru.pop(key, None)
+            self._total_size -= metadata.file_size
+            return metadata
+
+    def remove_key(
+        self, key: tuple[str, bytes]
+    ) -> GDNCheckpointMetadata | None:
+        with self._lock:
+            metadata = self._index.pop(key, None)
+            if metadata is None:
+                return None
+            self._lru.pop(key, None)
+            self._total_size -= metadata.file_size
+            return metadata
+
+    def touch(self, source_block_hash: bytes, cache_signature_digest: str) -> None:
+        with self._lock:
+            key = (cache_signature_digest, source_block_hash)
+            metadata = self._index.get(key)
+            if metadata is None:
+                return
+            metadata.touch()
+            self._lru.move_to_end(key)
+            self._lru[key] = metadata.last_access
+
+    def get_lru_entries(self, count: int) -> list[GDNCheckpointMetadata]:
+        with self._lock:
+            result = []
+            for key in list(self._lru)[:count]:
+                metadata = self._index.get(key)
+                if metadata is not None:
+                    result.append(metadata)
+            return result
+
+    def sort_lru_by_last_access(self) -> None:
+        with self._lock:
+            self._lru = OrderedDict(
+                sorted(
+                    (
+                        (key, self._index[key].last_access)
+                        for key in self._lru
+                        if key in self._index
+                    ),
+                    key=lambda item: (item[1], item[0][0], item[0][1]),
+                )
+            )
+
+    def contains(self, source_block_hash: bytes, cache_signature_digest: str) -> bool:
+        with self._lock:
+            return (cache_signature_digest, source_block_hash) in self._index
+
+    @property
+    def total_size(self) -> int:
+        with self._lock:
+            return self._total_size
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._index)
+
+    def get_all_keys(self) -> list[tuple[str, bytes]]:
+        with self._lock:
+            return list(self._index)
+
+    def get_all_metadata(self) -> list[GDNCheckpointMetadata]:
+        with self._lock:
+            return list(self._index.values())
+
+
+@dataclass
 class _HotCacheBudgetEntry:
     owner: Any
     block_hash: bytes
@@ -922,6 +1536,8 @@ class PagedSSDCacheManager(CacheManager):
 
     # Subdirectory prefixes (hash first char)
     SUBDIR_CHARS = "0123456789abcdef"
+    _GDN_SIDECAR_DIRNAME = "_gdn_sidecars"
+    _GDN_SIGNATURE_DIGEST_LENGTH = 64
 
     def __init__(
         self,
@@ -936,6 +1552,8 @@ class PagedSSDCacheManager(CacheManager):
         expected_block_size_tokens: int = _DEFAULT_BLOCK_SIZE_TOKENS,
         expected_kv_bytes_per_token: int = _DEFAULT_KV_BYTES_PER_TOKEN,
         expected_layer_cache_types: list[str] | None = None,
+        gdn_ssd_split_enabled: bool = False,
+        gdn_sidecar_state_dtype: str = "fp32",
     ):
         """
         Initialize the SSD cache manager.
@@ -977,19 +1595,55 @@ class PagedSSDCacheManager(CacheManager):
             expected_layer_cache_types: Optional current cache layout. When
                 provided, blocks with a different per-layer type list are
                 skipped at startup.
+            gdn_ssd_split_enabled: Stamp new main blocks with the split GDN
+                payload layout and enable the durable-sidecar profile. The
+                file/index API itself remains available only in SSD-backed
+                mode; split blocks use format version 5.
         """
         self._cache_dir = cache_dir
         self._max_size = max_size_bytes
         self._index = PagedSSDCacheIndex(max_size_bytes)
         self._incompatible_index = PagedSSDCacheIndex(max_size_bytes)
+        # Durable GDN checkpoints are kept in a separate namespace and never
+        # promoted into the raw-byte hot cache.  They still consume the same
+        # shared SSD budget as the two main block indexes.
+        self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
         self._expected_block_size = expected_block_size
         self._expected_layer_cache_types = expected_layer_cache_types
+        self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
+        self._gdn_sidecar_state_dtype = str(gdn_sidecar_state_dtype).lower()
+        if self._gdn_sidecar_state_dtype not in {
+            "fp32",
+            "bf16",
+            "int8",
+            "rht_int8",
+            "rht_int16",
+        }:
+            raise ValueError(
+                "gdn_sidecar_state_dtype must be one of: "
+                "fp32, bf16, int8, rht_int8, rht_int16"
+            )
+        self._gdn_legacy_fp32_fallbacks = 0
+        self._payload_layout = (
+            "split_recurrent_v1" if self._gdn_ssd_split_enabled else "embedded"
+        )
+        # TurboQuant bit depth requests will quantize at; learned together
+        # with the layer signature via ``set_expected_layer_signature``
+        # (the depth is only known once the engine has applied the model's
+        # TurboQuant settings, after this manager is constructed).
+        self._expected_turboquant_kv_bits: float | None = None
+        # Sub composition of mixed CacheList layers (see
+        # ``cachelist_subtypes_from_cache_list``); learned together with
+        # the layer signature. None disables the check (legacy managers /
+        # models without mixed CacheList layers).
+        self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
         # Set once we have swept stale-signature blocks for the current
-        # ``_expected_layer_cache_types``. Re-assigning the signature (e.g.,
-        # via ``adopt_layer_signature_if_unset``) resets this so the new
+        # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
+        # Re-assigning the signature (e.g., via
+        # ``adopt_layer_signature_if_unset``) resets this so the new
         # signature triggers its own one-shot sweep.
         self._signature_sweep_completed = False
         self._lock = threading.RLock()
@@ -998,6 +1652,7 @@ class PagedSSDCacheManager(CacheManager):
         self._disk_usage_cache = None  # type: shutil._ntuple_diskusage | None
         self._disk_usage_cache_time: float = 0.0
         self._last_disk_pressure_warn: float = 0.0
+        self._last_promotion_failure_warn: float = 0.0
 
         # Statistics
         self._stats = {
@@ -1012,6 +1667,7 @@ class PagedSSDCacheManager(CacheManager):
             "hot_cache_hits": 0,
             "hot_cache_evictions": 0,
             "hot_cache_promotions": 0,
+            "hot_cache_promotion_failures": 0,
             "preload_calls": 0,
             "preload_blocks_loaded": 0,
             "preload_time_ms": 0.0,
@@ -1284,8 +1940,11 @@ class PagedSSDCacheManager(CacheManager):
         arrays: dict[str, Any],
         file_metadata: Any,
         metadata: PagedSSDBlockMetadata,
-    ) -> None:
-        """Promote a block loaded from SSD into the hot cache."""
+    ) -> bool:
+        """Promote a block loaded from SSD into the hot cache.
+
+        Returns True when the entry was retained, False on failure.
+        """
         try:
             promoted_raw = {}
             for name, arr in arrays.items():
@@ -1302,8 +1961,63 @@ class PagedSSDCacheManager(CacheManager):
             }
             self._hot_cache_put(block_hash, entry)
             self._stats["hot_cache_promotions"] += 1
-        except Exception:
-            pass  # Promotion failure is non-critical
+            return True
+        except Exception as e:
+            self._record_promotion_failure(block_hash, e)
+            return False
+
+    def _promote_pending_write_to_hot_cache(
+        self,
+        block_hash: bytes,
+        entry: dict[str, Any],
+    ) -> bool:
+        """Retain a pending-write read in the hot tier when requested.
+
+        A write-through block can be read while its background SSD write is
+        still pending.  Treat that read the same as a disk read: otherwise
+        whether it is promoted depends on a race with the writer thread.
+        Keep the promoted copy dirty until its atomic SSD file is visible so
+        an early eviction still preserves the block.
+
+        Returns True when the entry was retained, False on failure or when
+        the hot cache is disabled.
+        """
+        if not self._hot_cache_enabled:
+            return False
+        try:
+            promoted_entry = dict(entry)
+            block_metadata = promoted_entry.get("block_metadata")
+            file_path = getattr(block_metadata, "file_path", None)
+            promoted_entry["dirty"] = not (
+                isinstance(file_path, Path) and file_path.exists()
+            )
+            self._hot_cache_put(block_hash, promoted_entry)
+            self._stats["hot_cache_promotions"] += 1
+            return True
+        except Exception as e:
+            self._record_promotion_failure(block_hash, e)
+            return False
+
+    def _record_promotion_failure(self, block_hash: bytes, exc: Exception) -> None:
+        """Count a failed hot cache promotion and warn with throttling.
+
+        Promotion failures are non-critical for the request being served
+        (the reconstructed cache is already in hand), but a systematic
+        failure would leave the hot tier permanently empty with no signal,
+        so surface it in stats and a throttled warning (#2662).
+        """
+        self._stats["hot_cache_promotion_failures"] += 1
+        now = time.monotonic()
+        if now - self._last_promotion_failure_warn < 60.0:
+            return
+        self._last_promotion_failure_warn = now
+        logger.warning(
+            "Hot cache promotion failed for block %s: %s "
+            "(%d promotion failures total)",
+            block_hash.hex()[:16],
+            exc,
+            self._stats["hot_cache_promotion_failures"],
+        )
 
     def _init_directories(self) -> None:
         """Create cache directory structure."""
@@ -1331,13 +2045,139 @@ class PagedSSDCacheManager(CacheManager):
         filename = f"{hash_hex}.safetensors"
         return self._cache_dir / subdir / filename
 
+    @staticmethod
+    def _gdn_signature_digest(cache_signature: str) -> str:
+        """Return the stable directory component for a cache signature."""
+        return hashlib.sha256(cache_signature.encode("utf-8")).hexdigest()
+
+    def _get_gdn_sidecar_path(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> Path:
+        """Return the durable sidecar path for a source block/signature pair."""
+        signature_digest = self._gdn_signature_digest(cache_signature)
+        return (
+            self._cache_dir
+            / self._GDN_SIDECAR_DIRNAME
+            / signature_digest
+            / f"{source_block_hash.hex()}.safetensors"
+        )
+
+    def _is_safe_gdn_sidecar_file(self, file_path: Path) -> bool:
+        """Reject sidecars that escape the cache root through symlinks."""
+        if self._cache_dir is None:
+            return False
+        sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+        if (
+            sidecar_root.is_symlink()
+            or file_path.parent.is_symlink()
+            or file_path.is_symlink()
+        ):
+            return False
+        try:
+            file_path.resolve(strict=True).relative_to(
+                self._cache_dir.resolve(strict=True)
+            )
+        except (OSError, ValueError):
+            return False
+        return file_path.is_file()
+
+    def _unlink_gdn_sidecar_file(self, metadata: GDNCheckpointMetadata) -> bool:
+        """Unlink one indexed sidecar without following swapped parent symlinks.
+
+        The index stores a pathname that was safe when it was discovered or
+        committed.  A later replacement of ``_gdn_sidecars`` (or its signature
+        directory) with a symlink must not turn forget/LRU/clear into an unlink
+        outside the cache.  Open both directories without following symlinks,
+        validate the leaf with ``lstat`` semantics, then unlink relative to the
+        already-open directory descriptor.
+
+        Returns ``False`` for an unsafe path. A missing file is treated as
+        successfully absent. Other OS errors are raised so callers can restore
+        the index entry and retry later.
+        """
+        if self._cache_dir is None:
+            return False
+
+        digest = metadata.cache_signature_digest
+        if len(digest) != self._GDN_SIGNATURE_DIGEST_LENGTH:
+            return False
+        try:
+            bytes.fromhex(digest)
+        except ValueError:
+            return False
+
+        sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+        file_name = f"{metadata.source_block_hash.hex()}.safetensors"
+        expected_path = sidecar_root / digest / file_name
+        if Path(metadata.file_path) != expected_path:
+            logger.warning(
+                "Refusing to unlink unexpected GDN sidecar path: %s",
+                metadata.file_path,
+            )
+            return False
+
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        root_fd = signature_fd = None
+        try:
+            root_fd = os.open(sidecar_root, directory_flags)
+            signature_fd = os.open(digest, directory_flags, dir_fd=root_fd)
+            try:
+                file_stat = os.stat(
+                    file_name,
+                    dir_fd=signature_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return True
+            if not stat.S_ISREG(file_stat.st_mode):
+                logger.warning(
+                    "Refusing to unlink non-regular GDN sidecar: %s",
+                    expected_path,
+                )
+                return False
+            try:
+                os.unlink(file_name, dir_fd=signature_fd)
+            except FileNotFoundError:
+                return True
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                logger.warning(
+                    "Refusing to unlink through unsafe GDN sidecar path: %s",
+                    expected_path,
+                )
+                return False
+            raise
+        finally:
+            if signature_fd is not None:
+                os.close(signature_fd)
+            if root_fd is not None:
+                os.close(root_fd)
+
     def _tracked_ssd_size(self) -> int:
-        """Return all SSD cache bytes tracked for this shared cache directory."""
-        return self._index.total_size + self._incompatible_index.total_size
+        """Return all tracked main-KV and GDN-sidecar bytes.
+
+        Sidecars deliberately share the configured SSD budget with main KV
+        files, so a long GDN history cannot grow without participating in the
+        same size enforcement path.
+        """
+        return (
+            self._index.total_size
+            + self._incompatible_index.total_size
+            + self._gdn_sidecar_index.total_size
+        )
 
     def _tracked_ssd_count(self) -> int:
-        """Return compatible plus incompatible tracked SSD cache file count."""
-        return self._index.count + self._incompatible_index.count
+        """Return the count of tracked main-KV and GDN-sidecar files."""
+        return (
+            self._index.count
+            + self._incompatible_index.count
+            + self._gdn_sidecar_index.count
+        )
 
     def _scan_existing_files(self) -> None:
         """Scan cache directory for existing files and build the compatible index.
@@ -1377,18 +2217,28 @@ class PagedSSDCacheManager(CacheManager):
                     logger.warning(f"Failed to read {file_path}: {e}")
                     errors += 1
 
+        sidecars_indexed, sidecars_skipped, sidecars_bytes = (
+            self._scan_existing_gdn_sidecars()
+        )
+
         self._index.sort_lru_by_last_access()
         self._incompatible_index.sort_lru_by_last_access()
+        self._gdn_sidecar_index.sort_lru_by_last_access()
 
         log_msg = (
             f"SSD cache scan complete: scanned={scanned}, indexed={indexed}, "
-            f"errors={errors}, total_size={format_bytes(self._index.total_size)}"
+            f"errors={errors}, total_size={format_bytes(self._tracked_ssd_size())}, "
+            f"gdn_sidecars={sidecars_indexed}"
         )
         if skipped_incompatible > 0:
             log_msg += (
                 f", skipped_incompatible={skipped_incompatible} blocks "
                 f"({format_bytes(skipped_incompatible_bytes)})"
             )
+        if sidecars_skipped > 0:
+            log_msg += f", skipped_gdn_sidecars={sidecars_skipped}"
+        if sidecars_bytes > 0:
+            log_msg += f", gdn_size={format_bytes(sidecars_bytes)}"
         logger.info(log_msg)
 
         # Startup can find a cache directory that already exceeds the shared
@@ -1396,6 +2246,291 @@ class PagedSSDCacheManager(CacheManager):
         tracked_size = self._tracked_ssd_size()
         if tracked_size > 0 and tracked_size > self._get_effective_max_size():
             self._enforce_size_limit_for_new_block(0, unbounded=True)
+
+    def _scan_existing_gdn_sidecars(self) -> tuple[int, int, int]:
+        """Index existing sidecars using only path and stat metadata.
+
+        The sidecar is an opaque safetensors file.  Startup must not load or
+        rewrite it merely to rebuild the LRU index, so the signature digest and
+        source hash are recovered from the namespace path and timestamps/sizes
+        are recovered from ``stat``.
+        """
+        if self._cache_dir is None:
+            return 0, 0, 0
+        root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+        if root.is_symlink() or not root.is_dir():
+            return 0, 0, 0
+
+        indexed = 0
+        skipped = 0
+        total_bytes = 0
+        for signature_dir in root.iterdir():
+            if signature_dir.is_symlink() or not signature_dir.is_dir():
+                continue
+            digest = signature_dir.name
+            if len(digest) != self._GDN_SIGNATURE_DIGEST_LENGTH:
+                skipped += 1
+                continue
+            try:
+                bytes.fromhex(digest)
+            except ValueError:
+                skipped += 1
+                continue
+            for file_path in signature_dir.glob("*.safetensors"):
+                try:
+                    source_hash = bytes.fromhex(file_path.stem)
+                    if (
+                        not source_hash
+                        or file_path.is_symlink()
+                        or not file_path.is_file()
+                    ):
+                        raise ValueError("invalid sidecar source hash or file")
+                    stat_result = file_path.stat()
+                    metadata = GDNCheckpointMetadata(
+                        source_block_hash=source_hash,
+                        cache_signature_digest=digest,
+                        file_path=file_path,
+                        file_size=stat_result.st_size,
+                        token_count=0,
+                        model_name="",
+                        block_size=0,
+                        created_at=stat_result.st_ctime,
+                        last_access=stat_result.st_mtime,
+                    )
+                    self._gdn_sidecar_index.add(metadata)
+                    indexed += 1
+                    total_bytes += stat_result.st_size
+                except (OSError, ValueError) as e:
+                    skipped += 1
+                    logger.debug("Skipping GDN sidecar %s: %s", file_path, e)
+        return indexed, skipped, total_bytes
+
+    def commit_gdn_checkpoint_file(
+        self,
+        source_block_hash: bytes,
+        staged_path: Path,
+        *,
+        token_count: int,
+        model_name: str,
+        cache_signature: str,
+        block_size: int,
+    ) -> Path | None:
+        """Atomically promote a request-local recurrent snapshot to SSD."""
+        if self._hot_cache_only or self._cache_dir is None:
+            return None
+        if not isinstance(source_block_hash, bytes) or not source_block_hash:
+            return None
+        staged_path = Path(staged_path)
+        try:
+            staged_stat = staged_path.stat()
+            if staged_path.is_symlink() or not staged_path.is_file():
+                return None
+        except OSError:
+            return None
+
+        signature_digest = self._gdn_signature_digest(cache_signature)
+        final_path = self._get_gdn_sidecar_path(source_block_hash, cache_signature)
+        with self._lock:
+            try:
+                sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+                sidecar_root.mkdir(parents=True, exist_ok=True)
+                if (
+                    sidecar_root.is_symlink()
+                    or sidecar_root.resolve(strict=True).parent
+                    != self._cache_dir.resolve(strict=True)
+                ):
+                    logger.warning("Rejecting unsafe GDN sidecar root")
+                    return None
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                if (
+                    final_path.parent.is_symlink()
+                    or final_path.parent.resolve(strict=True).parent
+                    != sidecar_root.resolve(strict=True)
+                ):
+                    logger.warning("Rejecting unsafe GDN sidecar destination")
+                    return None
+                if staged_stat.st_dev != final_path.parent.stat().st_dev:
+                    logger.warning("Rejecting cross-filesystem GDN sidecar promotion")
+                    return None
+                old = self._gdn_sidecar_index.remove(
+                    source_block_hash, signature_digest
+                )
+                try:
+                    # Temporarily remove the destination from LRU accounting so
+                    # size enforcement cannot evict/unlink the checkpoint being
+                    # replaced. Account for the full incoming file while the old
+                    # entry is protected; on promotion failure the old metadata
+                    # is restored below and its file remains intact.
+                    self._enforce_size_limit_for_new_block(staged_stat.st_size)
+                    os.replace(staged_path, final_path)
+                    committed_at = time.time()
+                    # os.replace preserves the staging file's timestamps. Stamp
+                    # the actual commit/access time so a restart reconstructs LRU
+                    # order from a meaningful mtime rather than stale staging age.
+                    with contextlib.suppress(OSError):
+                        os.utime(final_path, (committed_at, committed_at))
+                    self._gdn_sidecar_index.add(
+                        GDNCheckpointMetadata(
+                            source_block_hash=source_block_hash,
+                            cache_signature_digest=signature_digest,
+                            file_path=final_path,
+                            file_size=staged_stat.st_size,
+                            token_count=int(token_count),
+                            model_name=model_name,
+                            block_size=int(block_size),
+                            created_at=committed_at,
+                            last_access=committed_at,
+                        )
+                    )
+                    return final_path
+                except OSError:
+                    if old is not None and self._is_safe_gdn_sidecar_file(
+                        old.file_path
+                    ):
+                        self._gdn_sidecar_index.add(old)
+                    raise
+            except OSError as exc:
+                logger.warning("Failed to commit GDN sidecar: %s", exc)
+                return None
+
+    def get_gdn_checkpoint_file(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> Path | None:
+        """Return a sidecar path and touch its in-memory/on-disk LRU state."""
+        lookup = self.get_gdn_checkpoint_file_with_diagnostic(
+            source_block_hash, cache_signature
+        )
+        return lookup.file_path if lookup is not None else None
+
+    def get_gdn_checkpoint_file_with_diagnostic(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> GDNCheckpointLookup | None:
+        """Resolve a sidecar without hiding reduced-to-FP32 fallback.
+
+        ``get_gdn_checkpoint_file`` retains its historical ``Path`` return
+        type.  Restore callers that need proof of the selected namespace use
+        this richer companion API instead.
+        """
+        if self._hot_cache_only or self._cache_dir is None:
+            return None
+        if not isinstance(source_block_hash, bytes) or not source_block_hash:
+            return None
+        if not isinstance(cache_signature, str):
+            return None
+
+        with self._lock:
+            metadata = None
+            signature_digest = ""
+            selected_candidate_index = -1
+            candidates = self._gdn_signature_candidates(cache_signature)
+            for candidate_index, candidate in enumerate(candidates):
+                candidate_digest = self._gdn_signature_digest(candidate)
+                candidate_metadata = self._gdn_sidecar_index.get(
+                    source_block_hash, candidate_digest
+                )
+                if candidate_metadata is None:
+                    continue
+                if not self._is_safe_gdn_sidecar_file(
+                    candidate_metadata.file_path
+                ):
+                    self._gdn_sidecar_index.remove(
+                        source_block_hash, candidate_digest
+                    )
+                    continue
+                metadata = candidate_metadata
+                signature_digest = candidate_digest
+                selected_candidate_index = candidate_index
+                break
+            if metadata is None:
+                return None
+
+            requested_state_dtype = self._gdn_state_dtype_from_signature(
+                cache_signature
+            )
+            used_legacy_fp32_fallback = selected_candidate_index > 0
+            effective_state_dtype = (
+                "fp32" if used_legacy_fp32_fallback else requested_state_dtype
+            )
+            if used_legacy_fp32_fallback:
+                self._gdn_legacy_fp32_fallbacks += 1
+
+            self._gdn_sidecar_index.touch(source_block_hash, signature_digest)
+            try:
+                # Persist the LRU touch across manager restarts without
+                # touching the opaque safetensors payload itself.
+                os.utime(metadata.file_path, None)
+            except OSError as e:
+                logger.debug("Failed to persist GDN sidecar LRU touch: %s", e)
+            return GDNCheckpointLookup(
+                file_path=metadata.file_path,
+                requested_state_dtype=requested_state_dtype,
+                effective_state_codec=_GDN_STATE_CODEC_BY_DTYPE[
+                    effective_state_dtype
+                ],
+                used_legacy_fp32_fallback=used_legacy_fp32_fallback,
+            )
+
+    def has_gdn_checkpoint(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> bool:
+        """Return whether an indexed, existing sidecar is available."""
+        if self._hot_cache_only or self._cache_dir is None:
+            return False
+        if not isinstance(source_block_hash, bytes) or not source_block_hash:
+            return False
+        if not isinstance(cache_signature, str):
+            return False
+
+        with self._lock:
+            for candidate in self._gdn_signature_candidates(cache_signature):
+                signature_digest = self._gdn_signature_digest(candidate)
+                metadata = self._gdn_sidecar_index.get(
+                    source_block_hash, signature_digest
+                )
+                if metadata is None:
+                    continue
+                if metadata.file_path.is_file():
+                    return True
+                self._gdn_sidecar_index.remove(
+                    source_block_hash, signature_digest
+                )
+            return False
+
+    def forget_gdn_checkpoint(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> bool:
+        """Remove a sidecar from the index and delete its durable file."""
+        if self._hot_cache_only or self._cache_dir is None:
+            return False
+        if not isinstance(source_block_hash, bytes) or not source_block_hash:
+            return False
+        if not isinstance(cache_signature, str):
+            return False
+
+        with self._lock:
+            metadata = None
+            for candidate in self._gdn_signature_candidates(cache_signature):
+                signature_digest = self._gdn_signature_digest(candidate)
+                metadata = self._gdn_sidecar_index.remove(
+                    source_block_hash, signature_digest
+                )
+                if metadata is not None:
+                    break
+            if metadata is None:
+                return False
+            try:
+                deleted = self._unlink_gdn_sidecar_file(metadata)
+                if not deleted:
+                    self._gdn_sidecar_index.add(metadata)
+                return deleted
+            except OSError as e:
+                # Restore accounting if the file could not be removed. The
+                # sidecar remains a valid cache entry and can be retried.
+                self._gdn_sidecar_index.add(metadata)
+                logger.warning(
+                    "Failed to forget GDN sidecar %s: %s", metadata.file_path, e
+                )
+                return False
 
     def _is_compatible_block(self, metadata: PagedSSDBlockMetadata) -> bool:
         """Return True when a block can be indexed for this manager."""
@@ -1415,17 +2550,24 @@ class PagedSSDCacheManager(CacheManager):
                 metadata.layer_cache_types
             ) != _canonicalize_layer_cache_types(self._expected_layer_cache_types):
                 return False
-        if (
-            self._expected_layer_cache_types is not None
-            and not self._is_compatible_cache_signature(metadata)
-        ):
+        # Always gate the payload layout.  A manager without any other
+        # expectation still must not index a split block as an embedded block
+        # (or vice versa).  Signatures from before layout stamping default to
+        # embedded inside ``_is_compatible_cache_signature``.
+        if not self._is_compatible_cache_signature(metadata):
             return False
         return True
 
     def _is_compatible_cache_signature(self, metadata: PagedSSDBlockMetadata) -> bool:
         """Return True when a saved cache_signature matches enabled checks."""
         if not metadata.cache_signature:
-            return True
+            # Missing layout metadata is the historical embedded format. It
+            # remains readable for the embedded profile, but cannot prove a
+            # split block and therefore must not enter the split index.
+            return (
+                self._payload_layout == "embedded"
+                and self._signature_bits_match("")
+            )
 
         try:
             payload = json.loads(metadata.cache_signature)
@@ -1438,6 +2580,14 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 not expected_signature or metadata.cache_signature == expected_signature
             )
+
+        if not isinstance(payload, dict):
+            return False
+        # Old signatures did not carry this field and are embedded combined
+        # blocks by definition. This keeps the existing 2/3/4 reader path
+        # usable while making split and embedded signatures distinct.
+        if payload.get("payload_layout", "embedded") != self._payload_layout:
+            return False
 
         if self._expected_model_name:
             if payload.get("model_name", "") != self._expected_model_name:
@@ -1468,7 +2618,195 @@ class PagedSSDCacheManager(CacheManager):
             ) != _canonicalize_layer_cache_types(self._expected_layer_cache_types):
                 return False
 
+        # The block must PROVE a matching CacheList sub composition — an
+        # unstamped or mismatched block would rebuild a CacheList whose
+        # sub arity/classes disagree with the live model.
+        if (
+            self._expected_cachelist_subtypes is not None
+            and payload.get("cachelist_subtypes") != self._expected_cachelist_subtypes
+        ):
+            return False
+
+        if not self._signature_bits_match(metadata.cache_signature):
+            return False
+
         return True
+
+    def _signature_bits_match(self, cache_signature: str) -> bool:
+        """True when a block's recorded TurboQuant depth satisfies expectations.
+
+        With no expected depth every block passes. With one, the block must
+        PROVE a matching depth: the packed state width is
+        ``ceil(head_dim * bits / 32)``, so a block written at another depth —
+        or one with no recorded depth (pre-depth-stamping saves) — has an
+        incompatible or unverifiable width, and restoring it poisons batch
+        concatenation (#2045).
+        """
+        if self._expected_turboquant_kv_bits is None:
+            return True
+        return (
+            _signature_turboquant_bits(cache_signature)
+            == self._expected_turboquant_kv_bits
+        )
+
+    def is_signature_compatible(self, cache_signature: str) -> bool:
+        """Per-block signature gate for restore paths that bypass the
+        index scan (hot-cache / pending-write loads never pass through
+        ``_is_compatible_block``). Checks the expectation-gated signature
+        fields: TurboQuant depth and CacheList sub composition.
+        """
+        return self.signature_mismatch_reason(cache_signature) is None
+
+    def signature_mismatch_reason(self, cache_signature: str) -> str | None:
+        """Describe the first expectation-gated signature mismatch."""
+        cache_signature = cache_signature or ""
+        try:
+            signature_payload = json.loads(cache_signature) if cache_signature else {}
+        except (TypeError, ValueError):
+            signature_payload = {}
+        if not isinstance(signature_payload, dict):
+            return "invalid cache signature payload"
+        actual_layout = signature_payload.get("payload_layout", "embedded")
+        if actual_layout != self._payload_layout:
+            return (
+                f"payload layout: expected {self._payload_layout}, "
+                f"got {actual_layout}"
+            )
+        if not self._signature_bits_match(cache_signature):
+            actual_bits = _signature_turboquant_bits(cache_signature)
+            actual = "missing" if actual_bits is None else str(actual_bits)
+            return (
+                "TurboQuant depth: expected "
+                f"{self._expected_turboquant_kv_bits}, got {actual}"
+            )
+
+        expected_subtypes = self._expected_cachelist_subtypes
+        if expected_subtypes is None:
+            return None
+
+        actual_subtypes = _signature_cachelist_subtypes(cache_signature)
+        if actual_subtypes == expected_subtypes:
+            return None
+
+        actual_layers = actual_subtypes or {}
+
+        def _layer_sort_key(layer: str) -> tuple[int, int | str]:
+            try:
+                return (0, int(layer))
+            except (TypeError, ValueError):
+                return (1, str(layer))
+
+        for layer in sorted(
+            set(expected_subtypes) | set(actual_layers), key=_layer_sort_key
+        ):
+            expected = expected_subtypes.get(layer)
+            actual = actual_layers.get(layer)
+            if expected != actual:
+                return (
+                    f"CacheList sub composition at layer {layer}: "
+                    f"expected {expected}, got {actual}"
+                )
+
+        return "CacheList sub composition mismatch"
+
+    def cache_signature_for(
+        self,
+        *,
+        model_name: str,
+        num_layers: int,
+        block_size: int,
+        layer_cache_types: list[str],
+        turboquant_kv_bits: float | None = None,
+        cachelist_subtypes: dict[str, list[str]] | None = None,
+    ) -> str:
+        """Build a signature using this manager's expected layout settings.
+
+        Omitted TurboQuant and CacheList arguments inherit the manager's
+        expectation, which lets prefix-cache callers produce the exact same
+        signature as ``save_block`` without reaching into private fields.
+
+        GDN sidecar lookups hash this signature into a directory name, so
+        unlike block metadata checks there is no compare-time normalization.
+        Wrapper spellings must collapse here: a warm-restored request
+        extracts ``SizedArraysCache`` while block metadata says
+        ``ArraysCache``, and without canonicalization the commit and restore
+        paths address different sidecar directories.
+        """
+        if turboquant_kv_bits is None:
+            turboquant_kv_bits = self._expected_turboquant_kv_bits
+        if cachelist_subtypes is None:
+            cachelist_subtypes = self._expected_cachelist_subtypes
+        return _cache_compat_signature(
+            model_name=model_name,
+            num_layers=num_layers,
+            block_size=block_size,
+            layer_cache_types=_canonicalize_layer_cache_types(layer_cache_types)
+            or [],
+            turboquant_kv_bits=turboquant_kv_bits,
+            cachelist_subtypes=cachelist_subtypes,
+            payload_layout=self._payload_layout,
+        )
+
+    def gdn_cache_signature_for(
+        self,
+        *,
+        model_name: str,
+        num_layers: int,
+        block_size: int,
+        layer_cache_types: list[str],
+        turboquant_kv_bits: float | None = None,
+        cachelist_subtypes: dict[str, list[str]] | None = None,
+    ) -> str:
+        """Build a sidecar namespace signature without invalidating KV blocks."""
+        base = self.cache_signature_for(
+            model_name=model_name,
+            num_layers=num_layers,
+            block_size=block_size,
+            layer_cache_types=layer_cache_types,
+            turboquant_kv_bits=turboquant_kv_bits,
+            cachelist_subtypes=cachelist_subtypes,
+        )
+        if self._gdn_sidecar_state_dtype == "fp32":
+            return base
+        payload = json.loads(base)
+        payload["gdn_sidecar_state_dtype"] = self._gdn_sidecar_state_dtype
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _gdn_signature_candidates(cache_signature: str) -> list[str]:
+        """Return current then legacy-fp32 namespace signatures.
+
+        Reduced-precision modes write to an isolated namespace so experiments
+        cannot silently reuse another arm's checkpoint. If no new checkpoint
+        exists, an old fp32 sidecar remains a valid warm-cache fallback because
+        the per-file codec metadata is backward compatible.
+        """
+        candidates = [cache_signature]
+        try:
+            payload = json.loads(cache_signature)
+        except (TypeError, ValueError):
+            return candidates
+        if not isinstance(payload, dict) or "gdn_sidecar_state_dtype" not in payload:
+            return candidates
+        payload.pop("gdn_sidecar_state_dtype", None)
+        legacy = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if legacy != cache_signature:
+            candidates.append(legacy)
+        return candidates
+
+    @staticmethod
+    def _gdn_state_dtype_from_signature(cache_signature: str) -> str:
+        """Return the requested sidecar dtype encoded by a namespace."""
+        try:
+            payload = json.loads(cache_signature)
+        except (TypeError, ValueError):
+            return "fp32"
+        if not isinstance(payload, dict):
+            return "fp32"
+        state_dtype = payload.get("gdn_sidecar_state_dtype", "fp32")
+        if state_dtype not in _GDN_STATE_CODEC_BY_DTYPE:
+            return "fp32"
+        return state_dtype
 
     def _expected_cache_signature(self) -> str:
         if (
@@ -1476,13 +2814,16 @@ class PagedSSDCacheManager(CacheManager):
             and self._expected_num_layers <= 0
             and self._expected_block_size <= 0
             and self._expected_layer_cache_types is None
+            and not self._gdn_ssd_split_enabled
         ):
             return ""
-        return _cache_compat_signature(
+        return self.cache_signature_for(
             model_name=self._expected_model_name,
             num_layers=self._expected_num_layers,
             block_size=self._expected_block_size,
             layer_cache_types=self._expected_layer_cache_types,
+            turboquant_kv_bits=self._expected_turboquant_kv_bits,
+            cachelist_subtypes=self._expected_cachelist_subtypes,
         )
 
     def _read_file_metadata(self, file_path: Path) -> PagedSSDBlockMetadata | None:
@@ -1531,18 +2872,34 @@ class PagedSSDCacheManager(CacheManager):
             layer_cache_types = None
             layer_meta_states = None
 
+            # A present-but-unparseable field is corruption (torn write,
+            # damaged file), not a legacy block: indexing the block with the
+            # field silently dropped would make reconstruction guess layer
+            # types or per-layer meta for its tensors. Treat the block as
+            # unusable; the hash then misses and the next request re-stores
+            # it. Absent fields (legacy blocks) still pass through.
             if "layer_cache_types" in metadata and metadata["layer_cache_types"]:
                 try:
                     layer_cache_types = json.loads(metadata["layer_cache_types"])
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.warning(
+                        "Corrupt layer_cache_types metadata JSON in cache "
+                        "file %s; treating the block as unusable.",
+                        file_path,
+                    )
+                    return None
 
             if "layer_meta_states" in metadata and metadata["layer_meta_states"]:
                 try:
                     raw_meta_states = json.loads(metadata["layer_meta_states"])
                     layer_meta_states = [tuple(m) if m else () for m in raw_meta_states]
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.warning(
+                        "Corrupt layer_meta_states metadata JSON in cache "
+                        "file %s; treating the block as unusable.",
+                        file_path,
+                    )
+                    return None
 
             return PagedSSDBlockMetadata(
                 block_hash=bytes.fromhex(block_hash_hex),
@@ -1648,6 +3005,13 @@ class PagedSSDCacheManager(CacheManager):
         if remove_hot_cache:
             self._hot_cache_remove(block_hash)
 
+    def _mark_hot_cache_clean(self, block_hash: bytes) -> None:
+        """Mark a retained hot entry durable after its SSD write commits."""
+        with self._hot_cache_lock:
+            entry = self._hot_cache.get(block_hash)
+            if entry is not None:
+                entry["dirty"] = False
+
     def _writer_loop(self) -> None:
         """Background writer that drains the write queue.
 
@@ -1660,6 +3024,7 @@ class PagedSSDCacheManager(CacheManager):
         standard file I/O operations.
         """
         while True:
+            item = None
             try:
                 item = self._write_queue.get(timeout=1.0)
             except queue.Empty:
@@ -1672,12 +3037,20 @@ class PagedSSDCacheManager(CacheManager):
                 break
 
             block_hash, tensors_raw, metadata, file_path = item
-            self._write_block_file(
-                block_hash, tensors_raw, metadata, file_path, source="background"
-            )
-            self._clear_pending_write(
-                block_hash, remove_hot_cache=not self._hot_cache_enabled
-            )
+            try:
+                write_succeeded = self._write_block_file(
+                    block_hash, tensors_raw, metadata, file_path, source="background"
+                )
+                if write_succeeded:
+                    self._mark_hot_cache_clean(block_hash)
+                self._clear_pending_write(
+                    block_hash, remove_hot_cache=not self._hot_cache_enabled
+                )
+            finally:
+                # Avoid pinning the last raw tensor-byte batch while the
+                # writer thread blocks waiting for more work.
+                item = None
+                block_hash = tensors_raw = metadata = file_path = None
 
     def save_block(
         self,
@@ -1688,6 +3061,7 @@ class PagedSSDCacheManager(CacheManager):
         layer_cache_types: list[str] | None = None,
         layer_meta_states: list[tuple] | None = None,
         hot_cache_write_back: bool = True,
+        replace_existing: bool = False,
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -1709,6 +3083,10 @@ class PagedSSDCacheManager(CacheManager):
                 for reconstruction (e.g., [(offset,), (keep, max_size, offset, _idx)]).
             hot_cache_write_back: When False in SSD-backed hot-cache mode, enqueue
                 through the SSD writer path instead of retaining a hot-cache copy.
+            replace_existing: Rebuild and atomically replace an existing payload
+                for the same content hash. This is reserved for promoting a
+                non-sliceable prefix-cache placeholder into a valid boundary
+                snapshot; normal deduplicated saves must leave it False.
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -1716,6 +3094,8 @@ class PagedSSDCacheManager(CacheManager):
         if not HAS_MLX:
             logger.error("MLX not available, cannot save block")
             return False
+
+        layer_cache_types = _storage_layer_cache_types(layer_cache_types)
 
         # First save call after a model load is the canonical source for
         # the live layer-cache signature (post-TurboQuant / post-MTP). If
@@ -1727,11 +3107,29 @@ class PagedSSDCacheManager(CacheManager):
             except Exception as e:
                 logger.warning("Stale-signature sweep failed: %s", e)
 
-        # Check if already exists in index (thread-safe)
-        if self._index.contains(block_hash):
+        # A matching content hash does not guarantee a matching serialized
+        # layout. Replace an indexed block written by an older cache schema
+        # instead of treating it as an unconditional hit (#2487).
+        indexed_metadata = self._index.get(block_hash)
+        if (
+            indexed_metadata is not None
+            and not replace_existing
+            and self._is_compatible_block(indexed_metadata)
+        ):
             self._index.touch(block_hash)
             self._stats["hits"] += 1
             return True
+        if indexed_metadata is not None:
+            reason = (
+                self.signature_mismatch_reason(indexed_metadata.cache_signature)
+                or "cache layout mismatch"
+            )
+            logger.info(
+                "Replacing incompatible indexed cache block %s: %s",
+                block_hash.hex()[:16],
+                reason,
+            )
+            self.forget_block(block_hash)
 
         # Also check hot cache / pending writes buffer
         hot_entry = None
@@ -1740,6 +3138,23 @@ class PagedSSDCacheManager(CacheManager):
                 hot_entry = self._hot_cache[block_hash]
 
         if hot_entry is not None:
+            hot_metadata = hot_entry.get("block_metadata")
+            if isinstance(
+                hot_metadata, PagedSSDBlockMetadata
+            ) and not self._is_compatible_block(hot_metadata):
+                reason = (
+                    self.signature_mismatch_reason(hot_metadata.cache_signature)
+                    or "cache layout mismatch"
+                )
+                logger.info(
+                    "Replacing incompatible hot cache block %s: %s",
+                    block_hash.hex()[:16],
+                    reason,
+                )
+                self.forget_block(block_hash)
+                hot_entry = None
+
+        if hot_entry is not None and not replace_existing:
             if hot_cache_write_back or self._hot_cache_only:
                 self._stats["hits"] += 1
                 return True
@@ -1773,59 +3188,15 @@ class PagedSSDCacheManager(CacheManager):
             #   is uniform regardless of whether the producer (prefix_cache,
             #   etc.) has been migrated to emit ``__nstate__`` markers yet.
             arrays = {}
+            has_pooling_cache_delta = False
             cache_list_meta = (
                 {}
             )  # Per-layer sidecar metadata (sub_count, state_count, etc.)
 
+            # Shim; module-level to avoid a recursive-closure refcount
+            # cycle pinning `arrays` — see _store_nstate_elements_flat.
             def _store_nstate_elements(prefix: str, elements):
-                """Write N elements as ``{prefix}_state_{k}`` keys with a
-                ``{prefix}_state_count`` count marker. Zero-dim shapes are
-                preserved via ``{prefix}_state_{k}_zero_dim``. Composite
-                elements (a bare tuple/list or a nested ``__nstate__``
-                marker) recurse under a ``{elem_key}`` sub-prefix and record
-                a ``{elem_key}_nested`` marker; the flat ``{elem_key}``
-                tensor is deliberately omitted so an older reader hits its
-                ``Missing {elem_key} in arrays`` path and skips the block."""
-                cache_list_meta[f"{prefix}_state_count"] = str(len(elements))
-                for k, elem in enumerate(elements):
-                    elem_key = f"{prefix}_state_{k}"
-                    if elem is None:
-                        # None placeholder — store an empty marker tensor
-                        # and a sentinel zero_dim entry so the loader can
-                        # restore None instead of materializing zeros.
-                        arrays[elem_key] = mx.zeros((1,))
-                        cache_list_meta[f"{elem_key}_none"] = "1"
-                    elif _has_zero_dim(elem):
-                        arrays[elem_key] = mx.zeros((1,))
-                        cache_list_meta[f"{elem_key}_zero_dim"] = _encode_shape(
-                            elem.shape
-                        )
-                    elif (
-                        isinstance(elem, tuple)
-                        and len(elem) >= 2
-                        and isinstance(elem[0], str)
-                        and elem[0] == "__nstate__"
-                    ):
-                        # Nested ``('__nstate__', class_name, [sub...])``
-                        # marker — recurse, no flat tensor written.
-                        cache_list_meta[f"{elem_key}_nested"] = "nstate"
-                        sub_class = elem[1] if len(elem) >= 2 else None
-                        sub_elements = elem[2] if len(elem) >= 3 else []
-                        if sub_class:
-                            cache_list_meta[f"{elem_key}_state_class_name"] = sub_class
-                        _store_nstate_elements(elem_key, sub_elements)
-                    elif isinstance(elem, (tuple, list)):
-                        # Bare tuple/list of sub-elements — recurse, no flat
-                        # tensor written.
-                        cache_list_meta[f"{elem_key}_nested"] = "tuple"
-                        _store_nstate_elements(elem_key, list(elem))
-                    else:
-                        if not isinstance(elem, mx.array):
-                            raise TypeError(
-                                f"unsupported non-array nstate element "
-                                f"{elem_key}: {type(elem).__name__}"
-                            )
-                        arrays[elem_key] = elem
+                _store_nstate_elements_flat(arrays, cache_list_meta, prefix, elements)
 
             for i, layer_data in enumerate(cache_data):
                 if (
@@ -1839,17 +3210,25 @@ class PagedSSDCacheManager(CacheManager):
                     elements = layer_data[2] if len(layer_data) >= 3 else []
                     if class_name:
                         cache_list_meta[f"layer_{i}_state_class_name"] = class_name
+                    if class_name == POOLING_CACHE_DELTA_CLASS:
+                        has_pooling_cache_delta = True
                     _store_nstate_elements(f"layer_{i}", elements)
                 elif (
                     isinstance(layer_data, tuple)
                     and len(layer_data) == 2
                     and isinstance(layer_data[0], str)
-                    and layer_data[0] == "__cache_list__"
+                    and layer_data[0] in ("__cache_list__", "__cache_list_pm__")
                 ):
                     # CacheList: sub-indexed tensors. Each sub_tensor may be
                     # a 2-tuple (legacy) or an ``__nstate__`` marker.
+                    # ``__cache_list_pm__`` marks the per-member storage mode
+                    # (sliceable subs hold per-block slices, non-sliceable
+                    # subs hold boundary state); the mode rides the sidecar
+                    # so load_block can re-tag the payload for reconstruct.
                     sub_tensors = layer_data[1]
                     cache_list_meta[f"layer_{i}_sub_count"] = str(len(sub_tensors))
+                    if layer_data[0] == "__cache_list_pm__":
+                        cache_list_meta[f"layer_{i}_storage_mode"] = "pm"
                     for j, sub_tensor in enumerate(sub_tensors):
                         sub_prefix = f"layer_{i}_sub_{j}"
                         if (
@@ -1866,6 +3245,8 @@ class PagedSSDCacheManager(CacheManager):
                                 cache_list_meta[f"{sub_prefix}_state_class_name"] = (
                                     sub_class_name
                                 )
+                            if sub_class_name == POOLING_CACHE_DELTA_CLASS:
+                                has_pooling_cache_delta = True
                             _store_nstate_elements(sub_prefix, sub_elements)
                         elif (
                             isinstance(sub_tensor, (list, tuple))
@@ -1914,22 +3295,45 @@ class PagedSSDCacheManager(CacheManager):
                     _store_nstate_elements(f"layer_{i}", list(layer_data))
 
             block_size = self._expected_block_size or token_count
+            # Stamp the depth the block's own TurboQuant layers were packed
+            # at (observation), falling back to the manager's expectation
+            # only when the block carries no meta_state. A signature must
+            # never vouch for a width the payload does not have.
+            block_bits = _block_turboquant_bits(layer_cache_types, layer_meta_states)
             cache_signature = _cache_compat_signature(
                 model_name=model_name,
                 num_layers=len(cache_data),
                 block_size=block_size,
                 layer_cache_types=layer_cache_types,
+                turboquant_kv_bits=(
+                    block_bits
+                    if block_bits is not None
+                    else self._expected_turboquant_kv_bits
+                ),
+                # Stamped from the block's own payload (observation), like
+                # the TurboQuant depth above.
+                cachelist_subtypes=_block_cachelist_subtypes(
+                    cache_data, layer_cache_types, layer_meta_states
+                ),
+                payload_layout=self._payload_layout,
             )
 
             # Prepare metadata
             metadata = {
-                "omlx_cache_format_version": _CACHE_FORMAT_VERSION,
+                "omlx_cache_format_version": (
+                    "5"
+                    if self._gdn_ssd_split_enabled
+                    else POOLING_CACHE_DELTA_FORMAT_VERSION
+                    if has_pooling_cache_delta
+                    else _CACHE_FORMAT_VERSION
+                ),
                 "block_hash": block_hash.hex(),
                 "token_count": str(token_count),
                 "num_layers": str(len(cache_data)),
                 "model_name": model_name,
                 "block_size": str(block_size),
                 "cache_signature": cache_signature,
+                "payload_layout": self._payload_layout,
                 "created_at": str(time.time()),
             }
 
@@ -2145,75 +3549,10 @@ class PagedSSDCacheManager(CacheManager):
                 return (elements[0], elements[1])
             return marker
 
+        # Shim; module-level to avoid a recursive-closure refcount
+        # cycle pinning `arrays` — see _load_nstate_flat.
         def _load_nstate(prefix: str, fallback_class: str | None) -> tuple | None:
-            """Read either V3 ``state_count`` keys or V2 ``keys``/``values``
-            polyfill at ``prefix``. Returns ``('__nstate__', class_name, elements)``
-            on success or None on missing tensors."""
-            count_key = f"{prefix}_state_count"
-            class_name = None
-            if file_metadata:
-                class_name = file_metadata.get(f"{prefix}_state_class_name")
-            if class_name is None:
-                class_name = fallback_class
-
-            elements: list[Any] = []
-            if file_metadata and count_key in file_metadata:
-                # V3 path
-                try:
-                    count = int(file_metadata[count_key])
-                except (ValueError, TypeError):
-                    return None
-                for k in range(count):
-                    elem_key = f"{prefix}_state_{k}"
-                    none_marker = f"{elem_key}_none"
-                    zd_marker = f"{elem_key}_zero_dim"
-                    nested_marker = f"{elem_key}_nested"
-                    if file_metadata and none_marker in file_metadata:
-                        elements.append(None)
-                        continue
-                    if file_metadata and nested_marker in file_metadata:
-                        # Composite element — recurse, then restore the same
-                        # shape it had on save (bare tuple vs __nstate__).
-                        sub = _load_nstate(elem_key, fallback_class=None)
-                        if sub is None:
-                            return None
-                        if file_metadata[nested_marker] == "tuple":
-                            elements.append(tuple(sub[2]))
-                        elif file_metadata[nested_marker] == "nstate":
-                            # Explicit marker on write — preserve the full
-                            # ('__nstate__', class_name, elements) as-is;
-                            # never unwrap (would drop the marker/class_name).
-                            elements.append(sub)
-                        else:
-                            # Corrupt/unknown nested marker — fail closed.
-                            return None
-                        continue
-                    if elem_key not in arrays:
-                        logger.error(f"Missing {elem_key} in arrays")
-                        return None
-                    if file_metadata and zd_marker in file_metadata:
-                        elements.append(
-                            mx.zeros(_decode_shape(file_metadata[zd_marker]))
-                        )
-                    else:
-                        elements.append(arrays[elem_key])
-            else:
-                # V2 polyfill: legacy ``{prefix}_keys`` / ``{prefix}_values``.
-                keys_key = f"{prefix}_keys"
-                values_key = f"{prefix}_values"
-                if keys_key not in arrays or values_key not in arrays:
-                    return None
-                k_zd = f"{prefix}_keys_zero_dim"
-                v_zd = f"{prefix}_values_zero_dim"
-                if file_metadata and k_zd in file_metadata:
-                    elements.append(mx.zeros(_decode_shape(file_metadata[k_zd])))
-                else:
-                    elements.append(arrays[keys_key])
-                if file_metadata and v_zd in file_metadata:
-                    elements.append(mx.zeros(_decode_shape(file_metadata[v_zd])))
-                else:
-                    elements.append(arrays[values_key])
-            return ("__nstate__", class_name, elements)
+            return _load_nstate_flat(arrays, file_metadata, prefix, fallback_class)
 
         for i in range(num_layers):
             cache_type = (
@@ -2248,8 +3587,15 @@ class PagedSSDCacheManager(CacheManager):
                     # Preserve the legacy list shape — callers (prefix_cache,
                     # tests) expect ``cache_data[i]`` to be a list of
                     # sub-cache states for CacheList layers, not a wrapper
-                    # marker.
-                    cache_data.append(sub_tensors)
+                    # marker. Per-member blocks re-tag so reconstruct_cache
+                    # can pick the per-sub restore mode.
+                    if (
+                        file_metadata
+                        and file_metadata.get(f"layer_{i}_storage_mode") == "pm"
+                    ):
+                        cache_data.append(("__cache_list_pm__", sub_tensors))
+                    else:
+                        cache_data.append(sub_tensors)
                 else:
                     layer_marker = _load_nstate(f"layer_{i}", fallback_class=cache_type)
                     if layer_marker is None:
@@ -2385,6 +3731,7 @@ class PagedSSDCacheManager(CacheManager):
                 self._stats["loads"] += 1
                 self._stats["hits"] += 1
                 self._stats["hot_cache_hits"] += 1
+                self._promote_pending_write_to_hot_cache(block_hash, entry)
                 logger.debug(
                     f"Loaded block from pending write buffer: "
                     f"{block_hash.hex()[:16]}..."
@@ -2577,6 +3924,8 @@ class PagedSSDCacheManager(CacheManager):
             self._stats["loads"] += 1
             self._stats["hits"] += 1
             self._stats["hot_cache_hits"] += 1
+            if promote_to_hot_cache:
+                self._promote_pending_write_to_hot_cache(block_hash, entry)
             logger.debug(
                 f"Loaded block with metadata from pending write buffer: "
                 f"{block_hash.hex()[:16]}..."
@@ -2796,8 +4145,9 @@ class PagedSSDCacheManager(CacheManager):
                     not in _READABLE_CACHE_FORMAT_VERSIONS
                 ):
                     return False
-                self._promote_to_hot_cache(block_hash, arrays, file_metadata, metadata)
-                return True
+                return self._promote_to_hot_cache(
+                    block_hash, arrays, file_metadata, metadata
+                )
             except Exception as e:
                 logger.warning(f"Preload failed for block {block_hash.hex()[:16]}: {e}")
                 return False
@@ -2855,12 +4205,23 @@ class PagedSSDCacheManager(CacheManager):
         )
         return True
 
-    def set_expected_layer_signature(self, layer_cache_types: list[str] | None) -> bool:
+    def set_expected_layer_signature(
+        self,
+        layer_cache_types: list[str] | None,
+        *,
+        turboquant_kv_bits: float | None = None,
+        cachelist_subtypes: dict[str, list[str]] | None = None,
+    ) -> bool:
         """Set the live layer-cache signature, replacing stale expectations.
 
         Unlike ``adopt_layer_signature_if_unset``, this is used by callers that
         learn the final cache layout after manager construction (for example
         TurboQuant settings applied by the engine after the scheduler starts).
+
+        ``turboquant_kv_bits`` is the live TurboQuant bit depth (None when
+        TurboQuant is inactive). A bit-depth change alone also triggers the
+        sweep: blocks written at another depth have a different packed state
+        width and would crash batch concatenation if mixed (#2045).
 
         Returns True when the canonical signature changed and a stale-signature
         sweep should run. Returns False for empty input or a canonical no-op.
@@ -2870,28 +4231,45 @@ class PagedSSDCacheManager(CacheManager):
 
         new_signature = list(layer_cache_types)
         new_canonical = _canonicalize_layer_cache_types(new_signature)
+        new_bits = (
+            float(turboquant_kv_bits) if turboquant_kv_bits is not None else None
+        )
 
         with self._lock:
             old_signature = self._expected_layer_cache_types
             old_canonical = _canonicalize_layer_cache_types(old_signature)
-            if old_canonical == new_canonical:
+            bits_changed = new_bits != self._expected_turboquant_kv_bits
+            subtypes_changed = (
+                cachelist_subtypes != self._expected_cachelist_subtypes
+            )
+            if (
+                old_canonical == new_canonical
+                and not bits_changed
+                and not subtypes_changed
+            ):
                 if old_signature != new_signature:
                     self._expected_layer_cache_types = new_signature
                 return False
 
             self._expected_layer_cache_types = new_signature
+            self._expected_turboquant_kv_bits = new_bits
+            self._expected_cachelist_subtypes = cachelist_subtypes
             self._signature_sweep_completed = False
 
         logger.info(
             "PagedSSDCacheManager updated layer cache signature "
-            "(%d layers, %d unique types)",
+            "(%d layers, %d unique types, turboquant_kv_bits=%s, "
+            "cachelist_subtypes=%s)",
             len(new_signature),
             len(set(new_canonical or ())),
+            new_bits,
+            "yes" if cachelist_subtypes else "no",
         )
         return True
 
     def invalidate_stale_layer_signature(self) -> int:
-        """Drop in-memory index entries whose layer_cache_types disagree
+        """Drop in-memory index entries whose layer_cache_types — or, when a
+        TurboQuant depth is expected, whose recorded bit depth — disagree
         with the current expected signature.
 
         Scoped to the current ``_expected_model_name``: blocks belonging to
@@ -2915,6 +4293,7 @@ class PagedSSDCacheManager(CacheManager):
             return 0
 
         expected = _canonicalize_layer_cache_types(self._expected_layer_cache_types)
+        expects_bits = self._expected_turboquant_kv_bits is not None
 
         with self._index._lock:
             stale: list[bytes] = []
@@ -2923,10 +4302,35 @@ class PagedSSDCacheManager(CacheManager):
                     continue
                 got = _canonicalize_layer_cache_types(meta.layer_cache_types)
                 if got is None:
-                    # Pre-signature blocks lack the metadata to judge.
-                    # Skip rather than guess. Newer saves will replace them.
+                    # Pre-signature blocks lack the metadata to judge the
+                    # layout. Without a depth expectation, skip rather than
+                    # guess — newer saves will replace them. With one, the
+                    # block can no more prove its packed width than its
+                    # layout, so it is unsafe to keep (see
+                    # _signature_bits_match).
+                    if expects_bits:
+                        stale.append(h)
                     continue
                 if got != expected:
+                    stale.append(h)
+                    continue
+                try:
+                    signature_payload = json.loads(meta.cache_signature or "{}")
+                except (TypeError, ValueError):
+                    signature_payload = {}
+                if not isinstance(signature_payload, dict) or (
+                    signature_payload.get("payload_layout", "embedded")
+                    != self._payload_layout
+                ):
+                    stale.append(h)
+                    continue
+                if not self._signature_bits_match(meta.cache_signature):
+                    stale.append(h)
+                    continue
+                if self._expected_cachelist_subtypes is not None and (
+                    _signature_cachelist_subtypes(meta.cache_signature)
+                    != self._expected_cachelist_subtypes
+                ):
                     stale.append(h)
 
         for h in stale:
@@ -3049,9 +4453,16 @@ class PagedSSDCacheManager(CacheManager):
         self,
         target_size: int,
         max_count: int | None = None,
-    ) -> list[tuple[PagedSSDCacheIndex, PagedSSDBlockMetadata]]:
-        """Remove oldest tracked SSD entries from their indexes until target."""
-        evicted: list[tuple[PagedSSDCacheIndex, PagedSSDBlockMetadata]] = []
+    ) -> list[tuple[Any, Any]]:
+        """Remove globally oldest tracked main or sidecar files.
+
+        Main compatible blocks, incompatible blocks, and GDN sidecars share a
+        single deterministic LRU walk.  Equal timestamps are resolved in the
+        fixed order compatible, incompatible, sidecar, then by the index's
+        stable key ordering.  This keeps the configured SSD limit safe while
+        avoiding a second, competing budget for GDN history.
+        """
+        evicted: list[tuple[Any, Any]] = []
 
         while self._tracked_ssd_size() > target_size:
             if max_count is not None and len(evicted) >= max_count:
@@ -3059,24 +4470,28 @@ class PagedSSDCacheManager(CacheManager):
 
             compatible = self._index.get_lru_entries(1)
             incompatible = self._incompatible_index.get_lru_entries(1)
-            if not compatible and not incompatible:
+            sidecars = self._gdn_sidecar_index.get_lru_entries(1)
+            candidates: list[tuple[float, int, Any, Any]] = []
+            if compatible:
+                candidates.append((compatible[0].last_access, 0, self._index, compatible[0]))
+            if incompatible:
+                candidates.append(
+                    (incompatible[0].last_access, 1, self._incompatible_index, incompatible[0])
+                )
+            if sidecars:
+                candidates.append(
+                    (sidecars[0].last_access, 2, self._gdn_sidecar_index, sidecars[0])
+                )
+            if not candidates:
                 break
 
-            if compatible and incompatible:
-                if incompatible[0].last_access <= compatible[0].last_access:
-                    source_index = self._incompatible_index
-                    candidate = incompatible[0]
-                else:
-                    source_index = self._index
-                    candidate = compatible[0]
-            elif incompatible:
-                source_index = self._incompatible_index
-                candidate = incompatible[0]
+            _, _, source_index, candidate = min(
+                candidates, key=lambda item: (item[0], item[1])
+            )
+            if source_index is self._gdn_sidecar_index:
+                metadata = source_index.remove_key(candidate.key)
             else:
-                source_index = self._index
-                candidate = compatible[0]
-
-            metadata = source_index.remove(candidate.block_hash)
+                metadata = source_index.remove(candidate.block_hash)
             if metadata is not None:
                 evicted.append((source_index, metadata))
 
@@ -3182,8 +4597,8 @@ class PagedSSDCacheManager(CacheManager):
 
     def _unlink_evicted(
         self,
-        metadata: PagedSSDBlockMetadata,
-        source_index: PagedSSDCacheIndex | None = None,
+        metadata: Any,
+        source_index: Any | None = None,
     ) -> None:
         """Delete an evicted block file from disk.
 
@@ -3194,7 +4609,14 @@ class PagedSSDCacheManager(CacheManager):
         space that does not exist on disk).
         """
         try:
-            metadata.file_path.unlink(missing_ok=True)
+            if isinstance(metadata, GDNCheckpointMetadata):
+                if not self._unlink_gdn_sidecar_file(metadata):
+                    restore_index = source_index or self._gdn_sidecar_index
+                    restore_index.add(metadata)
+                    self._stats["evict_unlink_failures"] += 1
+                    return
+            else:
+                metadata.file_path.unlink(missing_ok=True)
             self._stats["evictions"] += 1
         except OSError as e:
             restore_index = source_index or self._index
@@ -3286,6 +4708,32 @@ class PagedSSDCacheManager(CacheManager):
                 if self.delete_block(block_hash):
                     count += 1
 
+            for signature_digest, source_block_hash in list(
+                self._gdn_sidecar_index.get_all_keys()
+            ):
+                # The public API accepts the original signature, while the
+                # startup index intentionally retains only its digest.  For
+                # a full clear, remove the indexed metadata directly so no
+                # opaque payload inspection or signature reverse lookup is
+                # needed.
+                metadata = self._gdn_sidecar_index.remove_key(
+                    (signature_digest, source_block_hash)
+                )
+                if metadata is None:
+                    continue
+                try:
+                    if self._unlink_gdn_sidecar_file(metadata):
+                        count += 1
+                    else:
+                        self._gdn_sidecar_index.add(metadata)
+                except OSError as e:
+                    self._gdn_sidecar_index.add(metadata)
+                    logger.warning(
+                        "Failed to clear GDN sidecar %s: %s",
+                        metadata.file_path,
+                        e,
+                    )
+
             logger.info(f"Cleared SSD cache: deleted {count} files")
             return count
 
@@ -3319,9 +4767,28 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
+                hot_cache_promotion_failures=self._stats[
+                    "hot_cache_promotion_failures"
+                ],
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
             )
+
+    @property
+    def gdn_sidecar_count(self) -> int:
+        """Number of durable recurrent checkpoint files in the SSD tier."""
+        return self._gdn_sidecar_index.count
+
+    @property
+    def gdn_sidecar_size_bytes(self) -> int:
+        """Tracked durable recurrent checkpoint bytes (never hot-cached)."""
+        return self._gdn_sidecar_index.total_size
+
+    @property
+    def gdn_legacy_fp32_fallbacks(self) -> int:
+        """Number of reduced-namespace lookups resolved by legacy FP32."""
+        with self._lock:
+            return self._gdn_legacy_fp32_fallbacks
 
     def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
         """Get model-scoped SSD cache statistics.
@@ -3381,6 +4848,9 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
+                hot_cache_promotion_failures=self._stats[
+                    "hot_cache_promotion_failures"
+                ],
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
             )
@@ -3420,6 +4890,8 @@ class PagedSSDCacheManager(CacheManager):
                 "hot_cache_max_formatted": format_bytes(
                     self._effective_hot_cache_max_bytes()
                 ),
+                "gdn_sidecar_count": self._gdn_sidecar_index.count,
+                "gdn_sidecar_size_bytes": self._gdn_sidecar_index.total_size,
                 **self._stats,
             }
 

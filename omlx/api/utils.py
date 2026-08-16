@@ -11,7 +11,17 @@ from typing import Any, List
 from .openai_models import Message
 
 # Model families whose chat templates consume message.reasoning_content directly.
-_NATIVE_REASONING_MODEL_TYPES = {"minimax_m3", "minimax_m3_vl"}
+_NATIVE_REASONING_MODEL_TYPES = {
+    "minimax_m3",
+    "minimax_m3_vl",
+    # Inkling's chat template renders history reasoning_content back into
+    # <|content_thinking|> blocks.
+    "inkling",
+    "inkling_mm_model",
+    # Muse Glimmer's chat template renders history reasoning_content into
+    # <|start|>assistant to=self<|message|> blocks.
+    "muse_glimmer",
+}
 
 
 def uses_native_reasoning_content(
@@ -32,6 +42,17 @@ def uses_native_reasoning_content(
 
     lowered = (model_name or "").lower()
     return "minimax" in lowered and "m3" in lowered
+
+
+def merge_reasoning_effort_chat_template_kwargs(
+    chat_template_kwargs: dict[str, Any] | None,
+    reasoning_effort: Any | None,
+) -> dict[str, Any] | None:
+    """Forward an API reasoning effort without overriding explicit template kwargs."""
+    merged = dict(chat_template_kwargs or {})
+    if reasoning_effort is not None:
+        merged.setdefault("reasoning_effort", reasoning_effort)
+    return merged or None
 
 
 # =============================================================================
@@ -367,6 +388,13 @@ def chat_template_preserves_mid_system(
     if placement not in {"tail", "between"}:
         return False
 
+    explicit_capability = getattr(tokenizer, "_omlx_supports_mid_system_messages", None)
+    if explicit_capability is None:
+        template = getattr(tokenizer, "_chat_template", None)
+        explicit_capability = getattr(template, "supports_mid_system_messages", None)
+    if explicit_capability is False:
+        return False
+
     has_tools = bool(tools)
     cache_key = _mid_system_probe_cache_key(
         tokenizer,
@@ -649,8 +677,9 @@ def prepare_system_messages_for_template(
 ) -> list[dict]:
     """Preserve cache-friendly mid-system turns when the template supports them.
 
-    Unsupported placements or templates fall back to the historical behavior:
-    all system messages are consolidated at the front.
+    Model-specific templates may first relocate supported system turns to a
+    native reminder role. Unsupported placements or templates then use the
+    configured strict or user-note fallback.
     """
     messages = [dict(msg) for msg in messages]
     if unsupported_mid_system_policy not in {"strict", "user_note_safe"}:
@@ -674,6 +703,19 @@ def prepare_system_messages_for_template(
                     prepared = _merge_consecutive_roles(prepared)
                 return prepared
         return strict_fallback()
+
+    if not is_partial and has_nonleading_system_message(messages):
+        relocator = getattr(tokenizer, "_omlx_relocate_mid_system_messages", None)
+        if relocator is None:
+            template = getattr(tokenizer, "_chat_template", None)
+            relocator = getattr(template, "relocate_mid_system_messages", None)
+        if callable(relocator):
+            try:
+                relocated = relocator(messages)
+            except Exception:
+                relocated = None
+            if relocated is not None:
+                messages = [dict(msg) for msg in relocated]
 
     placements = _mid_system_placement_kinds(messages)
     if not placements:
@@ -807,7 +849,6 @@ def _apply_reasoning_reconstruction(
     content: Any,
     reasoning: str | None,
     native: bool,
-    preserve: bool = True,
 ) -> tuple[Any, str | None]:
     """Reconstruct reasoning on a historical assistant message.
 
@@ -818,11 +859,8 @@ def _apply_reasoning_reconstruction(
     * ``native=True`` — template understands ``message.reasoning_content``
       as a top-level field (Qwen 3.6+).  Content stays clean and reasoning
       travels separately.
-    * ``native=False`` with ``preserve=True`` — template only parses
-      ``<think>...</think>`` embedded in content.  Reasoning is inlined into
-      content as a fallback.
-    * ``preserve=False`` — visible assistant content is kept, but historical
-      reasoning is not replayed into the prompt.
+    * ``native=False`` — template only parses ``<think>...</think>`` embedded
+      in content.  Reasoning is inlined into content as a fallback.
 
     Returns ``(new_content, reasoning_out)`` where ``reasoning_out`` is the
     string to attach as a ``reasoning_content`` field, or ``None`` to skip.
@@ -842,16 +880,6 @@ def _apply_reasoning_reconstruction(
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
         text = _extract_text_from_content_list(content)
-    # Some clients persist streamed reasoning even when the turn is aborted,
-    # and our malformed-thinking recovery can also duplicate the same text in
-    # both reasoning_content and content. Feeding those historical drafts back
-    # into Qwen's template makes later "continue" prompts resume thinking
-    # instead of answering. Treat reasoning-only / duplicate-reasoning turns as
-    # empty assistant content for prompt reconstruction.
-    if not text.strip() or text.strip() == reasoning.strip():
-        return "", None
-    if not preserve:
-        return text, None
     if native:
         return text, reasoning
     return f"<think>\n{reasoning}\n</think>\n\n{text}", None
@@ -862,7 +890,6 @@ def extract_text_content(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     native_reasoning_content: bool = False,
-    preserve_reasoning_content: bool = True,
     consolidate_system_messages: bool = True,
 ) -> List[dict]:
     """
@@ -900,11 +927,7 @@ def extract_text_content(
         # <think>...</think> in content.
         reasoning = getattr(msg, "reasoning_content", None)
         content, reasoning_out = _apply_reasoning_reconstruction(
-            role,
-            content,
-            reasoning,
-            native_reasoning_content,
-            preserve_reasoning_content,
+            role, content, reasoning, native_reasoning_content
         )
 
         # Normalize "developer" role to "system" (OpenAI API compatibility)
@@ -1054,7 +1077,6 @@ def extract_multimodal_content(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     native_reasoning_content: bool = False,
-    preserve_reasoning_content: bool = True,
     consolidate_system_messages: bool = True,
 ) -> List[dict]:
     """
@@ -1083,11 +1105,7 @@ def extract_multimodal_content(
         # Reconstruct reasoning (see extract_text_content).
         reasoning = getattr(msg, "reasoning_content", None)
         content, reasoning_out = _apply_reasoning_reconstruction(
-            role,
-            content,
-            reasoning,
-            native_reasoning_content,
-            preserve_reasoning_content,
+            role, content, reasoning, native_reasoning_content
         )
 
         if role == "developer":

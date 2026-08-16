@@ -12,6 +12,7 @@ Tests cover:
 
 import base64
 import io
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -175,6 +176,102 @@ class TestVLMStreamingCleanup:
         assert len(outputs) == 1
         assert outputs[0].generated_at == 10.0
         assert outputs[0].generated_until == 12.0
+
+
+class TestVLMToolForwarding:
+    """Tool schemas must reach scheduler requests on both chat paths."""
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    @staticmethod
+    def _process_chat_messages(*args):
+        return "prompt", None, {}, None, 0, []
+
+    @staticmethod
+    def _output(*, streaming=False):
+        return SimpleNamespace(
+            output_text="ok",
+            new_text="ok" if streaming else "",
+            prompt_tokens=1,
+            completion_tokens=1,
+            finished=streaming,
+            finish_reason="stop",
+            tool_calls=None,
+            cached_tokens=0,
+            first_token_at=None,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_chat_forwards_tools_to_core_generate(self):
+        executor = ThreadPoolExecutor(max_workers=1)
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            generate=AsyncMock(return_value=self._output()),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        try:
+            with patch.object(
+                engine,
+                "_process_chat_messages",
+                side_effect=self._process_chat_messages,
+            ):
+                await engine.chat(
+                    [{"role": "user", "content": "write json"}], tools=self.tools
+                )
+        finally:
+            executor.shutdown(wait=False)
+
+        assert core.generate.call_args.kwargs["tools"] == self.tools
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_chat_forwards_tools_to_core_request(self):
+        executor = ThreadPoolExecutor(max_workers=1)
+
+        async def stream_outputs(request_id):
+            yield self._output(streaming=True)
+
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            add_request=AsyncMock(return_value="request-1"),
+            stream_outputs=stream_outputs,
+            abort_request=AsyncMock(return_value=True),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        try:
+            with patch.object(
+                engine,
+                "_process_chat_messages",
+                side_effect=self._process_chat_messages,
+            ):
+                async for _ in engine.stream_chat(
+                    [{"role": "user", "content": "write json"}], tools=self.tools
+                ):
+                    pass
+        finally:
+            executor.shutdown(wait=False)
+
+        assert core.add_request.call_args.kwargs["tools"] == self.tools
 
 
 class TestVLMDiffusionLane:
@@ -800,6 +897,34 @@ class TestApplyChatTemplate:
         assert "assistant: Hi" in result
         assert result.endswith("assistant:")
 
+    def test_value_error_fallback_uses_get_chat_template(self):
+        """Tokenizer exposes apply_chat_template but has no chat_template set
+        (ValueError) → fall back to mlx-vlm's get_chat_template plain rendering.
+
+        Covers raw OCR checkpoints like baidu/Unlimited-OCR that ship no
+        chat template; the pre-flight token count must not 400.
+        """
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.side_effect = ValueError(
+            "Cannot use chat template functions because "
+            "tokenizer.chat_template is not set"
+        )
+        engine = _make_loaded_engine(tokenizer=tokenizer)
+        engine._processor = MagicMock()
+
+        messages = [{"role": "user", "content": "document parsing."}]
+        with patch(
+            "mlx_vlm.prompt_utils.get_chat_template",
+            return_value="<image>document parsing.",
+        ) as mock_gct:
+            result = engine._apply_chat_template(messages)
+
+        assert result == "<image>document parsing."
+        mock_gct.assert_called_once()
+        args, kwargs = mock_gct.call_args
+        assert args[0] is engine._processor
+        assert kwargs.get("add_generation_prompt") is True
+
     def test_chat_template_kwargs_override(self):
         """Additional chat_template_kwargs are merged into template kwargs."""
         tokenizer = MagicMock()
@@ -1020,6 +1145,7 @@ class TestProcessChatMessages:
             audio=None,
             chat_template_kwargs=None,
             tools=None,
+            is_partial=None,
         )
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
@@ -1718,7 +1844,7 @@ class TestCountChatTokens:
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {"url": "data:image/png;base64,abc"},
+                        "image_url": {"url": _png_data_uri(1, 1)},
                     },
                     {"type": "text", "text": "Describe"},
                 ],
@@ -1736,29 +1862,230 @@ class TestCountChatTokens:
 
 
 class TestPartialModeVLM:
-    """Tests for partial mode in VLM engine — always ignored."""
+    """Partial mode must continue the final assistant message on VLM engines.
 
-    def test_apply_chat_template_partial_ignored(self):
-        """VLM _apply_chat_template strips partial but always uses add_generation_prompt=True."""
+    ``VLMBatchedEngine`` renders chat prompts in two places on the
+    chat-completions path — the generation path (``_process_chat_messages``
+    → ``_prepare_vision_inputs``) and the token-counting path
+    (``count_chat_tokens`` / ``preflight_chat`` → ``_apply_chat_template``).
+    Both used to hardcode
+    ``add_generation_prompt=True``, so a request whose final assistant message
+    carries ``partial: true`` rendered byte-identically to one without it.
+    """
+
+    _PARTIAL_MESSAGES = [
+        {"role": "user", "content": "Count from 1 to 10."},
+        {"role": "assistant", "content": "1, 2, 3, 4,", "partial": True},
+    ]
+
+    @staticmethod
+    def _plain_messages():
+        return [
+            {"role": "user", "content": "Count from 1 to 10."},
+            {"role": "assistant", "content": "1, 2, 3, 4,"},
+        ]
+
+    def test_apply_chat_template_honours_explicit_partial(self):
+        """is_partial=True → continue the final message instead of a new turn."""
         mock_tokenizer = MagicMock()
         mock_tokenizer.apply_chat_template.return_value = "<formatted>"
         engine = _make_loaded_engine(tokenizer=mock_tokenizer)
 
-        messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "{", "partial": True},
-        ]
+        # The server strips `partial` at the API boundary and forwards the
+        # resolved decision, so the messages here carry no `partial` key.
+        engine._apply_chat_template(self._plain_messages(), is_partial=True)
 
-        engine._apply_chat_template(messages)
+        call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is False
+        assert call_kwargs["continue_final_message"] is True
+
+    def test_apply_chat_template_autodetects_partial(self):
+        """Direct engine callers still get detection from the message key."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        engine = _make_loaded_engine(tokenizer=mock_tokenizer)
+
+        engine._apply_chat_template([dict(m) for m in self._PARTIAL_MESSAGES])
+
+        call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is False
+        assert call_kwargs["continue_final_message"] is True
+
+        # partial field is never handed to the chat template
+        call_msgs = mock_tokenizer.apply_chat_template.call_args[0][0]
+        for msg in call_msgs:
+            assert "partial" not in msg
+
+    def test_apply_chat_template_without_partial_starts_new_turn(self):
+        """No partial signal → unchanged behavior."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        engine = _make_loaded_engine(tokenizer=mock_tokenizer)
+
+        engine._apply_chat_template(self._plain_messages(), is_partial=False)
 
         call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
         assert call_kwargs["add_generation_prompt"] is True
         assert "continue_final_message" not in call_kwargs
 
-        # partial field should be stripped from messages
-        call_msgs = mock_tokenizer.apply_chat_template.call_args[0][0]
-        for msg in call_msgs:
-            assert "partial" not in msg
+    @staticmethod
+    def _vision_engine():
+        """Engine whose processor renders the prompt, as on the real chat path."""
+        engine = _make_loaded_engine(model_type="qwen2_5_vl")
+        mock_processor = MagicMock()
+        mock_processor.apply_chat_template.return_value = "<vision prompt>"
+        mock_processor.tokenizer = engine._tokenizer
+        engine._processor = mock_processor
+        return engine
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_generation_path_honours_partial(self, mock_prepare):
+        """_process_chat_messages forwards partial into the real VLM render.
+
+        This is the path a text-only /v1/chat/completions request takes on a
+        VLM-capable checkpoint: chat()/stream_chat() hand their kwargs to
+        _process_chat_messages, which renders via _prepare_vision_inputs.
+        """
+        engine = self._vision_engine()
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        engine._process_chat_messages(
+            self._plain_messages(), tools=None, kwargs={"is_partial": True}
+        )
+
+        call_kwargs = engine._processor.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is False
+        assert call_kwargs["continue_final_message"] is True
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_generation_path_without_partial_starts_new_turn(self, mock_prepare):
+        """The same request without the flag keeps opening a new turn."""
+        engine = self._vision_engine()
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        engine._process_chat_messages(
+            self._plain_messages(), tools=None, kwargs={"is_partial": False}
+        )
+
+        call_kwargs = engine._processor.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is True
+        assert "continue_final_message" not in call_kwargs
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_no_chat_template_fallback_drops_continue_final_message(
+        self, mock_prepare
+    ):
+        """Checkpoints with no chat template cannot continue a message.
+
+        mlx-vlm's get_chat_template() has no continue_final_message
+        equivalent, so the kwarg must be dropped rather than forwarded as an
+        unknown argument (which would raise TypeError).
+        """
+        engine = self._vision_engine()
+        engine._processor.apply_chat_template.side_effect = ValueError(
+            "Cannot use apply_chat_template because this processor does not "
+            "have a chat template."
+        )
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        with patch(
+            "mlx_vlm.prompt_utils.get_chat_template",
+            return_value="<plain prompt>",
+        ) as mock_gct:
+            engine._process_chat_messages(
+                self._plain_messages(), tools=None, kwargs={"is_partial": True}
+            )
+
+        assert "continue_final_message" not in mock_gct.call_args[1]
+        assert mock_gct.call_args[1]["add_generation_prompt"] is True
+
+    def test_missing_template_error_signatures(self):
+        """The fallback guard matches every real missing-template spelling.
+
+        The tokenizer (transformers PreTrainedTokenizerBase), the processor
+        (transformers ProcessorMixin), and mlx-vlm processors that render
+        their own template (phi3_v) each spell the error differently; all of
+        them must fall back, and real render errors must not.
+        """
+        from omlx.engine.vlm import _is_missing_chat_template_error
+
+        missing = [
+            "Cannot use chat template functions because "
+            "tokenizer.chat_template is not set and no template argument "
+            "was passed!",
+            "Cannot use apply_chat_template because this processor does not "
+            "have a chat template.",
+            "No chat template found. Please provide a chat_template argument "
+            "or ensure the tokenizer has a chat_template attribute.",
+        ]
+        for message in missing:
+            assert _is_missing_chat_template_error(ValueError(message))
+        assert not _is_missing_chat_template_error(
+            ValueError(
+                "continue_final_message and add_generation_prompt "
+                "are not compatible"
+            )
+        )
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_generation_path_render_value_error_propagates(self, mock_prepare):
+        """A ValueError that is not the missing-template signature must raise.
+
+        transformers raises ValueError when continue_final_message meets
+        add_generation_prompt (e.g. a request combining partial mode with
+        chat_template_kwargs). Falling back would silently return a
+        non-partial render under a misleading no-chat-template warning.
+        """
+        engine = self._vision_engine()
+        engine._processor.apply_chat_template.side_effect = ValueError(
+            "continue_final_message and add_generation_prompt are not compatible"
+        )
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        with patch(
+            "mlx_vlm.prompt_utils.get_chat_template",
+            return_value="<plain prompt>",
+        ) as mock_gct:
+            with pytest.raises(ValueError, match="not compatible"):
+                engine._process_chat_messages(
+                    self._plain_messages(), tools=None, kwargs={"is_partial": True}
+                )
+        mock_gct.assert_not_called()
+
+    def test_count_path_render_value_error_propagates(self):
+        """The token-counting render applies the same narrow fallback."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.side_effect = ValueError(
+            "continue_final_message and add_generation_prompt are not compatible"
+        )
+        engine = _make_loaded_engine(tokenizer=mock_tokenizer)
+        engine._processor = MagicMock()
+
+        with patch(
+            "mlx_vlm.prompt_utils.get_chat_template",
+            return_value="<plain>",
+        ) as mock_gct:
+            with pytest.raises(ValueError, match="not compatible"):
+                engine._apply_chat_template(
+                    self._plain_messages(), is_partial=True
+                )
+        mock_gct.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1909,6 +2236,8 @@ class TestStopSafety:
         vision_cache.close.side_effect = lambda: events.append("vision_cache")
         engine._vision_cache = vision_cache
         engine._engine.stop = AsyncMock(side_effect=lambda: events.append("stop"))
+        engine._grammar_compiler = object()
+        engine._grammar_compiler_init_attempted = True
 
         mock_inner_engine = MagicMock()
 
@@ -1919,6 +2248,8 @@ class TestStopSafety:
             assert engine._processor is None
             assert engine._adapter is None
             assert engine._tokenizer is None
+            assert engine._grammar_compiler is None
+            assert engine._grammar_compiler_init_attempted is False
             assert engine._vision_cache is None
 
         mock_inner_engine.close.side_effect = close_side_effect
@@ -2025,6 +2356,14 @@ class TestReadImageDims:
                 "image_url": {"url": "https://example.com/x.jpg"}}
         assert _read_image_dims(part) is None
 
+    def test_local_path_returns_none_without_opening(self):
+        from omlx.engine.vlm import _read_image_dims
+
+        part = {"type": "image_url", "image_url": {"url": "/tmp/private.png"}}
+        with patch("PIL.Image.open") as image_open:
+            assert _read_image_dims(part) is None
+        image_open.assert_not_called()
+
     def test_garbage_returns_none(self):
         from omlx.engine.vlm import _read_image_dims
 
@@ -2080,3 +2419,115 @@ class TestCountImageTokensReal:
 
         messages = [{"role": "user", "content": "just text"}]
         assert _count_image_tokens_real(messages, _QWEN_PROC) == 0
+
+
+class TestVLMEngineFrequencyPenalty:
+    """VLM SamplingParams must carry frequency_penalty (mirrors BatchedEngine).
+
+    Both VLM SamplingParams constructions previously omitted
+    frequency_penalty entirely, so it landed in **kwargs and was silently
+    dropped instead of reaching the scheduler.
+    """
+
+    @staticmethod
+    def _fake_output():
+        return SimpleNamespace(
+            output_text="hi",
+            prompt_tokens=5,
+            completion_tokens=2,
+            finish_reason="stop",
+            tool_calls=None,
+            cached_tokens=0,
+            first_token_at=None,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_generate_forwards_frequency_penalty(self):
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", frequency_penalty=0.7)
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.7
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_generate_defaults_frequency_penalty_to_zero(self):
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt")
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_generate_forwards_frequency_penalty(self):
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = MagicMock()
+        engine._engine.add_request = AsyncMock(return_value="req-1")
+        engine._engine.abort_request = AsyncMock(return_value=True)
+
+        async def _one_output_stream(_request_id):
+            yield SimpleNamespace(
+                output_text="ok",
+                new_text="ok",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+                cached_tokens=0,
+            )
+
+        engine._engine.stream_outputs = _one_output_stream
+
+        async for _ in engine.stream_generate("hello", frequency_penalty=0.9):
+            pass
+
+        call_kwargs = engine._engine.add_request.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.9
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_chat_forwards_frequency_penalty_to_generate(self):
+        """chat() forwards **kwargs into generate(), so the server's
+        frequency_penalty kwarg must survive the chat -> generate chain."""
+        engine = _make_loaded_engine(model_type="test-vlm")
+        mlx_executor = ThreadPoolExecutor(max_workers=1)
+        engine._engine = SimpleNamespace(
+            _mlx_executor=mlx_executor,
+            generate=AsyncMock(return_value=self._fake_output()),
+        )
+
+        def _mock_process(messages, tools, kwargs):
+            return "<prompt>", None, {}, None, 0, []
+
+        try:
+            with patch.object(
+                engine, "_process_chat_messages", side_effect=_mock_process
+            ):
+                await engine.chat(
+                    messages=[{"role": "user", "content": "Hello"}],
+                    frequency_penalty=0.42,
+                )
+        finally:
+            mlx_executor.shutdown(wait=False)
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.42

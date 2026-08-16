@@ -52,9 +52,28 @@ from omlx.api.utils import (
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
+
+
+class TestReasoningEffortChatTemplateKwargs:
+    def test_adds_top_level_reasoning_effort(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, "xhigh") == {
+            "reasoning_effort": "xhigh"
+        }
+
+    def test_explicit_template_kwarg_wins(self):
+        original = {"reasoning_effort": "low", "enable_thinking": True}
+
+        merged = merge_reasoning_effort_chat_template_kwargs(original, "xhigh")
+
+        assert merged == original
+        assert merged is not original
+
+    def test_empty_inputs_return_none(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, None) is None
 
 
 class TestCleanOutputText:
@@ -459,31 +478,15 @@ class TestExtractTextContentReasoningReconstruction:
         assert result[0]["role"] == "assistant"
         assert result[0]["content"] == "<think>\nR\n</think>\n\nA"
 
-    def test_reasoning_with_none_content_is_dropped(self):
-        """reasoning-only assistant history should not be replayed."""
+    def test_reasoning_with_none_content(self):
+        """reasoning_content with content=None should still emit the <think> block."""
         messages = [
             Message(role="assistant", reasoning_content="R", content=None),
         ]
         result = extract_text_content(messages)
-        assert result == []
-
-    def test_duplicate_reasoning_content_is_dropped(self):
-        """Duplicate content/reasoning assistant history should not be replayed."""
-        messages = [
-            Message(role="assistant", reasoning_content="R", content="R"),
-        ]
-        result = extract_text_content(messages)
-        assert result == []
-
-    def test_visible_content_kept_when_reasoning_replay_disabled(self):
-        """Budgeted turns can keep answer text without replaying old reasoning."""
-        messages = [
-            Message(role="assistant", reasoning_content="R", content="A"),
-        ]
-        result = extract_text_content(messages, preserve_reasoning_content=False)
+        # Non-empty content after reconstruction keeps the message alive.
         assert len(result) == 1
-        assert result[0]["content"] == "A"
-        assert "reasoning_content" not in result[0]
+        assert result[0]["content"] == "<think>\nR\n</think>\n\n"
 
     def test_reasoning_with_content_list(self):
         """reasoning_content + list content should extract text parts and prefix <think>."""
@@ -541,35 +544,17 @@ class TestExtractTextContentNativeReasoningContent:
         # No <think> tag in content
         assert "<think>" not in result[0]["content"]
 
-    def test_native_mode_with_none_content_is_dropped(self):
-        """Native mode also drops reasoning-only assistant history."""
+    def test_native_mode_with_none_content(self):
+        """None content + reasoning_content still emits the field (and empty content)."""
         messages = [
             Message(role="assistant", reasoning_content="R", content=None),
         ]
         result = extract_text_content(messages, native_reasoning_content=True)
-        assert result == []
-
-    def test_native_mode_duplicate_reasoning_content_is_dropped(self):
-        """Native mode drops duplicate content/reasoning assistant history."""
-        messages = [
-            Message(role="assistant", reasoning_content="R", content="R"),
-        ]
-        result = extract_text_content(messages, native_reasoning_content=True)
-        assert result == []
-
-    def test_native_mode_visible_content_kept_when_reasoning_replay_disabled(self):
-        """Disabling replay wins over native reasoning field support."""
-        messages = [
-            Message(role="assistant", reasoning_content="R", content="A"),
-        ]
-        result = extract_text_content(
-            messages,
-            native_reasoning_content=True,
-            preserve_reasoning_content=False,
-        )
         assert len(result) == 1
-        assert result[0]["content"] == "A"
-        assert "reasoning_content" not in result[0]
+        # Empty content but message survives because reasoning_content exists.
+        # Note: _drop_void_assistant_messages may still drop this; verify it's
+        # retained via the reasoning_content presence.
+        assert result[0]["reasoning_content"] == "R"
 
     def test_native_mode_with_list_content(self):
         """List content gets flattened to text; reasoning kept separate."""
@@ -657,6 +642,16 @@ class TestUsesNativeReasoningContent:
         assert uses_native_reasoning_content(
             "qwen",
             preserve_thinking_default=True,
+        )
+
+    def test_detects_muse_glimmer(self):
+        assert uses_native_reasoning_content(
+            "any-name",
+            config_model_type="muse_glimmer",
+        )
+        assert uses_native_reasoning_content(
+            "any-name",
+            engine_model_type="muse_glimmer",
         )
 
     def test_plain_model_is_not_native(self):
@@ -1332,37 +1327,6 @@ class TestConvertAnthropicToInternalNativeReasoning:
         assert result[0]["content"] == "Let me check."
         assert result[0]["reasoning_content"] == "deliberating"
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
-        assert "<think>" not in result[0]["content"]
-
-    def test_reasoning_replay_disabled_keeps_visible_text(self):
-        """Budgeted requests can drop historical thinking but keep answer text."""
-        request = MessagesRequest(
-            model="claude-3",
-            max_tokens=1024,
-            messages=[
-                AnthropicMessage(
-                    role="assistant",
-                    content=[
-                        ContentBlockThinking(
-                            type="thinking",
-                            thinking="step by step",
-                            signature="",
-                        ),
-                        ContentBlockText(text="Answer"),
-                    ],
-                ),
-            ],
-        )
-
-        result = convert_anthropic_to_internal(
-            request,
-            native_reasoning_content=True,
-            preserve_reasoning_content=False,
-        )
-
-        assert len(result) == 1
-        assert result[0]["content"] == "Answer"
-        assert "reasoning_content" not in result[0]
         assert "<think>" not in result[0]["content"]
 
     def test_native_mode_no_thinking_no_field(self):
@@ -2243,6 +2207,17 @@ class TestPrepareSystemMessagesForTemplate:
                 )
             return "user:__OMLX_MID_SYSTEM_PROBE_USER__"
 
+    class ExplicitlyUnsupportedTokenizer(PreserveTokenizer):
+        _omlx_supports_mid_system_messages = False
+
+    class RelocatingTokenizer(ExplicitlyUnsupportedTokenizer):
+        @staticmethod
+        def _omlx_relocate_mid_system_messages(messages):
+            return [
+                {"role": "latest_reminder", "content": messages[1]["content"]},
+                messages[0],
+            ]
+
     def test_preserves_tail_system_when_template_keeps_position(self):
         messages = [
             {"role": "user", "content": "Hello"},
@@ -2255,6 +2230,56 @@ class TestPrepareSystemMessagesForTemplate:
 
         assert [m["role"] for m in result] == ["user", "system"]
         assert result[1]["content"] == "Plan mode"
+
+    def test_explicit_capability_overrides_marker_order_false_positive(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ExplicitlyUnsupportedTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [message["role"] for message in result] == ["user"]
+        assert result[0]["content"].endswith("[System note]\nPlan mode\n[/System note]")
+
+    def test_model_specific_relocation_precedes_capability_fallback(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.RelocatingTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert result == [
+            {"role": "latest_reminder", "content": "Plan mode"},
+            {"role": "user", "content": "Hello"},
+        ]
+
+    def test_partial_mode_does_not_use_model_specific_relocation(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.RelocatingTokenizer(),
+            is_partial=True,
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert result == [
+            {"role": "system", "content": "Plan mode"},
+            {"role": "user", "content": "Hello"},
+        ]
 
     def test_preserves_between_turn_system_when_template_keeps_position(self):
         messages = [

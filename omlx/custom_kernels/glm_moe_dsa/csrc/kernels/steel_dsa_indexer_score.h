@@ -16,6 +16,20 @@ METAL_FUNC uint dsa_ordered_key_16(T x) {
   return (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
 }
 
+METAL_FUNC uint dsa_ordered_key_16_bits(ushort bits) {
+  return (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
+}
+
+// finfo(T).min as an exact bit pattern: bf16 0xFF7F (-3.3895313892515355e38),
+// fp16 0xFBFF (-65504). This is the sentinel the call site's mx.where pass
+// writes (mx.finfo(dtype).min) — finite, and distinct from the -inf the
+// kernel's own causal path uses. Bit-exact by construction.
+template <typename T>
+METAL_FUNC T dsa_finfo_min() {
+  return as_type<T>(
+      ushort(metal::is_same<T, bfloat16_t>::value ? 0xFF7F : 0xFBFF));
+}
+
 template <typename T, typename O, int TOPK, int THREADS>
 [[kernel, max_total_threads_per_threadgroup(THREADS)]] void dsa_topk_indices_16bit(
     const device T* scores [[buffer(0)]],
@@ -134,21 +148,210 @@ template <typename T, typename O, int TOPK, int THREADS>
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   } else {
-    for (int i = int(tid); i < scan_limit; i += THREADS) {
+    // Deterministic output pass (replaces the atomic-race append, which made both
+    // tie MEMBERSHIP and output ORDER GPU-scheduling-dependent — measured: the
+    // selected set changed on ~80% of realistic rows across re-runs, so replicated
+    // TP ranks could pick different tie-band keys). Raking scan: each thread owns
+    // one contiguous segment of the row (count pass -> one threadgroup-wide
+    // exclusive scan of per-thread totals, ~3 barriers total -> emit pass).
+    // Strictly-greater entries fill [0, n_greater) and threshold ties fill
+    // [n_greater, TOPK) lowest-index-first — membership and order are functions of
+    // the scores alone. Costs one extra read of the score row vs the racy append.
+    constexpr uint kSimdgroups = THREADS / 32;
+    threadgroup uint tg_partials_g[kSimdgroups];
+    threadgroup uint tg_partials_t[kSimdgroups];
+    const uint simd_id = tid / 32;
+    const uint lane_id = tid % 32;
+    const int seg = (scan_limit + THREADS - 1) / THREADS;
+    const int s0 = int(tid) * seg;
+    const int s1 = metal::min(s0 + seg, scan_limit);
+
+    uint local_g = 0;
+    uint local_t = 0;
+    for (int i = s0; i < s1; ++i) {
       const uint key = dsa_ordered_key_16(row_scores[i]);
-      if (key > threshold_key) {
-        const uint pos =
-            atomic_fetch_add_explicit(&counters[0], 1, memory_order_relaxed);
-        if (pos < uint(TOPK)) {
-          row_out[pos] = O(i);
-        }
-      } else if (key == threshold_key) {
-        const uint pos =
-            atomic_fetch_add_explicit(&counters[1], 1, memory_order_relaxed);
-        if (pos < uint(TOPK)) {
-          row_out[pos] = O(i);
+      local_g += key > threshold_key ? 1u : 0u;
+      local_t += key == threshold_key ? 1u : 0u;
+    }
+
+    // Exclusive scan of the 1024 per-thread (greater, tie) totals.
+    uint pre_g = metal::simd_prefix_exclusive_sum(local_g);
+    uint pre_t = metal::simd_prefix_exclusive_sum(local_t);
+    if (lane_id == 31) {
+      tg_partials_g[simd_id] = pre_g + local_g;
+      tg_partials_t[simd_id] = pre_t + local_t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_id == 0) {
+      const uint pg = lane_id < kSimdgroups ? tg_partials_g[lane_id] : 0u;
+      const uint pt = lane_id < kSimdgroups ? tg_partials_t[lane_id] : 0u;
+      const uint sg = metal::simd_prefix_exclusive_sum(pg);
+      const uint st = metal::simd_prefix_exclusive_sum(pt);
+      if (lane_id < kSimdgroups) {
+        tg_partials_g[lane_id] = sg;
+        tg_partials_t[lane_id] = st;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint pos_g = tg_partials_g[simd_id] + pre_g;
+    uint pos_t = uint(state[3]) + tg_partials_t[simd_id] + pre_t;
+    if (local_g > 0 || (local_t > 0 && pos_t < uint(TOPK))) {
+      for (int j = s0; j < s1; ++j) {
+        const uint key = dsa_ordered_key_16(row_scores[j]);
+        if (key > threshold_key) {
+          row_out[pos_g++] = O(j);
+        } else if (key == threshold_key) {
+          if (pos_t < uint(TOPK)) {
+            row_out[pos_t++] = O(j);
+          }
         }
       }
+    }
+  }
+}
+
+METAL_FUNC uint dsa_ordered_key_32(float x) {
+  const uint bits = as_type<uint>(x);
+  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+// Exact FP32 selection for DSpark's decode-consistent index scores. Four
+// byte-wise radix passes identify the cutoff, then a deterministic segmented
+// scan writes the selected set directly in temporal order.
+template <int TOPK, int THREADS>
+[[kernel, max_total_threads_per_threadgroup(THREADS)]] void
+dspark_fp32_topk_indices(
+    const device float* scores [[buffer(0)]],
+    device uint* out [[buffer(1)]],
+    const constant DSATopKParams* params [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]) {
+  if (row >= uint(params->rows)) {
+    return;
+  }
+
+  constexpr uint kSimdgroups = THREADS / 32;
+  threadgroup atomic_uint hist[256];
+  threadgroup uint state[2];
+  threadgroup uint partial_a[kSimdgroups];
+  threadgroup uint partial_b[kSimdgroups];
+
+  if (tid == 0) {
+    state[0] = 0;
+    state[1] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint K = uint(params->K);
+  const uint segment = (K + THREADS - 1) / THREADS;
+  const uint start = tid * segment;
+  const uint stop = metal::min(start + segment, K);
+  const device float* row_scores = scores + size_t(row) * K;
+
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    if (tid < 256) {
+      atomic_store_explicit(&hist[tid], 0, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint prefix = state[0];
+    for (uint index = start; index < stop; ++index) {
+      const uint key = dsa_ordered_key_32(row_scores[index]);
+      const bool prefix_match = shift == 24 ||
+          (key >> uint(shift + 8)) == (prefix >> uint(shift + 8));
+      if (prefix_match) {
+        atomic_fetch_add_explicit(
+            &hist[(key >> uint(shift)) & 255u], 1, memory_order_relaxed);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+      uint greater = state[1];
+      uint selected_byte = 0;
+      for (int byte = 255; byte >= 0; --byte) {
+        const uint count =
+            atomic_load_explicit(&hist[byte], memory_order_relaxed);
+        if (greater + count >= uint(TOPK)) {
+          selected_byte = uint(byte);
+          break;
+        }
+        greater += count;
+      }
+      state[0] |= selected_byte << uint(shift);
+      state[1] = greater;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  const uint threshold = state[0];
+  const uint greater_total = state[1];
+  uint local_greater = 0;
+  uint local_ties = 0;
+  for (uint index = start; index < stop; ++index) {
+    const uint key = dsa_ordered_key_32(row_scores[index]);
+    local_greater += key > threshold ? 1u : 0u;
+    local_ties += key == threshold ? 1u : 0u;
+  }
+
+  const uint lane = tid & 31u;
+  const uint simd = tid >> 5;
+  uint pre_greater = metal::simd_prefix_exclusive_sum(local_greater);
+  uint pre_ties = metal::simd_prefix_exclusive_sum(local_ties);
+  if (lane == 31) {
+    partial_a[simd] = pre_greater + local_greater;
+    partial_b[simd] = pre_ties + local_ties;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd == 0) {
+    const uint group_greater = lane < kSimdgroups ? partial_a[lane] : 0u;
+    const uint group_ties = lane < kSimdgroups ? partial_b[lane] : 0u;
+    const uint group_pre_greater =
+        metal::simd_prefix_exclusive_sum(group_greater);
+    const uint group_pre_ties = metal::simd_prefix_exclusive_sum(group_ties);
+    if (lane < kSimdgroups) {
+      partial_a[lane] = group_pre_greater;
+      partial_b[lane] = group_pre_ties;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  pre_greater += partial_a[simd];
+  pre_ties += partial_b[simd];
+
+  const uint tie_budget = uint(TOPK) - greater_total;
+  const uint selected_ties = pre_ties >= tie_budget
+      ? 0u
+      : metal::min(local_ties, tie_budget - pre_ties);
+  const uint local_selected = local_greater + selected_ties;
+
+  uint pre_selected = metal::simd_prefix_exclusive_sum(local_selected);
+  if (lane == 31) {
+    partial_a[simd] = pre_selected + local_selected;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd == 0) {
+    const uint group_selected = lane < kSimdgroups ? partial_a[lane] : 0u;
+    const uint group_pre_selected =
+        metal::simd_prefix_exclusive_sum(group_selected);
+    if (lane < kSimdgroups) {
+      partial_a[lane] = group_pre_selected;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  uint output_pos = partial_a[simd] + pre_selected;
+  uint ties_seen = pre_ties;
+  device uint* row_out = out + size_t(row) * TOPK;
+  for (uint index = start; index < stop; ++index) {
+    const uint key = dsa_ordered_key_32(row_scores[index]);
+    bool selected = key > threshold;
+    if (key == threshold) {
+      selected = ties_seen < tie_budget;
+      ties_seen++;
+    }
+    if (selected) {
+      row_out[output_pos++] = index;
     }
   }
 }
@@ -165,6 +368,8 @@ dsa_indexer_score(
     const constant int& unused_causal_prefix_topk [[buffer(6)]],
     const constant bool& skip_causal_future_store [[buffer(7)]],
     const constant int& causal_q_offset [[buffer(8)]],
+    const constant int& mask_ratio [[buffer(9)]],
+    const constant int& mask_q_offset [[buffer(10)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -203,6 +408,8 @@ dsa_indexer_score(
   const int M = params->M;
   const int N = params->N;
   const int D = params->K;
+  const short tgp_bm = short(metal::min(BM, M - c_row));
+  const short tgp_bn = short(metal::min(BN, N - c_col));
   const int q_offset = causal_q_offset >= 0 ? causal_q_offset : N - M;
   constexpr int THREADS = WM * WN * 32;
   const int thread_idx = int(simd_group_id) * 32 + int(simd_lane_id);
@@ -260,8 +467,16 @@ dsa_indexer_score(
 
     for (int d = 0; d < params->gemm_k_iterations_aligned; ++d) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_a.load_unsafe();
-      loader_b.load_unsafe();
+      if (tgp_bm == BM) {
+        loader_a.load_unsafe();
+      } else {
+        loader_a.load_safe(short2(BK, tgp_bm));
+      }
+      if (tgp_bn == BN) {
+        loader_b.load_unsafe();
+      } else {
+        loader_b.load_safe(short2(BK, tgp_bn));
+      }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
       mma_op.mma(As, Bs);
@@ -276,9 +491,10 @@ dsa_indexer_score(
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < decltype(mma_op.Ctile)::kTileRows; ++i) {
       const int row = c_row + mma_op.sm + i * mma_t::TM_stride;
-      const float weight = weights_lh
-          ? static_cast<float>(W[size_t(row) * H + h])
-          : static_cast<float>(W[size_t(h) * M + row]);
+      const float weight = row < M
+          ? (weights_lh ? static_cast<float>(W[size_t(row) * H + h])
+                        : static_cast<float>(W[size_t(h) * M + row]))
+          : 0.0f;
       STEEL_PRAGMA_UNROLL
       for (short j = 0; j < decltype(mma_op.Ctile)::kTileCols; ++j) {
         thread const auto& frag = mma_op.Ctile.frag_at(i, j);
@@ -290,6 +506,7 @@ dsa_indexer_score(
     }
   }
 
+  const T pooled_sentinel = dsa_finfo_min<T>();
   device T* Dst = O + size_t(mma_op.sm) * params->ldd + mma_op.sn;
   short ai = 0;
   STEEL_PRAGMA_UNROLL
@@ -305,9 +522,24 @@ dsa_indexer_score(
       for (short e = 0; e < decltype(mma_op.Ctile)::kElemsPerFrag; ++e) {
         const int col = col_base + e;
         const bool future = do_causal && col > q_offset + row;
+        // ── Pooled-ratio causal mask (lossless opt 3) ─────────────────────
+        // Folds the call site's separate mx.where pass into the epilogue.
+        // Validity rule (cache_extras.py PoolingCache.make_mask): pooled
+        // column `col` is visible to query row `row` iff
+        //   col < (mask_q_offset + row + 1) // mask_ratio
+        // so masked iff col >= that bound (int operands are non-negative,
+        // C++ truncation == Python floor). Masked positions receive the SAME
+        // sentinel the where pass wrote — finfo(T).min, not -inf — so the
+        // post-mask output is bit-identical to the old two-step path.
+        // mask_ratio == 0 disables the mode (pmask == None callers).
+        const bool pooled_masked = mask_ratio > 0 &&
+            col >= (mask_q_offset + row + 1) / mask_ratio;
         const T value = future ? static_cast<T>(-INFINITY)
-                               : static_cast<T>(accum[ai]);
-        Dst[out_base + e] = value;
+            : pooled_masked  ? pooled_sentinel
+                             : static_cast<T>(accum[ai]);
+        if (row < M && col < N) {
+          Dst[out_base + e] = value;
+        }
         ai++;
       }
     }

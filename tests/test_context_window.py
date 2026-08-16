@@ -210,6 +210,7 @@ class TestValidateContextWindow:
         state = MagicMock()
         state.sampling = SamplingDefaults(max_context_window=global_max_ctx)
         state.settings_manager = None
+        state.engine_pool = None
         return state
 
     def test_passes_when_under_limit(self):

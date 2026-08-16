@@ -98,20 +98,6 @@ class VLMModelAdapter(nn.Module):
         )
 
     @property
-    def language_model(self):
-        """Expose the wrapped language model for native MTP eligibility checks."""
-        return self._language_model
-
-    @property
-    def mtp_available(self) -> bool:
-        """Return True when the wrapped language model exposes a live MTP head."""
-        return (
-            hasattr(self._language_model, "mtp_forward")
-            and hasattr(self._language_model, "make_mtp_cache")
-            and getattr(self._language_model, "mtp", None) is not None
-        )
-
-    @property
     def model_type(self) -> str:
         """Expose model_type for config access."""
         if hasattr(self._vlm_model, "config") and hasattr(self._vlm_model.config, "model_type"):
@@ -142,27 +128,6 @@ class VLMModelAdapter(nn.Module):
             return self._language_model.make_cache()
         from mlx_lm.models.cache import KVCache
         return [KVCache() for _ in range(len(self.layers))]
-
-    def make_mtp_cache(self) -> List[Any]:
-        """Create the language model's native MTP cache."""
-        if hasattr(self._language_model, "make_mtp_cache"):
-            return self._language_model.make_mtp_cache()
-        return []
-
-    def mtp_forward(
-        self,
-        hidden_states: mx.array,
-        next_token_ids: mx.array,
-        mtp_cache: List[Any],
-        **kwargs: Any,
-    ) -> Any:
-        """Delegate Native MTP head inference to the wrapped language model."""
-        return self._language_model.mtp_forward(
-            hidden_states,
-            next_token_ids,
-            mtp_cache,
-            **kwargs,
-        )
 
     def set_pending_embeddings(
         self,
@@ -288,12 +253,24 @@ class VLMModelAdapter(nn.Module):
     def _position_ids_from_starts(
         self, starts: mx.array, batch_size: int, seq_len: int
     ) -> mx.array:
-        """Build model-specific decode position_ids from per-row start offsets."""
+        """Build model-specific decode position_ids from per-row start offsets.
+
+        Positions are sequential from each row's start: row r covers
+        ``starts[r] .. starts[r] + seq_len - 1``. At single-token decode
+        (seq_len == 1) this reduces to the start offset itself; for
+        multi-token windows (the MTP verify rows) each position must
+        advance, or every draft row gets rope-rotated at the *first* row's
+        position — measured on Qwen3.6-35B-A3B as verify keys diverging
+        O(1) from an AR-built cache while values matched, breaking
+        verify/decode parity (and silently mis-rotating the KV the verify
+        writes for accepted rows).
+        """
         starts = starts.reshape(-1)[:batch_size]
+        steps = mx.arange(seq_len, dtype=starts.dtype)
+        seq_positions = starts[:, None] + steps[None, :]
         if self._uses_minimax_m3_positions:
-            steps = mx.arange(seq_len, dtype=starts.dtype)
-            return starts[:, None] + steps[None, :]
-        return mx.broadcast_to(starts[None, :, None], (3, batch_size, seq_len))
+            return seq_positions
+        return mx.broadcast_to(seq_positions[None, :, :], (3, batch_size, seq_len))
 
     def get_last_rope_deltas(self) -> float:
         """Extract rope_deltas from language model after VLM prefill.
@@ -379,6 +356,8 @@ class VLMModelAdapter(nn.Module):
                         input_ids, cache=cache, position_ids=position_ids, **kwargs
                     )
                 else:
+                    if hasattr(self._vlm_model, "_set_position_state"):
+                        self._vlm_model._set_position_state(input_ids)
                     result = self._language_model(
                         input_ids, cache=cache, **kwargs
                     )
@@ -397,6 +376,13 @@ class VLMModelAdapter(nn.Module):
                         input_ids, cache=cache, position_ids=position_ids, **kwargs
                     )
                 else:
+                    # Models that reuse another architecture's LanguageModel
+                    # (MiniCPM-o/V on qwen3_vl) cannot run get_rope_index()
+                    # against their own VisionConfig; without position state
+                    # a text-only prefill with scalar cache offsets crashes
+                    # on spatial_merge_size (#241, #2387).
+                    if hasattr(self._vlm_model, "_set_position_state"):
+                        self._vlm_model._set_position_state(input_ids)
                     result = self._language_model(
                         input_ids, cache=cache, **kwargs
                     )
@@ -408,10 +394,6 @@ class VLMModelAdapter(nn.Module):
         if return_hidden and hasattr(result, "logits"):
             return result
         if hasattr(result, "logits"):
-            if return_hidden:
-                hidden = getattr(result, "hidden_states", None)
-                if hidden is not None:
-                    return result.logits, hidden
             return result.logits
         return result
 

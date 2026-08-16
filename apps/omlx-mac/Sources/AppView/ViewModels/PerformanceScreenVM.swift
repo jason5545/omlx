@@ -7,6 +7,7 @@ final class PerformanceScreenVM {
     var maxConcurrentText: String = "8"
     var embeddingBatchSizeText: String = "32"
     var chunkedPrefill: Bool = false
+    var prefillPriority: String = "context"
 
     // Memory & Lifecycle
     var prefillMemoryGuard: Bool = false
@@ -27,6 +28,7 @@ final class PerformanceScreenVM {
     private(set) var loadedMaxConcurrent: Int = 8
     private(set) var loadedEmbeddingBatchSize: Int = 32
     private(set) var loadedChunkedPrefill: Bool = false
+    private(set) var loadedPrefillPriority: String = "context"
     private(set) var loadedPrefillMemoryGuard: Bool = false
     private(set) var loadedMemoryGuardTier: String = "balanced"
     private(set) var loadedMemoryGuardCustomCeilingGb: Double = 0
@@ -42,10 +44,17 @@ final class PerformanceScreenVM {
     private(set) var isSaving: Bool = false
     var lastError: String?
 
+    /// System memory snapshot from GET /admin/api/global-settings. Drives
+    /// the effective-ceiling preview under the Memory Guard Tier rows,
+    /// mirroring the web dashboard's breakdown (dashboard.js
+    /// `memoryGuardBreakdownHTML` / `memoryGuardShowWiredLimitWarning`).
+    var systemInfo: GlobalSettingsDTO.SystemInfo? = nil
+
     var hasPendingChanges: Bool {
         parsedMaxConcurrent != loadedMaxConcurrent
             || parsedEmbeddingBatchSize != loadedEmbeddingBatchSize
             || chunkedPrefill != loadedChunkedPrefill
+            || prefillPriority != loadedPrefillPriority
             || prefillMemoryGuard != loadedPrefillMemoryGuard
             || canonicalMemoryGuardTier(memoryGuardTier) != loadedMemoryGuardTier
             || parsedMemoryGuardCustomCeiling != loadedMemoryGuardCustomCeilingGb
@@ -70,6 +79,9 @@ final class PerformanceScreenVM {
                 self.loadedEmbeddingBatchSize = embeddingBatchSize
                 self.chunkedPrefill = sched.chunkedPrefill ?? false
                 self.loadedChunkedPrefill = sched.chunkedPrefill ?? false
+                let priority = sched.prefillPriority == "speed" ? "speed" : "context"
+                self.prefillPriority = priority
+                self.loadedPrefillPriority = priority
             }
             if let mem = s.memory {
                 self.prefillMemoryGuard = mem.prefillMemoryGuard ?? false
@@ -104,6 +116,7 @@ final class PerformanceScreenVM {
                 self.initialCacheBlocksText = cache.initialCacheBlocks.map { String($0) } ?? ""
                 self.loadedInitialCacheBlocks = cache.initialCacheBlocks
             }
+            self.systemInfo = s.system
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
@@ -125,18 +138,28 @@ final class PerformanceScreenVM {
                                     comment: "Performance screen error when embedding batch size input is invalid")
             return
         }
-        // Idle timeout: empty = leave alone (no patch field for null). Non-
-        // empty must be a positive integer; server enforces >= 60 itself.
+        // Idle timeout: empty or "0" = explicit null (disable), matching the
+        // WebUI's "None (disabled)" option. Non-zero must be >= 60; the
+        // server enforces the minimum.
         let idleTrimmed = idleTimeoutText.trimmingCharacters(in: .whitespaces)
-        var idleSeconds: Int? = nil
+        var idlePatch: PatchOptionalInt = .null
         if !idleTrimmed.isEmpty {
-            guard let n = Int(idleTrimmed), n >= 60 else {
+            guard let n = Int(idleTrimmed) else {
                 self.lastError = String(localized: "performance.error.idle_timeout_invalid",
-                                        defaultValue: "Idle Timeout must be ≥ 60 seconds (or empty to leave unchanged).",
+                                        defaultValue: "Idle Timeout must be ≥ 60 seconds (or empty/0 to disable).",
+                                        comment: "Performance screen error when idle timeout input is invalid")
+                return
+            }
+            if n == 0 {
+                idlePatch = .null
+            } else if n >= 60 {
+                idlePatch = .value(n)
+            } else {
+                self.lastError = String(localized: "performance.error.idle_timeout_invalid",
+                                        defaultValue: "Idle Timeout must be ≥ 60 seconds (or empty/0 to disable).",
                                         comment: "Performance screen error when idle timeout input is below 60 seconds")
                 return
             }
-            idleSeconds = n
         }
         // Initial cache blocks: empty = leave alone, non-empty must parse.
         let initTrimmed = initialCacheBlocksText.trimmingCharacters(in: .whitespaces)
@@ -166,6 +189,9 @@ final class PerformanceScreenVM {
             patch.embeddingBatchSize = embeddingBatchSize
         }
         if chunkedPrefill != loadedChunkedPrefill { patch.chunkedPrefill = chunkedPrefill }
+        if prefillPriority != loadedPrefillPriority {
+            patch.prefillPriority = prefillPriority
+        }
         // Memory & lifecycle
         if prefillMemoryGuard != loadedPrefillMemoryGuard {
             patch.memoryPrefillMemoryGuard = prefillMemoryGuard
@@ -176,8 +202,15 @@ final class PerformanceScreenVM {
         if customCeiling != loadedMemoryGuardCustomCeilingGb {
             patch.memoryGuardCustomCeilingGb = customCeiling
         }
-        if idleSeconds != loadedIdleTimeoutSeconds, let s = idleSeconds {
-            patch.idleTimeoutSeconds = s
+        // idleTimeout: empty/0 = disable (.null), >= 60 = set (.value).
+        // Only send when it actually changed, like the other fields.
+        switch idlePatch {
+        case .null where loadedIdleTimeoutSeconds != nil:
+            patch.idleTimeoutSeconds = .null
+        case .value(let n) where n != loadedIdleTimeoutSeconds:
+            patch.idleTimeoutSeconds = .value(n)
+        default:
+            break
         }
         if modelFallback != loadedModelFallback { patch.modelFallback = modelFallback }
         // Cache
@@ -201,10 +234,16 @@ final class PerformanceScreenVM {
             self.loadedMaxConcurrent = mc
             self.loadedEmbeddingBatchSize = embeddingBatchSize
             self.loadedChunkedPrefill = chunkedPrefill
+            self.loadedPrefillPriority = prefillPriority
             self.loadedPrefillMemoryGuard = prefillMemoryGuard
             self.loadedMemoryGuardTier = tier
             self.loadedMemoryGuardCustomCeilingGb = customCeiling
-            if let s = idleSeconds { self.loadedIdleTimeoutSeconds = s }
+            switch idlePatch {
+            case .null:
+                self.loadedIdleTimeoutSeconds = nil
+            case .value(let s):
+                self.loadedIdleTimeoutSeconds = s
+            }
             self.loadedModelFallback = modelFallback
             self.loadedCacheEnabled = cacheEnabled
             self.loadedHotCacheOnly = hotCacheOnly
@@ -228,9 +267,10 @@ final class PerformanceScreenVM {
         Int(embeddingBatchSizeText.trimmingCharacters(in: .whitespaces))
     }
 
-    private var parsedIdleTimeout: Int? {
+    var parsedIdleTimeout: Int? {
         let t = idleTimeoutText.trimmingCharacters(in: .whitespaces)
-        return t.isEmpty ? nil : Int(t)
+        guard !t.isEmpty, let value = Int(t) else { return nil }
+        return value == 0 ? nil : value
     }
 
     private var parsedInitialCacheBlocks: Int? {
@@ -290,6 +330,102 @@ final class PerformanceScreenVM {
                           defaultValue: "Default tier. Balances throughput with process memory safety.",
                           comment: "Description for balanced memory guard tier")
         }
+    }
+
+    // MARK: - Effective ceiling preview
+    //
+    // The server's hard ceiling is min(static, dynamic, metal_cap) —
+    // ProcessMemoryEnforcer._get_ceiling_breakdown. Without a preview a
+    // Custom ceiling above the Metal cap looks accepted here but the guard
+    // aborts requests at the clamped value with no hint why (#1463). The
+    // math below mirrors dashboard.js so both admin surfaces agree.
+
+    private static let bytesPerGB = 1073741824.0
+
+    /// Follows the tracked draft fields (tier popup, custom ceiling text)
+    /// so the preview updates as the user edits, before Apply.
+    var memoryGuardBreakdown: String? {
+        guard prefillMemoryGuard, let sys = systemInfo else { return nil }
+        let totalGB = Double(sys.totalMemoryBytes ?? 0) / Self.bytesPerGB
+        guard totalGB > 0 else { return nil }
+        let tier = canonicalMemoryGuardTier(memoryGuardTier)
+        let metalCapGB = Double(sys.iogpuWiredLimitBytes ?? 0) / Self.bytesPerGB
+
+        // Static reserve must track _STATIC_RESERVE_LARGE and the 24 GB
+        // small-system threshold in process_memory_enforcer.py.
+        let staticReserveGB: Double
+        if tier == "custom" {
+            staticReserveGB = 2
+        } else if totalGB < 24 {
+            staticReserveGB = 4
+        } else {
+            staticReserveGB = tier == "safe" ? 8 : tier == "aggressive" ? 4 : 6
+        }
+        let staticCeilingGB = max(0, totalGB - staticReserveGB)
+
+        func fmt(_ v: Double) -> String { String(format: "%.1f", v) }
+        func clamp(_ dynamicGB: Double) -> (ceiling: Double, kernelBinds: Bool) {
+            var candidates = [dynamicGB, staticCeilingGB]
+            if metalCapGB > 0 { candidates.append(metalCapGB) }
+            let ceiling = max(0, candidates.min() ?? 0)
+            let binds = metalCapGB > 0 && abs(metalCapGB - ceiling) < 1e-6
+                && dynamicGB >= metalCapGB - 1e-6
+                && staticCeilingGB >= metalCapGB - 1e-6
+            return (ceiling, binds)
+        }
+
+        if tier == "custom" {
+            let customGB = parsedMemoryGuardCustomCeiling
+            guard customGB > 0 else { return nil }
+            let (ceiling, kernelBinds) = clamp(customGB)
+            if kernelBinds {
+                return String(localized: "performance.memory.ceiling_preview.custom_kernel",
+                              defaultValue: "Custom ceiling \(fmt(customGB)) GB → effective ceiling \(fmt(ceiling)) GB (kernel Metal limit)",
+                              comment: "Ceiling preview when the custom memory guard value is clamped by the kernel Metal limit")
+            }
+            return String(localized: "performance.memory.ceiling_preview.custom",
+                          defaultValue: "Custom ceiling \(fmt(customGB)) GB → effective ceiling \(fmt(ceiling)) GB",
+                          comment: "Ceiling preview for the custom memory guard tier")
+        }
+
+        let freeGB = Double(sys.freeMemoryBytes ?? 0) / Self.bytesPerGB
+        let inactiveGB = Double(sys.inactiveMemoryBytes ?? 0) / Self.bytesPerGB
+        let activeGB = Double(sys.activeMemoryBytes ?? 0) / Self.bytesPerGB
+        guard freeGB + inactiveGB + activeGB > 0 else { return nil }
+        let ratio = tier == "safe" ? 0.2 : tier == "aggressive" ? 0.8 : 0.5
+        let reclaimGB = activeGB * ratio
+        let omlxGB = Double(sys.omlxPhysFootprintBytes ?? 0) / Self.bytesPerGB
+        let pct = Int((ratio * 100).rounded())
+        let (ceiling, kernelBinds) = clamp(omlxGB + freeGB + inactiveGB + reclaimGB)
+        if kernelBinds {
+            return String(localized: "performance.memory.ceiling_preview.tier_kernel",
+                          defaultValue: "Free \(fmt(freeGB)) GB + inactive \(fmt(inactiveGB)) GB + (active \(fmt(activeGB)) GB × \(pct)% = \(fmt(reclaimGB)) GB) → effective ceiling \(fmt(ceiling)) GB (kernel Metal limit)",
+                          comment: "Ceiling preview when the adaptive tier ceiling is clamped by the kernel Metal limit")
+        }
+        return String(localized: "performance.memory.ceiling_preview.tier",
+                      defaultValue: "Free \(fmt(freeGB)) GB + inactive \(fmt(inactiveGB)) GB + (active \(fmt(activeGB)) GB × \(pct)% = \(fmt(reclaimGB)) GB) → ceiling \(fmt(ceiling)) GB",
+                      comment: "Ceiling preview for the adaptive memory guard tiers")
+    }
+
+    /// Red warning when the effective Metal cap sits below what oMLX asked
+    /// Metal for at start — the ceiling users picked can never be reached
+    /// until the kernel sysctl is raised.
+    var wiredLimitWarningText: String? {
+        guard prefillMemoryGuard, let sys = systemInfo else { return nil }
+        let kernel = sys.iogpuWiredLimitBytes ?? 0
+        let requested = sys.omlxWiredLimitRequestBytes ?? 0
+        guard kernel > 0, requested > 0, kernel < requested else { return nil }
+        let kernelGB = String(format: "%.1f", Double(kernel) / Self.bytesPerGB)
+        return String(localized: "performance.memory.wired_limit_warning",
+                      defaultValue: "Metal caps oMLX at \(kernelGB) GB (kernel iogpu.wired_limit_mb). Raise it in Terminal:",
+                      comment: "Warning shown when the kernel Metal wired limit is below the memory ceiling oMLX requested")
+    }
+
+    /// The sysctl command paired with `wiredLimitWarningText`.
+    var wiredLimitCommand: String {
+        let requested = Double(systemInfo?.omlxWiredLimitRequestBytes ?? 0)
+        let mb = Int((requested / 1048576.0).rounded(.up))
+        return "sudo sysctl iogpu.wired_limit_mb=\(mb)"
     }
 
 }
