@@ -492,7 +492,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let group = DispatchGroup()
         group.enter()
         Task { @MainActor in
-            await server.stop(timeout: 8)
+            // Never stop an externally-owned server (e.g. the Homebrew
+            // service) just because the app is quitting — detach instead.
+            await server.stop(timeout: 8, stopAttachedExternal: false)
             group.leave()
         }
         _ = group.wait(timeout: .now() + 9)
