@@ -17,7 +17,12 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Guidance:
-    """A readable failure with steps that resolve it."""
+    """A readable failure with steps that resolve it.
+
+    ``code`` is the stable machine key structured diagnostics (the incident
+    feed) record next to the redacted message, so different failure funnels
+    that map to the same guidance stay groupable.
+    """
 
     title: str
     explanation: str
@@ -25,6 +30,7 @@ class Guidance:
     doc_anchor: str | None = None
     command: str | None = None
     keygen_command: str | None = None
+    code: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -34,6 +40,7 @@ class Guidance:
             "doc_anchor": self.doc_anchor,
             "command": self.command,
             "keygen_command": self.keygen_command,
+            "code": self.code,
         }
 
 
@@ -75,11 +82,36 @@ def _first_seen_host_guidance(message: str) -> Guidance | None:
         "pairing",
         f"ssh-copy-id -i ~/.ssh/omlx_cluster.pub {target}",
         "ssh-keygen -t ed25519 -f ~/.ssh/omlx_cluster -N '' -C omlx-cluster",
+        code="host_key_unknown",
     )
 
 
 # Ordered: the first pattern that matches wins, so put specific before general.
 _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
+    (
+        # Must precede the "not installed" rule below: a runtime we could not
+        # reach is not a runtime we know to be absent (#2680).
+        re.compile(
+            r"worker runtime could not be (?:verified|run|checked)",
+            re.I,
+        ),
+        Guidance(
+            "The device is online but its worker runtime could not be checked",
+            "SSH and hardware discovery succeeded and oMLX was found on the "
+            "device, but nothing there could load the worker, so its runtime "
+            "state is unknown rather than confirmed missing.",
+            (
+                "Open oMLX once on the named device — starting it publishes the "
+                "helper (~/.omlx/bin/omlx-cluster-python) this Mac looks for.",
+                "If the device runs oMLX from a pip or source install, start its "
+                "oMLX server once so the same helper is written.",
+                "Then return here and press Start again; oMLX re-checks the "
+                "runtime, memory, and links automatically.",
+            ),
+            "worker-runtime",
+            code="worker_runtime_unverified",
+        ),
+    ),
     (
         re.compile(r"oMLX worker runtime is not installed", re.I),
         Guidance(
@@ -93,6 +125,27 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "runtime, memory, and links automatically.",
             ),
             "worker-runtime",
+            code="worker_runtime_missing",
+        ),
+    ),
+    (
+        # Before the generic version rule below, which would otherwise claim
+        # the oMLX release differs when it is the interpreter that does (#2695).
+        re.compile(r"python local=\S+ remote=", re.I),
+        Guidance(
+            "The two Macs are running different Python versions",
+            "MLX ships a separate build for each Python version, so ranks on "
+            "different ones load different binaries and can disagree in ways "
+            "that produce wrong output rather than a clean error.",
+            (
+                "Run both Macs from the same oMLX install shape — either the "
+                "packaged app on both, or the same Python version on both.",
+                "If one Mac runs oMLX from source, recreate its environment on "
+                "the Python version the other Mac reports, then reinstall.",
+                "Re-run Set up cluster afterwards to confirm.",
+            ),
+            "worker-runtime",
+            code="python_version_mismatch",
         ),
     ),
     (
@@ -112,6 +165,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "its source copy is incomplete.",
             ),
             "models",
+            code="model_stage_incomplete",
         ),
     ),
     (
@@ -132,6 +186,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "split, and retry so automatic placement owns the full plan.",
             ),
             "plan-approval",
+            code="plan_changed",
         ),
     ),
     (
@@ -152,6 +207,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "stale entry with ssh-keygen -R, then retry pairing.",
             ),
             "pairing",
+            code="host_identity_changed",
         ),
     ),
     (
@@ -165,6 +221,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Retry pairing after both Macs are updated to a current macOS release.",
             ),
             "pairing",
+            code="no_matching_host_key",
         ),
     ),
     (
@@ -177,6 +234,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Check that the SSH username in the peer address is correct.",
             ),
             "pairing",
+            code="login_rejected",
         ),
     ),
     (
@@ -189,6 +247,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "If you typed it, try the .local name or the Thunderbolt IP.",
                 "Confirm both Macs are on the same network or cable.",
             ),
+            code="address_unresolved",
         ),
     ),
     (
@@ -201,6 +260,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "If you are using Thunderbolt, reseat the cable and re-run Detect link.",
                 "Confirm Remote Login is enabled in System Settings → General → Sharing.",
             ),
+            code="peer_unreachable",
         ),
     ),
     (
@@ -212,6 +272,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Check the peer is not asleep or under heavy load.",
                 "Retry — a first connection over a new link is often slower.",
             ),
+            code="peer_timeout",
         ),
     ),
     (
@@ -227,6 +288,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "family model.",
             ),
             "tensor-parallel",
+            code="no_tensor_parallel_support",
         ),
     ),
     (
@@ -240,6 +302,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Allow more memory on the Mac that is short, if it has headroom.",
                 "Choose a smaller model or add another Mac.",
             ),
+            code="no_workable_split",
         ),
     ),
     (
@@ -253,6 +316,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "degrees that divide evenly.",
             ),
             "tensor-parallel",
+            code="heads_not_divisible",
         ),
     ),
     (
@@ -262,6 +326,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
             "The cluster is arranged as pipeline stages of equal tensor-parallel "
             "groups, so the node count must be a multiple of the split.",
             ("Use automatic setup, or pick a split that divides your node count.",),
+            code="world_size_not_divisible",
         ),
     ),
     (
@@ -279,6 +344,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Update both Macs to the same oMLX release.",
                 "Re-run Set up cluster afterwards to confirm.",
             ),
+            code="version_mismatch",
         ),
     ),
     (
@@ -292,6 +358,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Make sure the paths match exactly on both.",
             ),
             "models",
+            code="model_missing_on_peer",
         ),
     ),
     (
@@ -300,6 +367,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
             "Clustering isn't set up on this Mac yet",
             "The cluster registry has not been initialised for this install.",
             ("Restart oMLX. If it persists, check the server logs for start-up errors.",),
+            code="registry_not_configured",
         ),
     ),
     (
@@ -311,6 +379,7 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
                 "Confirm /usr/bin/ssh-keygen exists.",
                 "If you manage your own keys, pair using an existing key instead.",
             ),
+            code="ssh_keygen_failed",
         ),
     ),
 )
@@ -322,6 +391,7 @@ _FALLBACK = Guidance(
         "Retry — transient link and SSH failures are common on a first connection.",
         "If it repeats, run Detect link to check the connection between the Macs.",
     ),
+    code="unknown_failure",
 )
 
 

@@ -45,6 +45,7 @@ from omlx.api.tool_calling import (
     parse_tool_calls,
     parse_tool_calls_with_thinking_fallback,
     restore_gemma4_param_names,
+    sanitize_tool_call_markup,
     validate_json_schema,
 )
 
@@ -1081,6 +1082,147 @@ class TestToolCallStreamFilter:
         assert r1 == "Next: "
         assert r2 == ""
         assert f.finish() == ""
+
+
+_DSML_START = "<｜DSML｜tool_calls>"
+_DSML_END = "</｜DSML｜tool_calls>"
+
+
+def _make_dsml_filter():
+    return ToolCallStreamFilter(_make_tokenizer_with_end(_DSML_START, _DSML_END))
+
+
+class TestToolCallStreamFilterDsmlSeparator:
+    """DeepSeek V4's "\\n\\n" separator belongs to the DSML envelope.
+
+    The reference decoder's stop token is the literal string
+    "\\n\\n<｜DSML｜tool_calls", so the separator before a tool-call block
+    is control markup, not content. The filter consumes it with the
+    envelope; content deltas never carry it.
+    """
+
+    def test_separator_consumed_before_tool_call(self):
+        f = _make_dsml_filter()
+        r = f.feed("I'll run it.\n\n" + _DSML_START + '{"name":"x"}')
+        assert r == "I'll run it."
+        assert f.feed(_DSML_END) == ""
+        assert f.finish() == ""
+
+    def test_separator_split_across_feeds(self):
+        f = _make_dsml_filter()
+        out = f.feed("answer.")
+        out += f.feed("\n")
+        out += f.feed("\n")
+        out += f.feed("<｜DSML｜tool_")
+        out += f.feed('calls>{"name":"x"}')
+        out += f.feed(_DSML_END)
+        out += f.finish()
+        assert out == "answer."
+
+    def test_marker_without_separator_still_suppressed(self):
+        f = _make_dsml_filter()
+        r = f.feed("answer." + _DSML_START + '{"name":"x"}' + _DSML_END)
+        r += f.finish()
+        assert r == "answer."
+
+    def test_only_final_two_newlines_belong_to_envelope(self):
+        # The reference decoder's str.find match consumes exactly the last
+        # two newlines of a longer run; the rest is content.
+        f = _make_dsml_filter()
+        r = f.feed("a.\n\n\n" + _DSML_START + '{"name":"x"}' + _DSML_END)
+        r += f.finish()
+        assert r == "a.\n"
+
+    def test_trailing_newlines_without_tool_call_survive_finish(self):
+        # Newlines held back as a potential envelope prefix are literal
+        # content when the stream ends without a tool call.
+        f = _make_dsml_filter()
+        r1 = f.feed("done.\n\n")
+        r2 = f.finish()
+        assert r1 == "done."
+        assert r1 + r2 == "done.\n\n"
+
+    def test_newlines_before_prose_pass_through(self):
+        f = _make_dsml_filter()
+        r1 = f.feed("a\n\n")
+        r2 = f.feed("b")
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "a\n\nb"
+
+    def test_separator_hold_disabled_for_thinking_channel(self):
+        # Filters watching the reasoning channel opt out: trailing newlines
+        # flush in place, never as a late delta after the channel closed.
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end(_DSML_START, _DSML_END),
+            consume_dsml_separator=False,
+        )
+        assert f.feed("thinking...\n\n") == "thinking...\n\n"
+        assert f.finish() == ""
+
+    def test_opted_out_filter_keeps_separator_but_still_suppresses(self):
+        # With the opt-out, a separator-preceded envelope is suppressed via
+        # the bare pair and the separator stays visible -- byte-identical
+        # to pre-change behavior for the thinking channel.
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end(_DSML_START, _DSML_END),
+            consume_dsml_separator=False,
+        )
+        r = f.feed("think\n\n" + _DSML_START + '{"name":"x"}' + _DSML_END)
+        r += f.finish()
+        assert r == "think\n\n"
+
+    def test_multiple_envelopes_with_prose_between(self):
+        f = _make_dsml_filter()
+        r = f.feed(
+            "a\n\n"
+            + _DSML_START
+            + "x"
+            + _DSML_END
+            + "b\n\n"
+            + _DSML_START
+            + "y"
+            + _DSML_END
+            + "c"
+        )
+        r += f.finish()
+        assert r == "abc"
+
+    def test_single_newline_held_then_released(self):
+        f = _make_dsml_filter()
+        r1 = f.feed("a\n")
+        r2 = f.feed("b")
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "a\nb"
+
+    def test_truncated_open_marker_drops_held_separator_at_finish(self):
+        # A stream cut mid-marker is malformed; strict mode drops the
+        # partial-marker tail, and the held separator goes with it --
+        # intended: the separator belongs to the (broken) envelope.
+        f = _make_dsml_filter()
+        r = f.feed("a\n\n<")
+        r += f.finish()
+        assert r == "a"
+
+    def test_unclosed_envelope_recovery_includes_separator(self):
+        # The recovery candidate carries the exact withheld bytes,
+        # separator included -- nothing streamed is duplicated, nothing
+        # withheld is lost.
+        f = _make_dsml_filter()
+        assert f.feed("a\n\n" + _DSML_START + "payload") == "a"
+        assert f.finish() == ""
+        assert (
+            f.take_recovery_candidate() == "\n\n" + _DSML_START + "payload"
+        )
+
+    def test_sanitize_markup_preserves_thinking_separator(self):
+        # sanitize_tool_call_markup cleans thinking-channel text at every
+        # call site; it must match the streamed reasoning deltas, which
+        # keep the separator (the opt-out above).
+        tok = _make_tokenizer_with_end(_DSML_START, _DSML_END)
+        cleaned = sanitize_tool_call_markup(
+            "a\n\n" + _DSML_START + '{"name":"x"}' + _DSML_END + "b", tok
+        )
+        assert cleaned == "a\n\nb"
 
 
 class TestToolCallStreamFilterBracketPartialPrefix:

@@ -8,7 +8,7 @@ and API key verification for admin panel access.
 import hashlib
 import os
 import secrets
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -192,24 +192,16 @@ def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
     Returns:
         True if the API key matches any configured key, False otherwise.
     """
-    return identify_api_key(api_key, main_key, sub_keys) is not None
-
-
-def identify_api_key(api_key: str, main_key: str, sub_keys: list) -> dict[str, Any] | None:
-    """Return safe metadata for the matched API key, without exposing the key value."""
     if not api_key:
-        return None
+        return False
+    # Check main key
     if main_key and compare_keys(api_key, main_key):
-        return {"kind": "main", "name": "main", "sub_key": None}
+        return True
+    # Check sub keys
     for sk in sub_keys:
-        key = getattr(sk, "key", "")
-        if key and compare_keys(api_key, key):
-            return {
-                "kind": "sub",
-                "name": getattr(sk, "name", "") or "sub-key",
-                "sub_key": sk,
-            }
-    return None
+        if sk.key and compare_keys(api_key, sk.key):
+            return True
+    return False
 
 
 def validate_api_key(api_key: str) -> tuple[bool, str]:

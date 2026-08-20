@@ -13,6 +13,7 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.tokenizer import get_tokenizer_config
 from .base import (
     BaseEngine,
@@ -111,7 +112,7 @@ class BatchedEngine(BaseEngine):
     @property
     def model_type(self) -> str | None:
         """Get the model type from config (e.g., 'gpt_oss', 'llama', 'qwen2')."""
-        if self._model is None:
+        if getattr(self, "_model", None) is None:
             return None
         # Try different ways to access model_type
         try:
@@ -311,6 +312,18 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
 
+        # Qwen MoE decode router: fuse the top-k select + renormalize chain
+        # into one launch (the composed argpartition chain is ~2 ms/token on
+        # the 256-expert 35B-A3B).
+        try:
+            from ..patches.qwen35_moe_router import (
+                apply_qwen35_moe_router_patch,
+            )
+
+            apply_qwen35_moe_router_patch()
+        except Exception:
+            logger.debug("Qwen MoE router patch not applied", exc_info=True)
+
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
@@ -380,6 +393,66 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
+        ane_prefill_sequence_length = 0
+        if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
+            try:
+                from ..patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
+
+                requested_ane_sequence_length = int(
+                    getattr(
+                        self._model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
+                )
+
+                def _enable_ane_prefill():
+                    return enable_qwen35_ane_prefill(
+                        self._model,
+                        sequence_length=requested_ane_sequence_length,
+                        fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_fraction",
+                            0.53,
+                        ),
+                        max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_max_layers",
+                            64,
+                        ),
+                        gdn=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn",
+                            True,
+                        ),
+                        gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_fraction",
+                            0.50,
+                        ),
+                        gdn_max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_max_layers",
+                            48,
+                        ),
+                        dual_ane=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_dual_ane",
+                            True,
+                        ),
+                    )
+
+                ane_count = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    _enable_ane_prefill,
+                )
+                if ane_count or getattr(
+                    self._model, "_omlx_ane_gdn_prefill_count", 0
+                ):
+                    ane_prefill_sequence_length = requested_ane_sequence_length
+            except Exception:
+                logger.warning("Qwen ANE prefill not enabled", exc_info=True)
+
         # Qwen3.5/3.6 sparse MoE prefill -> native weighted-sum after sorted
         # SwitchGLU. Strictly gated; decode and unsupported MoE variants fall
         # through to stock mlx-lm.
@@ -435,6 +508,15 @@ class BatchedEngine(BaseEngine):
 
         # TurboQuant KV cache: propagate bits to scheduler
         scheduler = self._engine.engine.scheduler
+        if ane_prefill_sequence_length:
+            from ..patches.qwen35_ane_prefill import (
+                configure_qwen35_ane_prefill_scheduler,
+            )
+
+            configure_qwen35_ane_prefill_scheduler(
+                scheduler,
+                ane_prefill_sequence_length,
+            )
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:
@@ -573,7 +655,12 @@ class BatchedEngine(BaseEngine):
                 template_kwargs.update(chat_template_kwargs)
 
             try:
-                return self._tokenizer.apply_chat_template(messages, **template_kwargs)
+                return apply_chat_template_with_reasoning_effort_fallback(
+                    self._tokenizer,
+                    messages,
+                    template_kwargs,
+                    is_harmony=self.model_type == "gpt_oss",
+                )
             except TypeError:
                 # Tokenizer doesn't support some kwargs, remove them and retry
                 if chat_template_kwargs:
@@ -820,6 +907,10 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
+            benchmark_ane_sequence_length=int(
+                kwargs.get("benchmark_ane_sequence_length", 0) or 0
+            ),
             **specprefill_kwargs,
         )
 
@@ -846,6 +937,22 @@ class BatchedEngine(BaseEngine):
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
+                    benchmark_prefill_chunks=(
+                        list(chunks)
+                        if (chunks := getattr(output, "benchmark_prefill_chunks", []))
+                        else []
+                    ),
+                    benchmark_requested_steps=(
+                        list(steps)
+                        if (steps := getattr(output, "benchmark_requested_steps", []))
+                        else []
+                    ),
+                    benchmark_boundary_enabled=bool(
+                        getattr(output, "benchmark_boundary_enabled", False)
+                    ),
+                    benchmark_cache_block_size=int(
+                        getattr(output, "benchmark_cache_block_size", 0) or 0
+                    ),
                 )
         except GeneratorExit:
             # Client disconnected
@@ -1118,8 +1225,16 @@ class BatchedEngine(BaseEngine):
             return self._engine.get_cache_stats()
         return None
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         """Abort all active requests without stopping the engine."""
         if self._engine and self._engine.engine:
-            return await self._engine.engine.abort_all_requests()
+            return await self._engine.engine.abort_all_requests(
+                reason=reason,
+                error_code=error_code,
+            )
         return 0

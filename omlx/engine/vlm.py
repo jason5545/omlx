@@ -47,6 +47,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
+from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -840,6 +841,56 @@ def _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir: Path):
             )
 
 
+@contextlib.contextmanager
+def _transpose_qwen35_mlx_vision_patch_embed_on_load(model_dir: Path):
+    """Fix channels-first Qwen3.5 vision weights in MLX checkpoints.
+
+    mlx-vlm skips model sanitizers when safetensors metadata declares
+    ``format=mlx``. Some converted Qwen3.5/3.6 checkpoints retain the PyTorch
+    Conv3d layout ``(out, in, time, height, width)`` for the vision patch
+    embedding, while MLX expects ``(out, time, height, width, in)``. Correct
+    only that unambiguously channels-first tensor during loading.
+    """
+    if _read_config_model_type(model_dir) not in {"qwen3_5", "qwen3_5_moe"}:
+        yield
+        return
+    if not _is_mlx_format_safetensors_dir(model_dir):
+        yield
+        return
+
+    import mlx_vlm.utils as _vu
+
+    original_load_safetensors = _vu._load_safetensors
+    transposed = 0
+
+    def _patched_load_safetensors(path):
+        nonlocal transposed
+        weights = original_load_safetensors(path)
+        key = "vision_tower.patch_embed.proj.weight"
+        value = weights.get(key)
+        if (
+            value is not None
+            and getattr(value, "ndim", None) == 5
+            and value.shape[1] == 3
+            and value.shape[-1] != 3
+        ):
+            weights[key] = value.transpose(0, 2, 3, 4, 1)
+            transposed += 1
+        return weights
+
+    _vu._load_safetensors = _patched_load_safetensors
+    try:
+        yield
+    finally:
+        _vu._load_safetensors = original_load_safetensors
+        if transposed:
+            logger.info(
+                "Transposed Qwen3.5 vision patch embedding to MLX Conv3d "
+                "layout for %s",
+                model_dir.name,
+            )
+
+
 _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
@@ -1518,6 +1569,9 @@ class VLMBatchedEngine(BaseEngine):
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
+                _transpose_qwen35_mlx_vision_patch_embed_on_load(
+                    Path(self._model_name)
+                ),
             ):
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
@@ -1744,6 +1798,30 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen FA-256 steel patch not applied", exc_info=True)
 
+        # Qwen3.5/3.6 verify-width GDN prework -> one fused Metal launch
+        # (conv+SiLU+split+RMS+scale+conv-state), bit-exact to the chain.
+        try:
+            from ..patches.qwen35_gdn_prework import (
+                apply_qwen35_gdn_prework_patch,
+            )
+
+            apply_qwen35_gdn_prework_patch()
+        except Exception:
+            logger.debug("Qwen GDN prework patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 verify-width (MTP target-verify) attention -> chunked
+        # causal vector-kernel calls instead of the per-row SDPA loop.
+        try:
+            from ..patches.qwen35_verify_sdpa_split import (
+                apply_qwen35_verify_sdpa_split_patch,
+            )
+
+            apply_qwen35_verify_sdpa_split_patch()
+        except Exception:
+            logger.debug(
+                "Qwen verify-split attention patch not applied", exc_info=True
+            )
+
         # Qwen3.5/3.6 Gated DeltaNet prefill -> optimized Metal kernel.
         # Decode and masked paths keep the original mlx-vlm kernel.
         gdn_prefill_enabled = getattr(
@@ -1782,6 +1860,82 @@ class VLMBatchedEngine(BaseEngine):
                 apply_muse_glimmer_q4_prefill_patch()
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
+
+        # Qwen MoE decode router: fuse the top-k select + renormalize chain
+        # into one launch for short rows (decode + MTP verify widths).
+        try:
+            from ..patches.qwen35_moe_router import (
+                apply_qwen35_moe_router_patch,
+            )
+
+            apply_qwen35_moe_router_patch()
+        except Exception:
+            logger.debug("Qwen MoE router patch not applied", exc_info=True)
+
+        if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
+            try:
+                from ..patches.qwen35_ane_prefill import (
+                    configure_qwen35_ane_prefill_scheduler,
+                    enable_qwen35_ane_prefill,
+                )
+
+                requested_ane_sequence_length = int(
+                    getattr(
+                        self._model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
+                )
+
+                def _enable_ane_prefill():
+                    return enable_qwen35_ane_prefill(
+                        self._vlm_model,
+                        sequence_length=requested_ane_sequence_length,
+                        fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_fraction",
+                            0.53,
+                        ),
+                        max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_max_layers",
+                            64,
+                        ),
+                        gdn=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn",
+                            True,
+                        ),
+                        gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_fraction",
+                            0.50,
+                        ),
+                        gdn_max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_max_layers",
+                            48,
+                        ),
+                        dual_ane=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_dual_ane",
+                            True,
+                        ),
+                    )
+
+                ane_count = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    _enable_ane_prefill,
+                )
+                if ane_count or getattr(
+                    self._vlm_model, "_omlx_ane_gdn_prefill_count", 0
+                ):
+                    configure_qwen35_ane_prefill_scheduler(
+                        scheduler,
+                        requested_ane_sequence_length,
+                    )
+            except Exception:
+                logger.warning("Qwen ANE prefill not enabled", exc_info=True)
 
         # Qwen3.5/3.6 sparse MoE prefill -> native weighted-sum after sorted
         # SwitchGLU. Decode and target-verify keep the original path.
@@ -2622,8 +2776,11 @@ class VLMBatchedEngine(BaseEngine):
         if not hasattr(template_target, "apply_chat_template"):
             template_target = getattr(self._processor, "tokenizer", self._processor)
         try:
-            prompt = template_target.apply_chat_template(
-                formatted_messages, **template_kwargs
+            prompt = apply_chat_template_with_reasoning_effort_fallback(
+                template_target,
+                formatted_messages,
+                template_kwargs,
+                is_harmony=model_type == "gpt_oss",
             )
         except TypeError:
             # Fallback: template doesn't support some kwargs
@@ -2698,8 +2855,13 @@ class VLMBatchedEngine(BaseEngine):
                     boundary_tokens = 0
                     if prefix_messages:
                         try:
-                            prefix_prompt = template_target.apply_chat_template(
-                                prefix_messages, **prefix_template_kwargs
+                            prefix_prompt = (
+                                apply_chat_template_with_reasoning_effort_fallback(
+                                    template_target,
+                                    prefix_messages,
+                                    prefix_template_kwargs,
+                                    is_harmony=model_type == "gpt_oss",
+                                )
                             )
                         except TypeError:
                             local_kwargs = dict(prefix_template_kwargs)
@@ -2956,7 +3118,12 @@ class VLMBatchedEngine(BaseEngine):
             _apply_minimax_m3_thinking_mode(self.model_type, template_kwargs)
 
             try:
-                return self._tokenizer.apply_chat_template(messages, **template_kwargs)
+                return apply_chat_template_with_reasoning_effort_fallback(
+                    self._tokenizer,
+                    messages,
+                    template_kwargs,
+                    is_harmony=self.model_type == "gpt_oss",
+                )
             except TypeError:
                 if chat_template_kwargs:
                     for key in chat_template_kwargs:
@@ -3256,6 +3423,10 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
+            benchmark_ane_sequence_length=int(
+                kwargs.get("benchmark_ane_sequence_length", 0) or 0
+            ),
             tools=tools,
             **specprefill_kwargs,
         )
@@ -3279,6 +3450,22 @@ class VLMBatchedEngine(BaseEngine):
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
+                    benchmark_prefill_chunks=(
+                        list(chunks)
+                        if (chunks := getattr(output, "benchmark_prefill_chunks", []))
+                        else []
+                    ),
+                    benchmark_requested_steps=(
+                        list(steps)
+                        if (steps := getattr(output, "benchmark_requested_steps", []))
+                        else []
+                    ),
+                    benchmark_boundary_enabled=bool(
+                        getattr(output, "benchmark_boundary_enabled", False)
+                    ),
+                    benchmark_cache_block_size=int(
+                        getattr(output, "benchmark_cache_block_size", 0) or 0
+                    ),
                 )
         except GeneratorExit:
             logger.info(f"[vlm_stream_generate] GeneratorExit for request {request_id}")
@@ -4164,7 +4351,12 @@ class VLMBatchedEngine(BaseEngine):
             return self._engine.get_cache_stats()
         return None
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         """Abort all active requests."""
         if self.is_diffusion_model:
             cancel_events = list(getattr(self, "_diffusion_cancel_events", ()))
@@ -4172,5 +4364,8 @@ class VLMBatchedEngine(BaseEngine):
                 cancel_event.set()
             return len(cancel_events)
         if self._engine and self._engine.engine:
-            return await self._engine.engine.abort_all_requests()
+            return await self._engine.engine.abort_all_requests(
+                reason=reason,
+                error_code=error_code,
+            )
         return 0

@@ -414,7 +414,6 @@ final class WelcomeViewModel: ObservableObject {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if case .running = proc.state { return }
-            if case .attached = proc.state { return }
             try? await Task.sleep(for: .milliseconds(200))
         }
     }

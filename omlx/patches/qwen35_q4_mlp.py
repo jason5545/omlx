@@ -26,8 +26,35 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _LINEAR_PATCHED = False
 _LM_LINEAR_PATCHED = False
+_LM_GDN_PREFILL_BACKEND: (
+    Callable[
+        [Any, mx.array, bool],
+        tuple[mx.array, mx.array, mx.array, mx.array] | None,
+    ]
+    | None
+) = None
 _SUPPORTED_QMM_BITS = frozenset((2, 4, 5, 6, 8))
 _Q8_MIN_TOKENS = 16384
+
+
+def register_qwen35_lm_gdn_prefill_backend(
+    backend: Callable[
+        [Any, mx.array, bool],
+        tuple[mx.array, mx.array, mx.array, mx.array] | None,
+    ]
+    | None,
+) -> None:
+    """Register a first-refusal projection backend for mlx-lm GDN prefill.
+
+    mlx-vlm funnels these projections through ``_target_verify_linears``;
+    mlx-lm calls them directly inside ``GatedDeltaNet.__call__``.  Keeping the
+    hook in this outer q4 wrapper lets later accelerators intercept the active
+    mlx-lm path without replacing the recurrent GDN implementation or the MTP
+    compatibility signature.
+    """
+
+    global _LM_GDN_PREFILL_BACKEND
+    _LM_GDN_PREFILL_BACKEND = backend
 
 
 def _native_qmm_for_bits(bits: int) -> Callable[..., mx.array] | None:
@@ -171,6 +198,20 @@ def _linear_qmm(linear: nn.QuantizedLinear, x: mx.array, variant: int) -> mx.arr
         return linear(x)
     gs = int(getattr(linear, "group_size", 64))
     return qmm(x, linear.weight, linear.scales, linear.biases, variant, gs)
+
+
+def _post_ane_qmm_or_linear(linear: Any, x: mx.array, variant: int) -> mx.array:
+    # The native q8 tile only pays off at long sequences, and post-ANE suffix
+    # inputs sit at the fixed ANE shape far below that. Route q8 through the
+    # same OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS boundary as the prefill linear
+    # patch instead of hardcoding stock MLX for it.
+    bits = getattr(linear, "bits", None)
+    q8_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
+    )
+    if x.shape[-2] < _route_min_tokens_for_bits(bits, 0, q8_min_tokens):
+        return linear(x)
+    return _linear_qmm(linear, x, variant)
 
 
 def _make_patched_mlp(
@@ -371,8 +412,6 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
     """Patch mlx-lm Qwen3.5/3.6 attention/GDN linears for q4 prefill."""
 
     global _LM_LINEAR_PATCHED
-    if _LM_LINEAR_PATCHED:
-        return True
     if os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") == "0":
         return False
     if not _has_native_qmm():
@@ -403,12 +442,16 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
             return _linear_qmm(linear, x, variant)
         return linear(x)
 
+    installed = False
     patched = False
 
     attn_cls = getattr(module, "Attention", None)
-    if attn_cls is not None and not getattr(
-        attn_cls, "_omlx_q4_lm_attention_patched", False
-    ):
+    attn_wrapper = (
+        getattr(attn_cls, "_omlx_q4_lm_attention_wrapper", None)
+        if attn_cls is not None
+        else None
+    )
+    if attn_cls is not None and attn_cls.__call__ is not attn_wrapper:
         orig_attn = attn_cls.__call__
         try:
             attn_module = importlib.import_module(attn_cls.__module__)
@@ -478,12 +521,19 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
         attn_cls.__call__ = patched_attention
         attn_cls._omlx_q4_lm_attention_patched = True
         attn_cls._omlx_q4_lm_attention_original_call = orig_attn
+        attn_cls._omlx_q4_lm_attention_wrapper = patched_attention
+        installed = True
         patched = True
+    elif attn_cls is not None:
+        installed = True
 
     gdn_cls = getattr(module, "GatedDeltaNet", None)
-    if gdn_cls is not None and not getattr(
-        gdn_cls, "_omlx_q4_lm_gdn_patched", False
-    ):
+    gdn_wrapper = (
+        getattr(gdn_cls, "_omlx_q4_lm_gdn_wrapper", None)
+        if gdn_cls is not None
+        else None
+    )
+    if gdn_cls is not None and gdn_cls.__call__ is not gdn_wrapper:
         orig_gdn = gdn_cls.__call__
         try:
             gdn_module = importlib.import_module(gdn_cls.__module__)
@@ -501,6 +551,7 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 or inputs.ndim != 3
                 or inputs.shape[-2] < min_tokens
                 or self.sharding_group is not None
+                or os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") == "0"
             ):
                 if n_confirmed:
                     return orig_gdn(
@@ -514,7 +565,15 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 self.in_proj_b,
                 self.in_proj_a,
             )
-            if not any(should_route(linear, inputs) for linear in input_linears):
+            backend = _LM_GDN_PREFILL_BACKEND
+            projections = (
+                backend(self, inputs, bool(n_confirmed))
+                if backend is not None
+                else None
+            )
+            if projections is None and not any(
+                should_route(linear, inputs) for linear in input_linears
+            ):
                 if n_confirmed:
                     return orig_gdn(
                         self, inputs, mask=mask, cache=cache, n_confirmed=n_confirmed
@@ -522,12 +581,14 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 return orig_gdn(self, inputs, mask=mask, cache=cache)
 
             B, S, _ = inputs.shape
-            qkv = qmm_or_linear(self.in_proj_qkv, inputs)
-            z = qmm_or_linear(self.in_proj_z, inputs).reshape(
-                B, S, self.num_v_heads, self.head_v_dim
-            )
-            b = qmm_or_linear(self.in_proj_b, inputs)
-            a = qmm_or_linear(self.in_proj_a, inputs)
+            if projections is None:
+                qkv = qmm_or_linear(self.in_proj_qkv, inputs)
+                z = qmm_or_linear(self.in_proj_z, inputs)
+                b = qmm_or_linear(self.in_proj_b, inputs)
+                a = qmm_or_linear(self.in_proj_a, inputs)
+            else:
+                qkv, z, b, a = projections
+            z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
             if cache is not None and cache[0] is not None:
                 conv_state = cache[0]
@@ -587,9 +648,13 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
         gdn_cls.__call__ = patched_gdn
         gdn_cls._omlx_q4_lm_gdn_patched = True
         gdn_cls._omlx_q4_lm_gdn_original_call = orig_gdn
+        gdn_cls._omlx_q4_lm_gdn_wrapper = patched_gdn
+        installed = True
         patched = True
+    elif gdn_cls is not None:
+        installed = True
 
-    _LM_LINEAR_PATCHED = patched
+    _LM_LINEAR_PATCHED = installed
     if patched:
         logger.info(
             "Qwen mlx-lm quantized prefill linear patch applied "
@@ -598,7 +663,7 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
             min_tokens,
             q8_min_tokens,
         )
-    return patched
+    return installed
 
 
 _MUSE_PATCHED = False

@@ -33,6 +33,7 @@ from ..memory_monitor import (
     raise_if_prefill_exceeds,
     set_model_info_from_model,
 )
+from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
 from ..utils.proc_memory import get_phys_footprint
@@ -396,15 +397,19 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else 20 * 1024**3
         )
-        # None → let dflash-mlx pick its own default (window=1024, sink=64, verify="adaptive").
-        # `getattr` returns None for missing attrs so older settings files keep working.
         self._draft_window_size = (
             getattr(model_settings, "dflash_draft_window_size", None)
             if model_settings
             else None
         )
-        self._draft_sink_size = (
+        draft_sink_size = (
             getattr(model_settings, "dflash_draft_sink_size", None)
+            if model_settings
+            else None
+        )
+        self._draft_sink_size = 0 if draft_sink_size is None else draft_sink_size
+        self._block_size = (
+            getattr(model_settings, "dflash_block_size", None)
             if model_settings
             else None
         )
@@ -489,6 +494,31 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         )
         return build_runtime_context(cfg)
 
+    @staticmethod
+    def _checkpoint_draft_window_size(draft_meta: Any) -> int | None:
+        """Return a positive ``config.sliding_window`` from draft metadata."""
+        if not isinstance(draft_meta, dict):
+            return None
+        config = draft_meta.get("config")
+        value = (
+            config.get("sliding_window")
+            if isinstance(config, dict)
+            else getattr(config, "sliding_window", None)
+        )
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            window_size = int(value)
+        except (TypeError, ValueError):
+            return None
+        return window_size if window_size > 0 else None
+
+    def _resolve_draft_window_size(self, draft_meta: Any) -> int | None:
+        """Keep an explicit setting; otherwise use the checkpoint config."""
+        if self._draft_window_size is not None:
+            return self._draft_window_size
+        return self._checkpoint_draft_window_size(draft_meta)
+
     async def start(self) -> None:
         if self._loaded:
             return
@@ -528,20 +558,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # Native MTP load on the same process would see leftover dflash
             # hooks and crash with TypeError on n_confirmed (issue #1388).
             # Idempotent — only wraps once per process.
-            from ..patches.dflash_draft_config import (
-                install_dflash_draft_config_normalizer,
-            )
             from ..patches.dflash_lifecycle import install_dflash_lifecycle_wrap
 
             install_dflash_lifecycle_wrap()
-            # Newer z-lab drafts ship transformers 5.x-style configs that nest
-            # rope_theta under rope_parameters and block_size under
-            # dflash_config, but DFlashDraftModelArgs requires both at the
-            # config root with no defaults. Without this, load_draft_bundle
-            # crashes with a missing-positional-argument TypeError and
-            # engine_pool falls back to the vlm engine (issue #2317).
-            # Idempotent — only wraps once per process.
-            install_dflash_draft_config_normalizer()
 
             target_bundle = load_target_bundle(
                 self._model_name,
@@ -592,10 +611,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 target_ops=target_bundle.target_ops,
             )
             draft_backend = EagerDraftBackend()
-            return target_bundle, draft, draft_backend
+            return target_bundle, draft, draft_backend, draft_meta
 
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
-        target_bundle, self._draft_model, self._draft_backend = result
+        target_bundle, self._draft_model, self._draft_backend, draft_meta = result
+        self._draft_window_size = self._resolve_draft_window_size(draft_meta)
+        runtime_context = self._build_runtime_context()
         self._runtime_context = runtime_context
         self._target_model = target_bundle.model
         self._tokenizer_obj = target_bundle.tokenizer
@@ -890,8 +911,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
             try:
-                return self._tokenizer_obj.apply_chat_template(
-                    messages, **template_kwargs
+                return apply_chat_template_with_reasoning_effort_fallback(
+                    self._tokenizer_obj,
+                    messages,
+                    template_kwargs,
+                    is_harmony=self.model_type == "gpt_oss",
                 )
             except TypeError:
                 if chat_template_kwargs:
@@ -1111,6 +1135,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self,
         prompt_tokens: list[int],
         max_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
         from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
@@ -1152,6 +1180,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             suppress_token_ids=(
                 sorted(self._suppress_token_ids) if self._suppress_token_ids else None
             ),
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            block_tokens=self._block_size,
             prompt_tokens_override=prompt_tokens,
             prefix_snapshot=prefix_flow.snapshot,
             snapshot_service=prefix_flow.snapshot_service,
@@ -1192,6 +1225,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         prompt_tokens: list[int],
         max_tokens: int,
         temperature: float,
+        top_p: float,
+        top_k: int,
+        min_p: float,
+        seed: int | None,
         tools: list[dict] | None,
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
@@ -1210,9 +1247,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         cache_manager = None
         try:
             self._record_prefill_guard_active_memory()
+            if seed is not None:
+                # Best-effort per-request reproducibility, matching the
+                # batched engine's mx.random.seed handling.
+                mx.random.seed(int(seed))
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                 prompt_tokens=prompt_tokens,
                 max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
             )
             cache_manager = self._begin_runtime_cache_request()
             self._record_prefill_guard_active_memory()
@@ -1401,6 +1446,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             )
 
         tools = kwargs.pop("tools", None)
+        seed = kwargs.pop("seed", None)
 
         from ..engine_core import get_mlx_executor
 
@@ -1421,9 +1467,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             parser_session = self._create_output_parser_session(tools)
             try:
                 self._record_prefill_guard_active_memory()
+                if seed is not None:
+                    # Best-effort per-request reproducibility, matching the
+                    # batched engine's mx.random.seed handling.
+                    mx.random.seed(int(seed))
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
                 )
                 cache_manager = self._begin_runtime_cache_request()
                 self._record_prefill_guard_active_memory()
@@ -1613,6 +1667,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             return
 
         tools = kwargs.pop("tools", None)
+        seed = kwargs.pop("seed", None)
 
         prompt_len = len(prompt_tokens)
         loop = asyncio.get_running_loop()
@@ -1645,6 +1700,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             prompt_tokens,
             max_tokens,
             temperature,
+            top_p,
+            top_k,
+            min_p,
+            seed,
             tools,
             queue,
             loop,

@@ -53,17 +53,13 @@ def test_qwen35_q_affine_qmm_matches_mlx_quantized_matmul(bits):
         bits=bits,
         mode="affine",
     )
-    got = getattr(fast, f"qwen35_q{bits}_affine_qmm_t")(
-        x, weight, scales, biases, 8
-    )
+    got = getattr(fast, f"qwen35_q{bits}_affine_qmm_t")(x, weight, scales, biases, 8)
     mx.eval(ref, got)
 
     diff = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32))
     mx.eval(diff)
     max_abs = float(mx.max(diff).item())
-    rel = float(
-        (mx.max(diff) / (mx.max(mx.abs(ref.astype(mx.float32))) + 1e-9)).item()
-    )
+    rel = float((mx.max(diff) / (mx.max(mx.abs(ref.astype(mx.float32))) + 1e-9)).item())
     assert max_abs <= 1.0
     assert rel <= 0.05
 
@@ -97,10 +93,7 @@ def test_qwen35_q4_mlp_patch_routes_prefill_and_skips_decode(monkeypatch):
     y = mlp(x)
     mx.eval(y)
     assert calls["count"] == 3
-    assert (
-        mx.max(mx.abs(y.astype(mx.float32) - y_ref.astype(mx.float32))).item()
-        <= 1.0
-    )
+    assert mx.max(mx.abs(y.astype(mx.float32) - y_ref.astype(mx.float32))).item() <= 1.0
 
     calls["count"] = 0
     y_decode = mlp(x[:, :1, :])
@@ -146,10 +139,7 @@ def test_qwen35_mixed_bit_mlp_patch_routes_5_bit_down_proj(monkeypatch):
     y = mlp(x)
     mx.eval(y)
     assert calls == {4: 2, 5: 1}
-    assert (
-        mx.max(mx.abs(y.astype(mx.float32) - y_ref.astype(mx.float32))).item()
-        <= 1.0
-    )
+    assert mx.max(mx.abs(y.astype(mx.float32) - y_ref.astype(mx.float32))).item() <= 1.0
 
 
 def test_qwen35_q8_route_uses_bit_specific_min_tokens():
@@ -196,6 +186,118 @@ def test_qwen35_q8_route_uses_bit_specific_min_tokens():
         min_tokens=16,
         q8_min_tokens=16,
     )
+
+
+def test_post_ane_qmm_or_linear_routes_q8_through_env_threshold(monkeypatch):
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    routed = []
+    monkeypatch.setattr(
+        q4patch,
+        "_linear_qmm",
+        lambda linear, x, variant: routed.append((linear, variant)) or x,
+    )
+
+    class _Stock:
+        def __init__(self, bits=None):
+            if bits is not None:
+                self.bits = bits
+            self.called = 0
+
+        def __call__(self, x):
+            self.called += 1
+            return x
+
+    x = mx.zeros((1, 2048, 64), dtype=mx.bfloat16)
+
+    q8 = _Stock(bits=8)
+    assert q4patch._post_ane_qmm_or_linear(q8, x, 8) is x
+    assert q8.called == 1
+    assert routed == []
+
+    monkeypatch.setenv("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", "2048")
+    q8_low = _Stock(bits=8)
+    q4patch._post_ane_qmm_or_linear(q8_low, x, 8)
+    assert q8_low.called == 0
+    assert routed == [(q8_low, 8)]
+
+    q5 = _Stock(bits=5)
+    q4patch._post_ane_qmm_or_linear(q5, x, 8)
+    assert q5.called == 0
+    assert routed[-1] == (q5, 8)
+
+
+def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
+    monkeypatch,
+):
+    import mlx_lm.models.qwen3_5 as qwen35
+
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    class BackendCalledError(Exception):
+        pass
+
+    monkeypatch.setattr(q4patch, "_has_native_qmm", lambda: True)
+    monkeypatch.setenv("OMLX_QWEN35_Q4_LM_LINEAR", "1")
+    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "16")
+    monkeypatch.setenv("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", "16384")
+
+    class FakeGDN:
+        sharding_group = None
+        in_proj_qkv = object()
+        in_proj_z = object()
+        in_proj_b = object()
+        in_proj_a = object()
+
+    gdn = FakeGDN()
+    x = mx.zeros((1, 32, 1), dtype=mx.bfloat16)
+
+    def gdn_backend(module, inputs, target_verify=False):
+        assert module is gdn
+        assert inputs is x
+        assert target_verify is False
+        raise BackendCalledError
+
+    def original_call(module, inputs, mask=None, cache=None):
+        return inputs
+
+    orig_gdn_call = qwen35.GatedDeltaNet.__call__
+    orig_lm_patched = q4patch._LM_LINEAR_PATCHED
+    orig_gdn_backend = q4patch._LM_GDN_PREFILL_BACKEND
+    saved_attrs = {}
+    for attr in (
+        "_omlx_q4_lm_gdn_patched",
+        "_omlx_q4_lm_gdn_original_call",
+        "_omlx_q4_lm_gdn_wrapper",
+    ):
+        saved_attrs[attr] = (
+            getattr(qwen35.GatedDeltaNet, attr)
+            if hasattr(qwen35.GatedDeltaNet, attr)
+            else None,
+            hasattr(qwen35.GatedDeltaNet, attr),
+        )
+        if hasattr(qwen35.GatedDeltaNet, attr):
+            delattr(qwen35.GatedDeltaNet, attr)
+
+    try:
+        qwen35.GatedDeltaNet.__call__ = original_call
+        q4patch._LM_LINEAR_PATCHED = False
+        q4patch.register_qwen35_lm_gdn_prefill_backend(gdn_backend)
+        assert q4patch.apply_qwen35_q4_lm_prefill_linear_patch() is True
+
+        with pytest.raises(BackendCalledError):
+            qwen35.GatedDeltaNet.__call__(gdn, x)
+        monkeypatch.setenv("OMLX_QWEN35_Q4_LM_LINEAR", "0")
+        assert qwen35.GatedDeltaNet.__call__(gdn, x) is x
+    finally:
+        qwen35.GatedDeltaNet.__call__ = orig_gdn_call
+        q4patch._LM_LINEAR_PATCHED = orig_lm_patched
+        q4patch._LM_GDN_PREFILL_BACKEND = orig_gdn_backend
+        for attr, (value, existed) in saved_attrs.items():
+            if existed:
+                setattr(qwen35.GatedDeltaNet, attr, value)
+            elif hasattr(qwen35.GatedDeltaNet, attr):
+                delattr(qwen35.GatedDeltaNet, attr)
 
 
 @pytest.mark.parametrize(
@@ -331,9 +433,7 @@ def test_qwen35_q4_prefill_linear_patch_routes_supported_only(monkeypatch):
 
     monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy)
     assert apply_qwen35_q4_prefill_linear_patch() is True
-    out0, out1 = qwen35_lang._target_verify_linears(
-        (supported, unsupported), x, False
-    )
+    out0, out1 = qwen35_lang._target_verify_linears((supported, unsupported), x, False)
     mx.eval(out0, out1)
     assert calls["count"] == 1
 
@@ -415,9 +515,7 @@ def test_qwen35_q4_lm_attention_uses_sdpa_installed_after_the_patch(monkeypatch)
         # Install the replacement dispatcher only after the patch is in place,
         # the way a later TurboQuant-enabled model load does.
         attn_module = importlib.import_module(qwen35.Attention.__module__)
-        monkeypatch.setattr(
-            attn_module, "scaled_dot_product_attention", sentinel_sdpa
-        )
+        monkeypatch.setattr(attn_module, "scaled_dot_product_attention", sentinel_sdpa)
 
         y = attn(x)
         mx.eval(y)
@@ -470,6 +568,12 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
         setattr(attn, name, _quantized_bf16(getattr(attn, name)))
 
     gdn = qwen35.GatedDeltaNet(args)
+    for name in ("in_proj_qkv", "in_proj_z", "out_proj"):
+        setattr(gdn, name, _quantized_bf16(getattr(gdn, name)))
+    for name in ("in_proj_b", "in_proj_a"):
+        setattr(gdn, name, _quantized_bf16(getattr(gdn, name), bits=8))
+
+    gdn_q8 = qwen35.GatedDeltaNet(args)
     for name in (
         "in_proj_qkv",
         "in_proj_z",
@@ -477,11 +581,12 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
         "in_proj_a",
         "out_proj",
     ):
-        setattr(gdn, name, _quantized_bf16(getattr(gdn, name)))
+        setattr(gdn_q8, name, _quantized_bf16(getattr(gdn_q8, name), bits=8))
 
     orig_attn_call = qwen35.Attention.__call__
     orig_gdn_call = qwen35.GatedDeltaNet.__call__
     orig_lm_patched = q4patch._LM_LINEAR_PATCHED
+    orig_gdn_backend = q4patch._LM_GDN_PREFILL_BACKEND
 
     saved_attrs = {}
     for cls, attrs in (
@@ -490,6 +595,7 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
             (
                 "_omlx_q4_lm_attention_patched",
                 "_omlx_q4_lm_attention_original_call",
+                "_omlx_q4_lm_attention_wrapper",
             ),
         ),
         (
@@ -497,6 +603,7 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
             (
                 "_omlx_q4_lm_gdn_patched",
                 "_omlx_q4_lm_gdn_original_call",
+                "_omlx_q4_lm_gdn_wrapper",
             ),
         ),
     ):
@@ -546,6 +653,52 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
             <= 1.0
         )
 
+        backend_calls = []
+
+        def gdn_backend(module, inputs, target_verify=False):
+            backend_calls.append((module, inputs.shape, target_verify))
+            return (
+                module.in_proj_qkv(inputs),
+                module.in_proj_z(inputs),
+                module.in_proj_b(inputs),
+                module.in_proj_a(inputs),
+            )
+
+        q4patch.register_qwen35_lm_gdn_prefill_backend(gdn_backend)
+        y_gdn_backend = gdn(x)
+        mx.eval(y_gdn_backend)
+        assert backend_calls == [(gdn, x.shape, False)]
+        assert (
+            mx.max(
+                mx.abs(y_gdn_backend.astype(mx.float32) - y_gdn_ref.astype(mx.float32))
+            ).item()
+            <= 1.0
+        )
+
+        # The q8 standalone GPU tile is intentionally disabled below 16K,
+        # but that threshold must not prevent the independent 2K ANE backend
+        # from receiving the GDN projections.
+        backend_calls.clear()
+        y_gdn_q8_backend = gdn_q8(x)
+        mx.eval(y_gdn_q8_backend)
+        assert backend_calls == [(gdn_q8, x.shape, False)]
+        assert y_gdn_q8_backend.shape == x.shape
+
+        # Simulate the MTP lifecycle restoring GDN.__call__ while leaving the
+        # process-wide patch flag and class metadata behind. A subsequent
+        # model load must validate the live callable and reinstall the hook.
+        qwen35.GatedDeltaNet.__call__ = orig_gdn_call
+        assert q4patch._LM_LINEAR_PATCHED is True
+        assert q4patch.apply_qwen35_q4_lm_prefill_linear_patch() is True
+        assert (
+            qwen35.GatedDeltaNet.__call__
+            is qwen35.GatedDeltaNet._omlx_q4_lm_gdn_wrapper
+        )
+        backend_calls.clear()
+        y_gdn_reloaded = gdn(x)
+        mx.eval(y_gdn_reloaded)
+        assert backend_calls == [(gdn, x.shape, False)]
+
         calls["count"] = 0
         y_attn_decode = attn(x[:, :1, :])
         y_gdn_decode = gdn(x[:, :1, :])
@@ -555,6 +708,7 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
         qwen35.Attention.__call__ = orig_attn_call
         qwen35.GatedDeltaNet.__call__ = orig_gdn_call
         q4patch._LM_LINEAR_PATCHED = orig_lm_patched
+        q4patch._LM_GDN_PREFILL_BACKEND = orig_gdn_backend
         for (cls, attr), (value, existed) in saved_attrs.items():
             if existed:
                 setattr(cls, attr, value)

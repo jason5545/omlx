@@ -28,6 +28,43 @@
 import Foundation
 import Darwin
 
+struct AutoRestartBudget {
+    let maxAttempts: Int
+    let stableThreshold: TimeInterval
+
+    private(set) var attempts = 0
+    private(set) var healthySince: Date?
+
+    mutating func recordHealthy(at date: Date) {
+        if healthySince == nil {
+            healthySince = date
+        }
+        if attempts > 0,
+           let since = healthySince,
+           date.timeIntervalSince(since) >= stableThreshold {
+            attempts = 0
+            healthySince = date
+        }
+    }
+
+    mutating func consumeRestart(at date: Date) -> Int? {
+        if let since = healthySince,
+           date.timeIntervalSince(since) >= stableThreshold {
+            attempts = 0
+        }
+        healthySince = nil
+
+        guard attempts < maxAttempts else { return nil }
+        attempts += 1
+        return attempts
+    }
+
+    mutating func reset() {
+        attempts = 0
+        healthySince = nil
+    }
+}
+
 // @unchecked Sendable: state mutations either happen on the main thread
 // (start, stop, force restart, callbacks dispatched via main) or inside
 // the @MainActor health-check Task. Process termination handler bounces
@@ -37,14 +74,13 @@ final class ServerProcess: @unchecked Sendable {
         case stopped
         case starting
         case running(pid: Int32)
-        case attached(pid: Int32?)
         case stopping
         case unresponsive(pid: Int32)
         case failed(message: String)
 
         var isRunningLike: Bool {
             switch self {
-            case .running, .attached, .unresponsive: return true
+            case .running, .unresponsive: return true
             default:                      return false
             }
         }
@@ -90,7 +126,7 @@ final class ServerProcess: @unchecked Sendable {
     enum ReconfigureError: Error { case serverIsLive }
     func reconfigure(bindAddress: String? = nil, port: Int? = nil, basePath: URL? = nil) throws {
         switch state {
-        case .running, .attached, .starting, .stopping, .unresponsive:
+        case .running, .starting, .stopping, .unresponsive:
             throw ReconfigureError.serverIsLive
         case .stopped, .failed:
             break
@@ -106,8 +142,6 @@ final class ServerProcess: @unchecked Sendable {
     private let healthCheckInterval: TimeInterval = 5
     private let maxHealthFailures = 3
     private let auxiliaryHealthFreshness: TimeInterval = 15
-    private let maxAutoRestarts   = 3
-    private let stableThreshold: TimeInterval = 60   // seconds before counter resets
     private let stopGraceSeconds: TimeInterval = 10
 
     // State
@@ -117,12 +151,12 @@ final class ServerProcess: @unchecked Sendable {
     private var logHandle: FileHandle?
     private var healthTask: Task<Void, Never>?
     private var consecutiveFailures = 0
-    private var autoRestartCount    = 0
-    private var lastHealthyAt: Date?
+    private var autoRestartBudget = AutoRestartBudget(
+        maxAttempts: 3,
+        stableThreshold: 60
+    )
     private var lastAuxiliaryHealthyAt: Date?
     private var expectingExit       = false   // set by stop()/forceRestart() so terminationHandler doesn't trigger auto-restart
-    private var attachedExternally  = false
-    private var attachedOwnerPID: pid_t?
     private let logURL: URL
 
     init(
@@ -146,15 +180,11 @@ final class ServerProcess: @unchecked Sendable {
 
     var isRunning: Bool {
         if case .running = state { return true }
-        if case .attached = state { return true }
         if case .unresponsive = state { return true }
         return process?.isRunning == true
     }
 
-    var pid: Int32? {
-        if let processPID = process?.processIdentifier { return processPID }
-        return attachedOwnerPID
-    }
+    var pid: Int32? { process?.processIdentifier }
     var serverLogURL: URL { logURL }
 
     /// Start the server. Returns .started on success, .alreadyRunning if
@@ -163,7 +193,7 @@ final class ServerProcess: @unchecked Sendable {
     @discardableResult
     func start() throws -> StartResult {
         switch state {
-        case .running, .attached, .starting, .unresponsive:
+        case .running, .starting, .unresponsive:
             return .alreadyRunning
         default:
             break
@@ -175,10 +205,6 @@ final class ServerProcess: @unchecked Sendable {
                 pid: resolver.findOwnerPIDSync(),
                 isOMLX: resolver.isOMLXOnPortSync()
             )
-            if conflict.isOMLX {
-                attachExternal(pid: conflict.pid)
-                return .alreadyRunning
-            }
             update(.failed(message: "Port \(port) in use" +
                            (conflict.isOMLX ? " (oMLX server already running)" : "")))
             postPortConflict(conflict)
@@ -190,35 +216,8 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     /// Graceful stop: SIGTERM → wait ≤ stopGraceSeconds → SIGKILL.
-    func stop(timeout: TimeInterval? = nil, stopAttachedExternal: Bool = true) async {
+    func stop(timeout: TimeInterval? = nil) async {
         guard isRunning || state == .starting else { return }
-
-        if isAttachedToExternal {
-            guard stopAttachedExternal else {
-                cancelHealthLoop()
-                attachedExternally = false
-                attachedOwnerPID = nil
-                update(.stopped)
-                return
-            }
-            update(.stopping)
-            cancelHealthLoop()
-            let ownerPID = attachedOwnerPID ?? resolver.findOwnerPIDSync()
-            let stopped = await stopExternalOwner(pid: ownerPID)
-            attachedExternally = false
-            attachedOwnerPID = nil
-            if stopped {
-                update(.stopped)
-            } else {
-                let conflict = PortConflict(
-                    pid: resolver.findOwnerPIDSync(),
-                    isOMLX: resolver.isOMLXOnPortSync()
-                )
-                update(.failed(message: "Could not stop external oMLX on port \(port)"))
-                postPortConflict(conflict)
-            }
-            return
-        }
 
         update(.stopping)
         expectingExit = true
@@ -253,28 +252,6 @@ final class ServerProcess: @unchecked Sendable {
     /// then start() fresh.
     @discardableResult
     func forceRestart() async throws -> StartResult {
-        if isAttachedToExternal {
-            update(.stopping)
-            cancelHealthLoop()
-            let ownerPID = attachedOwnerPID ?? resolver.findOwnerPIDSync()
-            let stopped = await stopExternalOwner(pid: ownerPID)
-            attachedExternally = false
-            attachedOwnerPID = nil
-            autoRestartCount = 0
-            consecutiveFailures = 0
-            update(.stopped)
-            guard stopped else {
-                let conflict = PortConflict(
-                    pid: resolver.findOwnerPIDSync(),
-                    isOMLX: resolver.isOMLXOnPortSync()
-                )
-                update(.failed(message: "Could not restart external oMLX on port \(port)"))
-                postPortConflict(conflict)
-                return .portConflict(conflict)
-            }
-            return try start()
-        }
-
         expectingExit = true
         cancelHealthLoop()
         if let proc = process, proc.isRunning {
@@ -286,7 +263,7 @@ final class ServerProcess: @unchecked Sendable {
         }
         process = nil
         closeLog()
-        autoRestartCount = 0
+        autoRestartBudget.reset()
         consecutiveFailures = 0
         lastAuxiliaryHealthyAt = nil
         expectingExit = false
@@ -301,7 +278,7 @@ final class ServerProcess: @unchecked Sendable {
     @MainActor
     func recordAuxiliaryHealthSuccess(at date: Date = Date()) {
         lastAuxiliaryHealthyAt = date
-        lastHealthyAt = date
+        autoRestartBudget.recordHealthy(at: date)
         consecutiveFailures = 0
         switch state {
         case .starting:
@@ -333,8 +310,6 @@ final class ServerProcess: @unchecked Sendable {
     // MARK: - Internal — spawn
 
     private func doStart() throws {
-        attachedExternally = false
-        attachedOwnerPID = nil
         try ensureDir(basePath)
         try ensureDir(logURL.deletingLastPathComponent())
         consecutiveFailures = 0
@@ -374,8 +349,6 @@ final class ServerProcess: @unchecked Sendable {
     private func handleProcessExit(code: Int32) {
         let wasExpectingExit = expectingExit
         expectingExit = false
-        attachedExternally = false
-        attachedOwnerPID = nil
         process = nil
         closeLog()
 
@@ -396,24 +369,22 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     private func tryAutoRestart(reason: String) {
-        // Reset counter if last healthy was > stableThreshold ago.
-        if let last = lastHealthyAt,
-           Date().timeIntervalSince(last) >= stableThreshold {
-            autoRestartCount = 0
-        }
-
-        if autoRestartCount >= maxAutoRestarts {
-            update(.failed(message: "\(reason). Auto-restart failed after \(maxAutoRestarts) attempts."))
+        guard let attempt = autoRestartBudget.consumeRestart(at: Date()) else {
+            update(.failed(
+                message: "\(reason). Auto-restart failed after " +
+                         "\(autoRestartBudget.maxAttempts) attempts."
+            ))
             return
         }
 
-        autoRestartCount += 1
         consecutiveFailures = 0
         lastAuxiliaryHealthyAt = nil
-        let attempt = autoRestartCount
         let backoff = TimeInterval(5 * (1 << (attempt - 1)))   // 5, 10, 20s
 
-        NSLog("oMLX: auto-restart \(attempt)/\(maxAutoRestarts) in \(Int(backoff))s — \(reason)")
+        NSLog(
+            "oMLX: auto-restart \(attempt)/\(autoRestartBudget.maxAttempts) " +
+            "in \(Int(backoff))s — \(reason)"
+        )
         update(.starting)
 
         Task { @MainActor [weak self] in
@@ -451,7 +422,7 @@ final class ServerProcess: @unchecked Sendable {
     @MainActor
     private func tickHealth() async {
         switch state {
-        case .starting, .running, .attached, .unresponsive:
+        case .starting, .running, .unresponsive:
             break
         default:
             return
@@ -466,23 +437,6 @@ final class ServerProcess: @unchecked Sendable {
                 markHealthy(pid: pid, at: now)
             } else {
                 logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: false)
-            }
-        case .attached(let pid):
-            if probe.ok {
-                consecutiveFailures = 0
-                lastHealthyAt = now
-                attachedOwnerPID = pid ?? attachedOwnerPID
-            } else if hasRecentAuxiliaryHealth(now: now) {
-                logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: true)
-                consecutiveFailures = 0
-                lastHealthyAt = now
-                attachedOwnerPID = pid ?? attachedOwnerPID
-            } else {
-                consecutiveFailures += 1
-                logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: false)
-                if consecutiveFailures >= maxHealthFailures {
-                    update(.unresponsive(pid: attachedOwnerPID ?? pid ?? 0))
-                }
             }
         case .running(let pid), .unresponsive(let pid):
             if probe.ok {
@@ -506,16 +460,10 @@ final class ServerProcess: @unchecked Sendable {
     @MainActor
     private func markHealthy(pid: Int32, at date: Date) {
         consecutiveFailures = 0
-        lastHealthyAt = date
+        autoRestartBudget.recordHealthy(at: date)
         switch state {
-        case .starting:
+        case .starting, .unresponsive:
             update(.running(pid: pid))
-        case .unresponsive:
-            if attachedExternally {
-                update(.attached(pid: attachedOwnerPID ?? pid))
-            } else {
-                update(.running(pid: pid))
-            }
         default:
             break
         }
@@ -550,104 +498,6 @@ final class ServerProcess: @unchecked Sendable {
             "--base-path", basePath.path,
             "--port", String(port),
         ]
-    }
-
-    private func attachExternal(pid: pid_t?) {
-        process = nil
-        closeLog()
-        expectingExit = false
-        attachedExternally = true
-        attachedOwnerPID = pid
-        consecutiveFailures = 0
-        autoRestartCount = 0
-        lastHealthyAt = Date()
-        update(.attached(pid: pid))
-        startHealthCheckLoop()
-    }
-
-    private var isAttachedToExternal: Bool {
-        process == nil && attachedExternally
-    }
-
-    private func stopExternalOwner(pid: pid_t?) async -> Bool {
-        if let pid, isHomebrewOMLXOwner(pid: pid) {
-            if await runBrewServices(action: "stop"),
-               await waitUntilPortFree(timeout: 12) {
-                return true
-            }
-        }
-
-        if let pid {
-            _ = await resolver.killExternal(pid, timeout: 8)
-        }
-        return await waitUntilPortFree(timeout: 8)
-    }
-
-    private func waitUntilPortFree(timeout: TimeInterval) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if !resolver.isPortInUseSync() { return true }
-            try? await Task.sleep(for: .milliseconds(200))
-        }
-        return !resolver.isPortInUseSync()
-    }
-
-    private func isHomebrewOMLXOwner(pid: pid_t) -> Bool {
-        guard let command = commandLine(for: pid) else { return false }
-        return command.contains("/opt/homebrew/")
-            && (command.contains("/omlx")
-                || command.contains("omlx.cli")
-                || command.contains("omlx serve"))
-    }
-
-    private func commandLine(for pid: pid_t) -> String? {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-        proc.arguments = ["-p", String(pid), "-o", "command="]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        do {
-            try proc.run()
-        } catch {
-            return nil
-        }
-        proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else { return nil }
-        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func runBrewServices(action: String) async -> Bool {
-        let candidates = [
-            "/opt/homebrew/bin/brew",
-            "/usr/local/bin/brew",
-        ]
-        guard let brew = candidates.first(where: {
-            FileManager.default.isExecutableFile(atPath: $0)
-        }) else { return false }
-
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: brew)
-        proc.arguments = ["services", action, "jason5545/omlx/omlx"]
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        do {
-            try proc.run()
-        } catch {
-            return false
-        }
-
-        let deadline = Date().addingTimeInterval(15)
-        while proc.isRunning && Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(200))
-        }
-        if proc.isRunning {
-            proc.terminate()
-            return false
-        }
-        return proc.terminationStatus == 0
     }
 
     private func update(_ next: State) {

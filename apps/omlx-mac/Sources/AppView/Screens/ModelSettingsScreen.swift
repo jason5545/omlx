@@ -989,18 +989,36 @@ private struct EntryEditor: View {
                 forceCheckbox
             }
         case .reasoningEffort:
-            HStack(spacing: 8) {
-                Popup(
-                    selection: vm.bindProfile(binding.value),
-                    width: 130,
-                    options: [
-                        ("low", "low"),
-                        ("medium", "medium"),
-                        ("high", "high"),
-                        ("max", "max"),
-                    ]
-                )
-                forceCheckbox
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    if entry.usesCustomReasoningEffort {
+                        TextInput(
+                            text: vm.bindProfile(binding.reasoningEffortCustomValue),
+                            placeholder: "0.9",
+                            mono: true,
+                            width: 130
+                        )
+                    } else {
+                        Popup(
+                            selection: vm.bindProfile(binding.value),
+                            width: 130,
+                            options: ChatTemplateKwargsCodec.reasoningEffortPresets.map {
+                                ($0, $0)
+                            }
+                        )
+                    }
+                    forceCheckbox
+                }
+                Toggle(isOn: vm.bindProfile(binding.usesCustomReasoningEffort)) {
+                    Text(String(
+                        localized: "settings.advanced.chat_template.reasoning_effort.custom",
+                        defaultValue: "Custom",
+                        comment: "Checkbox label that enables a custom reasoning_effort value"
+                    ))
+                    .font(.omlxText(11))
+                    .foregroundStyle(theme.textSecondary)
+                }
+                .toggleStyle(.checkbox)
             }
         case .custom:
             VStack(alignment: .leading, spacing: 6) {
@@ -1088,10 +1106,225 @@ private struct ExperimentalSection: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        // All experimental fields are profile-eligible (universal or
-        // model-specific). Edits write to the working profile via
-        // bindProfile and surface in the Active banner above.
+        // Most experimental fields are profile edits. Qwen ANE controls are
+        // load-time hardware settings, so they save directly to the model;
+        // leaving them as working-profile-only edits makes a visually enabled
+        // switch a no-op until an unrelated profile action is performed.
         ListGroup {
+            if vm.isQwen35AnePrefillModel {
+                Row(label: String(localized: "settings.experimental.qwen_ane.label",
+                                  defaultValue: "Qwen ANE Prefill",
+                                  comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
+                    sublabel: String(localized: "settings.experimental.qwen_ane.sub",
+                                     defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
+                                     comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
+                    Toggle("", isOn: saved(
+                        $vm.qwen35AnePrefillEnabled,
+                        field: .qwen35AnePrefillEnabled
+                    ))
+                        .labelsHidden().toggleStyle(.switch)
+                }
+                Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
+                                  defaultValue: "Tune ANE Split",
+                                  comment: "Row label for the Qwen ANE/GPU split tuner"),
+                    sublabel: String(localized: "settings.experimental.qwen_ane.tuner.sub",
+                                     defaultValue: "Calibrates ANE and GPU work on real model layers, then verifies the predicted split end to end. Saved settings change only when you apply the result.",
+                                     comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        if !vm.aneTuningIsRunning {
+                            Menu("Tuner overrides") {
+                                Toggle("Allow GDN on ANE", isOn: $vm.aneTuningAllowANEGDN)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                        }
+                        if vm.aneTuningIsRunning {
+                            if let status = vm.aneTuningStatus {
+                                Text(status.message)
+                                    .font(.omlxText(11))
+                                    .foregroundStyle(theme.textSecondary)
+                                    .lineLimit(1)
+                                ProgressView(
+                                    value: Double(status.current),
+                                    total: Double(max(status.total, 1))
+                                )
+                                .frame(width: 190)
+                            } else {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Button("Cancel") {
+                                Task { await vm.cancelANETuning(client: client) }
+                            }
+                            .buttonStyle(.omlx(.destructive, size: .small))
+                        } else if let recommendation = vm.aneTuningStatus?.recommendation {
+                            Text(aneRecommendationText(recommendation))
+                                .font(.omlxText(11))
+                                .foregroundStyle(theme.textSecondary)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.trailing)
+                            Button(vm.aneTuningIsApplying ? "Applying…" : "Apply result") {
+                                Task {
+                                    await vm.applyANETuningRecommendation(client: client)
+                                }
+                            }
+                            .buttonStyle(.omlx(.primary, size: .small))
+                            .disabled(vm.aneTuningIsApplying)
+                        } else {
+                            Button("Tune for this Mac") {
+                                Task { await vm.startANETuning(client: client) }
+                            }
+                            .buttonStyle(.omlx(.normal, size: .small))
+                        }
+
+                        if let status = vm.aneTuningStatus {
+                            if let reason = status.terminationReason,
+                               !reason.isEmpty {
+                                Text(reason)
+                                    .font(.omlxText(10))
+                                    .foregroundStyle(
+                                        status.status == "error"
+                                            ? Color.red
+                                            : theme.textSecondary
+                                    )
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .multilineTextAlignment(.trailing)
+                            }
+
+                            if !status.results.isEmpty {
+                                VStack(spacing: 3) {
+                                    HStack(spacing: 8) {
+                                        Text("Test")
+                                        Spacer(minLength: 8)
+                                        Text("Prompt tok/s")
+                                    }
+                                    .font(.omlxText(9, weight: .semibold))
+                                    .foregroundStyle(theme.textSecondary)
+
+                                    Divider()
+
+                                    ForEach(status.results) { result in
+                                        HStack(spacing: 8) {
+                                            Text(result.detail ?? result.label)
+                                                .lineLimit(1)
+                                                .foregroundStyle(
+                                                    result.state == "failed"
+                                                        ? Color.red
+                                                        : theme.textSecondary
+                                                )
+                                            Spacer(minLength: 8)
+                                            Text(aneCandidateResultText(result))
+                                                .monospacedDigit()
+                                                .foregroundStyle(theme.text)
+                                                .frame(minWidth: 78, alignment: .trailing)
+                                        }
+                                        .font(.omlxText(10))
+                                    }
+                                }
+                                .frame(width: 285)
+                            }
+                        }
+                    }
+                    .frame(minWidth: 285, alignment: .trailing)
+                }
+                if vm.qwen35AnePrefillEnabled {
+                    Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label",
+                                      defaultValue: "ANE Prompt Block",
+                                      comment: "Row label for the fixed Qwen ANE prompt block size"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.sequence.sub",
+                                         defaultValue: "Only prompt chunks exactly matching this token count use the ANE path. 2,048 is the measured default.",
+                                         comment: "Sublabel explaining the fixed Qwen ANE prompt block size")) {
+                        TextInput(text: $vm.qwen35AnePrefillSequenceLength,
+                                  placeholder: "2048", mono: true,
+                                  isNumeric: true, range: 1024...262_144,
+                                  step: 64, width: 190)
+                            .onSubmit {
+                                Task { await vm.save(.qwen35AnePrefillSequenceLength, client: client) }
+                            }
+                    }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.mlp_fraction.label",
+                                      defaultValue: "MLP on ANE",
+                                      comment: "Row label for the Qwen MLP ANE workload fraction"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.mlp_fraction.sub",
+                                         defaultValue: "Output channels assigned to both ANEs; the GPU handles the remainder.",
+                                         comment: "Sublabel explaining the Qwen MLP ANE workload fraction")) {
+                        TextInput(text: $vm.qwen35AnePrefillFraction,
+                                  placeholder: "0.53", mono: true,
+                                  isNumeric: true, range: 0.05...0.90,
+                                  step: 0.005, width: 190)
+                            .onSubmit {
+                                Task { await vm.save(.qwen35AnePrefillFraction, client: client) }
+                            }
+                    }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.mlp_layers.label",
+                                      defaultValue: "MLP Layer Limit",
+                                      comment: "Row label for the maximum number of Qwen MLP layers placed on ANE"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.mlp_layers.sub",
+                                         defaultValue: "Maximum eligible MLP layers prepared eagerly. The selected default covers the measured 64-layer model.",
+                                         comment: "Sublabel explaining the maximum number of Qwen MLP ANE layers")) {
+                        TextInput(text: $vm.qwen35AnePrefillMaxLayers,
+                                  placeholder: "64", mono: true, width: 90)
+                            .onSubmit {
+                                Task { await vm.save(.qwen35AnePrefillMaxLayers, client: client) }
+                            }
+                    }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.dual.label",
+                                      defaultValue: "Use Both ANEs",
+                                      comment: "Row label for dual-ANE Qwen prefill"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.dual.sub",
+                                         defaultValue: "Pin one resident procedure bank to each physical ANE. Recommended on M3 Ultra.",
+                                         comment: "Sublabel describing dual-ANE Qwen prefill")) {
+                        Toggle("", isOn: saved(
+                            $vm.qwen35AnePrefillDualAne,
+                            field: .qwen35AnePrefillDualAne
+                        ))
+                            .labelsHidden().toggleStyle(.switch)
+                    }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.gdn.label",
+                                      defaultValue: "Accelerate GDN",
+                                      comment: "Row label for Qwen GDN ANE acceleration"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.gdn.sub",
+                                         defaultValue: "Also split eligible GDN z+qkv input projections across ANE and GPU.",
+                                         comment: "Sublabel describing Qwen GDN ANE acceleration")) {
+                        Toggle("", isOn: saved(
+                            $vm.qwen35AnePrefillGdn,
+                            field: .qwen35AnePrefillGdn
+                        ))
+                            .labelsHidden().toggleStyle(.switch)
+                    }
+                    if vm.qwen35AnePrefillGdn {
+                        Row(label: String(localized: "settings.experimental.qwen_ane.gdn_fraction.label",
+                                          defaultValue: "GDN on ANE",
+                                          comment: "Row label for the Qwen GDN ANE workload fraction"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.gdn_fraction.sub",
+                                             defaultValue: "GDN projection channels assigned to both ANEs; the GPU handles the remainder.",
+                                             comment: "Sublabel explaining the Qwen GDN ANE workload fraction")) {
+                            TextInput(text: $vm.qwen35AnePrefillGdnFraction,
+                                      placeholder: "0.5", mono: true,
+                                      isNumeric: true, range: 0.05...0.90,
+                                      step: 0.005, width: 190)
+                                .onSubmit {
+                                    Task { await vm.save(.qwen35AnePrefillGdnFraction, client: client) }
+                                }
+                        }
+                        Row(label: String(localized: "settings.experimental.qwen_ane.gdn_layers.label",
+                                          defaultValue: "GDN Layer Limit",
+                                          comment: "Row label for the maximum number of Qwen GDN layers placed on ANE"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.gdn_layers.sub",
+                                             defaultValue: "Maximum eligible GDN layers prepared eagerly. The selected default covers 48 layers.",
+                                             comment: "Sublabel explaining the maximum number of Qwen GDN ANE layers")) {
+                            TextInput(text: $vm.qwen35AnePrefillGdnMaxLayers,
+                                      placeholder: "48", mono: true,
+                                      isNumeric: true, range: 0...256,
+                                      step: 1, width: 190)
+                                .onSubmit {
+                                    Task { await vm.save(.qwen35AnePrefillGdnMaxLayers, client: client) }
+                                }
+                        }
+                    }
+                }
+            }
+
             // TurboQuant KV
             Row(label: String(localized: "settings.experimental.turboquant.label",
                               defaultValue: "TurboQuant KV Cache",
@@ -1261,19 +1494,28 @@ private struct ExperimentalSection: View {
                                   defaultValue: "Draft Window Size",
                                   comment: "Row label for the DFlash draft sliding-attention window size field"),
                     sublabel: String(localized: "settings.experimental.dflash.window_size.sub",
-                                     defaultValue: "Draft model sliding-attention window. Empty = dflash default (1024).",
+                                     defaultValue: "Draft model sliding-attention window. Empty = dflash default (2048).",
                                      comment: "Sublabel for the DFlash draft window size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
-                              placeholder: "1024", mono: true, width: 110)
+                              placeholder: "2048", mono: true, width: 110)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.sink_size.label",
                                   defaultValue: "Draft Sink Size",
                                   comment: "Row label for the DFlash attention-sink tokens field"),
                     sublabel: String(localized: "settings.experimental.dflash.sink_size.sub",
-                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (64).",
+                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (0).",
                                      comment: "Sublabel for the DFlash draft sink size field")) {
                     TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
-                              placeholder: "64", mono: true, width: 110)
+                              placeholder: "0", mono: true, width: 110)
+                }
+                Row(label: String(localized: "settings.experimental.dflash.block_size.label",
+                                  defaultValue: "Runtime Block Size",
+                                  comment: "Row label for the DFlash runtime block size field"),
+                    sublabel: String(localized: "settings.experimental.dflash.block_size.sub",
+                                     defaultValue: "Maximum draft and verify tokens per cycle. Empty = checkpoint default.",
+                                     comment: "Sublabel for the DFlash runtime block size field")) {
+                    TextInput(text: vm.bindProfile($vm.dflashBlockSize),
+                              placeholder: "checkpoint", mono: true, width: 110)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.mem_cache.label",
                                   defaultValue: "DFlash in-memory cache",
@@ -1361,6 +1603,15 @@ private struct ExperimentalSection: View {
         }
     }
 
+    private func saved<T: Equatable>(
+        _ binding: Binding<T>,
+        field: ModelSettingsScreenVM.Field
+    ) -> Binding<T> {
+        vm.bind(binding) {
+            Task { await vm.save(field, client: client) }
+        }
+    }
+
     private var vlmMtpOwnsSpeculativePathReason: String {
         String(localized: "settings.speculative.conflict.vlm_mtp",
                defaultValue: "Disable VLM MTP before enabling this feature.",
@@ -1429,6 +1680,48 @@ private struct ExperimentalSection: View {
         return String(localized: "settings.experimental.vlm_mtp.sub",
                       defaultValue: "Multi-token prediction for vision-language models via an assistant drafter.",
                       comment: "Default sublabel for the VLM MTP toggle")
+    }
+
+    private func aneRecommendationText(
+        _ recommendation: ANETuningRecommendationDTO
+    ) -> String {
+        if !recommendation.enabled {
+            return String(
+                format: "GPU-only recommended (%.1f tok/s)",
+                recommendation.processingTps
+            )
+        }
+        let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
+        var parts = ["MLP ANE \(mlp)%"]
+        if recommendation.gdnEnabled {
+            let gdn = Int(((recommendation.gdnFraction ?? 0) * 100).rounded())
+            parts.append("GDN ANE \(gdn)%")
+        } else {
+            parts.append("GDN off")
+        }
+        return String(
+            format: "%@ · %.1f tok/s (%+.1f%%)",
+            parts.joined(separator: " · "),
+            recommendation.processingTps,
+            recommendation.speedupPercent
+        )
+    }
+
+    private func aneCandidateResultText(
+        _ result: ANETuningCandidateDTO
+    ) -> String {
+        guard let processingTps = result.processingTps else {
+            if let latencyMs = result.latencyMs {
+                return String(format: "%.2f ms", latencyMs)
+            }
+            // Deliberately blank: the row remains visible so an interrupted
+            // run shows which tests did not complete.
+            return ""
+        }
+        if let speedup = result.speedupPercent {
+            return String(format: "%.1f (%+.1f%%)", processingTps, speedup)
+        }
+        return String(format: "%.1f", processingTps)
     }
 }
 

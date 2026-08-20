@@ -227,6 +227,72 @@ const component = {{
     return json.loads(result.stdout)
 
 
+def test_cluster_quick_status_distinguishes_runtime_mismatch_from_loading():
+    result = _run_dashboard_helpers(
+        ("clusterQuickStatus",),
+        """
+component.clusterSelectedModel = () => null;
+component.clusterPrimaryDeployment = () => null;
+component.clusterLiveJobs = () => [];
+component.clusterAutoconfigureError = '';
+component.clusterError = '';
+component.clusterDeploymentsError = '';
+component.clusterDeactivatingId = '';
+component.clusterActivationLoading = false;
+component.clusterAutoconfigureLoading = false;
+component.clusterLinkSetupLoading = false;
+component.clusterPeerSsh = 'studio.local';
+component.clusterFabricLoading = false;
+component.clusterLinkStatusLoading = false;
+component.clusterCatalogueLoading = false;
+const states = {};
+
+component.clusterPeerProbeLoading = false;
+component.clusterPeerProbe = null;
+states.firstProbe = component.clusterQuickStatus();
+
+component.clusterPeerProbeLoading = true;
+component.clusterPeerProbe = { runtime_compatible: true };
+states.reprobe = component.clusterQuickStatus();
+
+component.clusterPeerProbeLoading = false;
+component.clusterPeerProbe = {
+  runtime_compatible: false,
+  runtime_mismatches: [
+    'omlx local=0.6.0 remote=0.5.4',
+    'mlx local=0.32.0 remote=0.31.0',
+  ],
+};
+states.mismatch = component.clusterQuickStatus();
+
+component.clusterPeerProbe = {
+  runtime_compatible: true,
+  runtime_warnings: ['python minor differs: local=3.11 remote=3.12'],
+};
+states.warning = component.clusterQuickStatus();
+
+process.stdout.write(JSON.stringify(states));
+""",
+    )
+
+    assert result["firstProbe"]["key"] == "checking"
+    assert result["firstProbe"]["busy"] is True
+    assert result["reprobe"]["key"] == "checking"
+    assert result["reprobe"]["busy"] is True
+    assert result["mismatch"] == {
+        "key": "runtime-mismatch",
+        "label": "Worker runtime mismatch",
+        "detail": (
+            "omlx local=0.6.0 remote=0.5.4 · "
+            "mlx local=0.32.0 remote=0.31.0"
+        ),
+        "tone": "red",
+        "busy": False,
+    }
+    assert result["warning"]["key"] == "model"
+    assert result["warning"]["tone"] == "amber"
+
+
 def test_manual_memory_allowance_survives_automatic_budget_refresh():
     result = _run_dashboard_helpers(
         (
@@ -339,7 +405,7 @@ process.stdout.write(JSON.stringify(component.clusterBudgetHostsPayload()));
 
 def test_unmeasured_peer_memory_is_unknown_not_a_56_gib_placeholder():
     result = _run_dashboard_helpers(
-        ("syncClusterNodesFromPeers",),
+        ("clusterNodeId", "syncClusterNodesFromPeers"),
         """
 const gib = 1024 ** 3;
 component.clusterStatus = { node: {
@@ -350,6 +416,7 @@ component.clusterPlanNodes = [
   { key: 1, node_id: 'this-mac', capacity_gib: 128, reserve_gib: 8 },
   { key: 2, node_id: 'peer-mac', capacity_gib: 256, reserve_gib: 8 },
 ];
+component.clusterDeployments = [];
 component.clusterPeerProbes = {};
 component.clusterWorkerPeers = () => [{ ssh: 'studio.local', name: 'studio' }];
 component.clusterFriendlyMacName = value => value;
@@ -362,14 +429,49 @@ process.stdout.write(JSON.stringify(component.clusterPlanNodes));
     )
 
     assert result[0]["capacity_bytes"] == 498 * 1024**3
+    assert result[1]["node_id"] == "studio"
     assert result[1]["capacity_gib"] == 0
     assert result[1]["capacity_bytes"] == 0
     assert result[1]["reserve_gib"] == 0
 
 
+def test_local_role_defaults_to_workstation_and_preserves_headless_selection():
+    result = _run_dashboard_helpers(
+        ("clusterNodeId", "syncClusterNodesFromPeers"),
+        """
+component.clusterStatus = { node: {
+  hostname: 'local',
+  admission_ceiling_bytes: 1000,
+} };
+component.clusterPlanNodes = [
+  { key: 1, node_id: 'local', ssh: '127.0.0.1' },
+];
+component.clusterDeployments = [];
+component.clusterPeerProbes = {};
+component.clusterWorkerPeers = () => [];
+component.normalizeClusterTensorParallelSize = () => {};
+component.invalidateClusterPlan = () => {};
+component._clusterNodeKey = 1;
+component.syncClusterNodesFromPeers();
+const defaultRole = component.clusterPlanNodes[0].role;
+component.clusterPlanNodes[0].role = 'headless';
+component.syncClusterNodesFromPeers();
+process.stdout.write(JSON.stringify({
+  defaultRole,
+  selectedRole: component.clusterPlanNodes[0].role,
+}));
+""",
+    )
+
+    assert result == {
+        "defaultRole": "workstation",
+        "selectedRole": "headless",
+    }
+
+
 def test_same_named_peer_does_not_inherit_another_macs_capacity():
     result = _run_dashboard_helpers(
-        ("syncClusterNodesFromPeers",),
+        ("clusterNodeId", "syncClusterNodesFromPeers"),
         """
 const gib = 1024 ** 3;
 component.clusterStatus = { node: {
@@ -381,6 +483,7 @@ component.clusterPlanNodes = [
   { key: 2, node_id: 'Mac Studio', ssh: 'old.local',
     capacity_gib: 498, capacity_bytes: 498 * gib, reserve_gib: 50 },
 ];
+component.clusterDeployments = [];
 component.clusterPeerProbes = {};
 component.clusterWorkerPeers = () => [{ ssh: 'new.local', name: 'Mac Studio' }];
 component.clusterFriendlyMacName = value => value;
@@ -396,6 +499,91 @@ process.stdout.write(JSON.stringify(component.clusterPlanNodes[1]));
     assert result["capacity_gib"] == 0
     assert result["capacity_bytes"] == 0
     assert result["reserve_gib"] == 0
+
+
+def test_default_macos_names_use_valid_network_node_ids():
+    result = _run_dashboard_helpers(
+        ("clusterNodeId", "syncClusterNodesFromPeers"),
+        """
+component.clusterStatus = { node: {
+  hostname: 'Coordinator’s Mac Studio',
+  admission_ceiling_bytes: 1000,
+} };
+component.clusterDeployments = [];
+component.clusterPlanNodes = [
+  { key: 1, node_id: 'this-mac' },
+  { key: 2, node_id: 'peer-mac' },
+];
+component.clusterPeerProbes = {
+  'Deepaks-Mac-mini.local': {
+    status: { node: { hostname: 'Deepak’s Mac mini' } },
+  },
+  'Sarahs-MacBook-Pro.local': {
+    status: { node: { hostname: 'Sarah’s MacBook Pro' } },
+  },
+  'Alexs-Mac-Studio.local': {
+    status: { node: { hostname: 'Alex’s Mac Studio' } },
+  },
+};
+component.clusterWorkerPeers = () => [
+  { ssh: 'Deepaks-Mac-mini.local', name: 'Deepak’s Mac mini' },
+  { ssh: 'Sarahs-MacBook-Pro.local', name: 'Sarah’s MacBook Pro' },
+  { ssh: 'Alexs-Mac-Studio.local', name: 'Alex’s Mac Studio' },
+];
+component.normalizeClusterTensorParallelSize = () => {};
+component.invalidateClusterPlan = () => {};
+component._clusterNodeKey = 2;
+component.syncClusterNodesFromPeers();
+process.stdout.write(JSON.stringify(
+  component.clusterPlanNodes.map(node => node.node_id)
+));
+""",
+    )
+
+    assert result == [
+        "this-mac",
+        "Deepaks-Mac-mini.local",
+        "Sarahs-MacBook-Pro.local",
+        "Alexs-Mac-Studio.local",
+    ]
+    assert all(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", node_id)
+        for node_id in result
+    )
+
+
+def test_sync_preserves_valid_deployment_node_ids():
+    result = _run_dashboard_helpers(
+        ("clusterNodeId", "syncClusterNodesFromPeers"),
+        """
+component.clusterStatus = { node: {
+  hostname: 'Coordinator’s Mac Studio',
+  admission_ceiling_bytes: 1000,
+} };
+component.clusterDeployments = [{ hosts: [
+  { node_id: 'coordinator', ssh: '127.0.0.1' },
+  { node_id: 'mac-studio-01', ssh: 'Alexs-Mac-Studio.local' },
+] }];
+component.clusterPlanNodes = [
+  { key: 1, node_id: 'this-mac' },
+  { key: 2, node_id: 'peer-mac' },
+];
+component.clusterPeerProbes = {};
+component.clusterWorkerPeers = () => [{
+  ssh: 'Alexs-Mac-Studio.local',
+  name: 'Alex’s Mac Studio',
+}];
+component.normalizeClusterTensorParallelSize = () => {};
+component.invalidateClusterPlan = () => {};
+component._clusterNodeKey = 2;
+component.syncClusterNodesFromPeers();
+process.stdout.write(JSON.stringify(
+  component.clusterPlanNodes.map(node => node.node_id)
+));
+""",
+    )
+
+    assert result == ["coordinator", "mac-studio-01"]
 
 
 def test_unknown_middle_peer_does_not_shift_memory_to_another_card():
@@ -472,19 +660,30 @@ component.clusterResponseError = async () => 'The other Mac rejected the login';
 
 def test_successful_peer_retry_clears_connection_error_and_guidance():
     result = _run_dashboard_helpers(
-        ("probeClusterPeer", "clusterDisplayedError", "resetClusterProbeBackoff"),
+        (
+            "clusterNodeId",
+            "probeClusterPeer",
+            "clusterDisplayedError",
+            "resetClusterProbeBackoff",
+        ),
         """
 global.window = { location: { href: '' } };
 global.fetch = async () => ({
   status: 200,
   ok: true,
-  json: async () => ({ status: { node: { hostname: 'studio' } } }),
+  json: async () => ({
+    status: { node: { hostname: 'Alex’s Mac Studio' } },
+  }),
 });
 component.clusterPeerSsh = 'studio.local';
 component.clusterPeerProbeLoading = false;
 component.clusterPeerProbe = null;
 component.clusterPeerProbes = {};
-component.clusterPlanNodes = [];
+component.clusterDeployments = [];
+component.clusterPlanNodes = [
+  { node_id: 'local' },
+  { node_id: 'peer-mac' },
+];
 component.clusterLocalIp = '';
 component.clusterConnectionError = 'The other Mac rejected the oMLX key';
 component.clusterError = 'The other Mac rejected the oMLX key';
@@ -502,6 +701,7 @@ component.loadClusterFabric = async () => {};
     connectionError: component.clusterConnectionError,
     guidance: component.clusterGuidance,
     probed: Boolean(component.clusterPeerProbe),
+    nodeId: component.clusterPlanNodes[1].node_id,
   }));
 })().catch(error => {
   console.error(error);
@@ -516,6 +716,7 @@ component.loadClusterFabric = async () => {};
         "connectionError": "",
         "guidance": None,
         "probed": True,
+        "nodeId": "studio.local",
     }
 
 
@@ -1714,6 +1915,48 @@ def test_first_run_adopts_omlx_peers_before_transport_has_been_measured():
     assert "if (this.clusterWorkerPeers().length" in source
     assert source.count("await this.measureClusterBudgets()") == 1
     assert "await this.previewClusterWeightBalance()" in source
+
+
+def test_initialization_previews_by_default_but_polling_skips_it():
+    result = _run_dashboard_helpers(
+        ("initializeClusterSetup", "refreshClusterExperience"),
+        """
+const calls = [];
+Object.assign(component, {
+  clusterStatus: null,
+  clusterDiscoveredPeers: [],
+  clusterPeerProbe: null,
+  clusterModelInventory: {},
+  clusterModelInventoryLoading: false,
+  clusterCatalogueLoading: false,
+  _clusterKnownNodesNeedsSync: false,
+  _clusterDiscoveryRefreshCounter: 4,
+  clusterWorkerPeers: () => [],
+  clusterProbeBackoffActive: () => false,
+  clusterRecommendedModels: () => [],
+  clusterModelCandidates: () => [],
+  loadClusterPeerHardware: async () => {},
+  normalizeClusterTensorParallelSize: () => {},
+  previewClusterWeightBalance: async () => calls.push('preview'),
+  loadClusterRuntime: async () => calls.push('runtime'),
+  loadClusterIncidents: async () => calls.push('incidents'),
+  discoverClusterPeers: async () => calls.push('discover'),
+  loadClusterJoinStatus: async () => calls.push('join'),
+});
+(async () => {
+  await component.initializeClusterSetup();
+  await component.refreshClusterExperience();
+  process.stdout.write(JSON.stringify({ calls }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result == {
+        "calls": ["preview", "runtime", "incidents", "discover", "join"]
+    }
 
 
 def test_initialization_resyncs_live_capabilities_before_measuring_budgets():

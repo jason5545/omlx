@@ -328,7 +328,7 @@ struct ServerHeroCard: View {
     @ViewBuilder
     private var buttons: some View {
         switch services.serverState {
-        case .running, .attached, .unresponsive:
+        case .running, .unresponsive:
             HStack(spacing: 6) {
                 Button {
                     // Pick up any pending edits in Listen Address / Port that
@@ -387,11 +387,6 @@ struct ServerHeroCard: View {
     private var pillStatus: StatusPill.Status {
         switch services.serverState {
         case .running:      return .running
-        case .attached:     return .custom(color: theme.greenDot,
-                                            label: String(localized: "server.hero.pill.attached",
-                                                          defaultValue: "Attached",
-                                                          comment: "Status pill label when the app is attached to an existing oMLX server"),
-                                            fillBg: true)
         case .starting:     return .starting
         case .stopping:     return .stopping
         case .stopped:      return .stopped
@@ -412,10 +407,6 @@ struct ServerHeroCard: View {
             return String(localized: "server.hero.subtitle.listening",
                           defaultValue: "Listening on \(host):\(String(port))",
                           comment: "Hero subtitle while server is running; placeholders are host and port (port is plain integer, no grouping)")
-        case .attached:
-            return String(localized: "server.hero.subtitle.attached",
-                          defaultValue: "Attached to existing server on \(host):\(String(port))",
-                          comment: "Hero subtitle while the app is attached to an existing oMLX server")
         case .starting:
             return String(localized: "server.hero.subtitle.starting",
                           defaultValue: "Starting on \(host):\(String(port))…",

@@ -1741,7 +1741,10 @@ def sanitize_tool_call_markup(text: str, tokenizer: Any) -> str:
     if not text:
         return ""
 
-    stream_filter = ToolCallStreamFilter(tokenizer)
+    # Every caller sanitizes thinking-channel text; keep it byte-identical
+    # with the streamed reasoning deltas, which do not consume DeepSeek
+    # V4's separator either.
+    stream_filter = ToolCallStreamFilter(tokenizer, consume_dsml_separator=False)
     cleaned = stream_filter.feed(text)
     cleaned += stream_filter.finish()
     return cleaned.strip()
@@ -1869,9 +1872,15 @@ class ToolCallStreamFilter:
     Args:
         tokenizer: The model's tokenizer. Uses tokenizer-defined
             ``tool_call_start`` when available.
+        consume_dsml_separator: Treat DeepSeek V4's ``"\n\n"`` separator as
+            part of the DSML tool-call envelope, matching the reference
+            decoder's stop token. Disable for filters watching a channel
+            that never contains a separator-prefixed tool-call block (the
+            thinking channel), where holding trailing newlines would flush
+            them only after the channel closed.
     """
 
-    def __init__(self, tokenizer: Any):
+    def __init__(self, tokenizer: Any, *, consume_dsml_separator: bool = True):
         marker = getattr(tokenizer, "tool_call_start", None)
         marker_end = getattr(tokenizer, "tool_call_end", None)
         # Normalize None-like values but preserve empty strings.
@@ -1892,6 +1901,16 @@ class ToolCallStreamFilter:
                 # One-sided markers (e.g. Mistral "[TOOL_CALLS]" with no
                 # end marker): suppress everything after the start marker.
                 self._suppress_after_markers.append(marker)
+        # DeepSeek V4's reference decoder consumes "\n\n<｜DSML｜tool_calls"
+        # as one literal stop token, so the separator belongs to the envelope,
+        # not to content. Register the separator-inclusive variant so the
+        # earliest-match rule consumes it when present; the bare pair stays as
+        # fallback for emissions that omit the separator.
+        is_dsml_tool_marker = (
+            marker == "<｜DSML｜tool_calls>" and marker_end == "</｜DSML｜tool_calls>"
+        )
+        if is_dsml_tool_marker and consume_dsml_separator:
+            self._marker_pairs.insert(0, ("\n\n" + marker, marker_end))
         # Gemma 4 can emit a bare close token outside a matched tool-call
         # envelope. Do not apply this to XML-style closers like </tool_call>,
         # which may appear as literal prose.
@@ -2322,6 +2341,11 @@ class ToolCallStreamFilter:
                 # bracket at end-of-stream is much more likely to be literal
                 # prose than an incomplete MiniMax control marker.
                 if tail == "]":
+                    continue
+                # Newline-only tails are held back only because of the
+                # separator-inclusive DeepSeek V4 marker; at end-of-stream
+                # with no envelope following they are literal content.
+                if not tail.strip("\n"):
                     continue
                 return True
 

@@ -2,12 +2,12 @@ class Omlx < Formula
   CUSTOM_KERNELS = %w[bonsai glm_moe_dsa minimax_m3 qwen35_prefill].freeze
 
   desc "LLM inference server optimized for Apple Silicon"
-  homepage "https://github.com/jason5545/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.6.0rc1.tar.gz"
-  sha256 "036ac15c11f23458c83a63a1dd39202c826be8f7487773db086f4406fa674f08"
+  homepage "https://github.com/jundot/omlx"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.6.3rc1.tar.gz"
+  sha256 "1aae9e4cf64422b7e86fb7bc9ac2d0cf5e6ef5858a4afab47d1011c1498b58bc"
   license "Apache-2.0"
 
-  head "https://github.com/jason5545/omlx.git", branch: "main"
+  head "https://github.com/jundot/omlx.git", branch: "main"
 
   option "with-custom-kernel",
          "Build native custom kernels for Bonsai, GLM-5.2, MiniMax M3 and Qwen3.5/3.6 acceleration"
@@ -15,7 +15,7 @@ class Omlx < Formula
 
   depends_on "rust" => :build
   depends_on arch: :arm64
-  depends_on :macos
+  depends_on macos: :sequoia
   depends_on "python@3.11"
 
   # macOS 27 beta's `strip` corrupts dynamic offsets in Mach-O libraries

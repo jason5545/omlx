@@ -487,14 +487,6 @@ final class MenubarController: NSObject {
                        comment: "Menubar status header when the server is running; placeholder is the port (rendered as a plain integer, no grouping)"),
                 .systemGreen
             )
-        case .attached:
-            let port = MenubarController.displayPort(server: server, fallback: config.port)
-            return (
-                String(localized: "menubar.header.attached",
-                       defaultValue: "Server: attached (port \(String(port)))",
-                       comment: "Menubar status header when the app is attached to an existing oMLX server"),
-                .systemGreen
-            )
         case .stopping:
             return (
                 String(localized: "menubar.header.stopping",
@@ -631,12 +623,7 @@ final class MenubarController: NSObject {
         statsSubmenu.removeAllItems()
 
         let isRunning: Bool
-        switch server?.state {
-        case .running, .attached:
-            isRunning = true
-        default:
-            isRunning = false
-        }
+        if case .running = server?.state { isRunning = true } else { isRunning = false }
 
         if !isRunning {
             statsSubmenu.addItem(disabled(String(localized: "menubar.stats.server_off",
@@ -1338,7 +1325,6 @@ final class MenubarController: NSObject {
 
     private var serverIsRunning: Bool {
         if case .running = server?.state { return true }
-        if case .attached = server?.state { return true }
         return false
     }
 

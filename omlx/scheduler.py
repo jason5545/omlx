@@ -1511,7 +1511,7 @@ class SchedulerConfig:
     # ordinary block retains only KV/sliceable payloads.
     gdn_ssd_split_enabled: bool = False
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
-    gdn_sidecar_state_dtype: str = "rht_int16"
+    gdn_sidecar_state_dtype: str = "fp32"
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -1742,6 +1742,27 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
+        # Qwen3.5/3.6 hybrid (GatedDeltaNet + hd-256 full attention): the
+        # fused prefill routes favor wider chunks. Measured on the 27B
+        # (M3 Ultra, 2026-08-17): chunk 4096 beats the 2048 default +3.2%
+        # at 4k prompts / +1.0% at 16k, 8192 flat vs 4096. Floor the chunk
+        # at 4096 when the machine has headroom; the prefill memory guard
+        # still shrinks chunks under pressure, so small Macs are unchanged.
+        self._qwen35_prefill_floor = 0
+        try:
+            _mt = str(getattr(model, "model_type", "") or "")
+            if not _mt:
+                _mt = str(
+                    getattr(getattr(model, "config", None), "model_type", "") or ""
+                )
+            if _mt.startswith("qwen3_5"):
+                from .settings import get_system_memory
+
+                if get_system_memory() >= 64 * 1024**3:
+                    self._qwen35_prefill_floor = 4096
+        except Exception:
+            logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
+
         self._minimax_m3_adaptive_prefill = None
         try:
             from .patches.minimax_m3.generate_patch import (
@@ -3319,6 +3340,9 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
+        if getattr(request, "benchmark_trace", False):
+            request.benchmark_boundary_enabled = boundary_enabled
+            request.benchmark_cache_block_size = block_size if boundary_enabled else 0
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         # Sanity check: base_size from cache offsets should match the number
         # of tokens actually cached. A mismatch indicates stale meta_state
@@ -3383,6 +3407,8 @@ class Scheduler:
         emitted_boundaries: dict[int, int] = {}
 
         while input_arr.shape[1] > 0:
+            _trace_chunk_start = time.perf_counter()
+            _trace_processed_before = processed_tokens
             remaining = input_arr.shape[1]
             prefill_step_size = self._prefill_step_size_for_progress(
                 processed_tokens, remaining
@@ -3426,6 +3452,9 @@ class Scheduler:
                 loop_label="external",
                 request_id=request.request_id,
             )
+            if getattr(request, "benchmark_trace", False):
+                request.benchmark_prefill_chunks.append(int(n_to_process))
+                request.benchmark_requested_steps.append(int(prefill_step_size))
 
             _throttle_pre = get_phys_footprint()
             # External prefill bypasses BatchGenerator, so it must establish
@@ -3438,6 +3467,7 @@ class Scheduler:
             # eval graph across two streams and adds a per-chunk cross-stream
             # fence, the synchronization pattern implicated in the #2197 and
             # #2183 engine hangs on macOS 26.
+            _trace_model_start = time.perf_counter()
             with mx.stream(self._stream):
                 model_kwargs: dict[str, Any] = {}
                 if embeds_array is not None and embeds_array.shape[1] > 0:
@@ -3459,6 +3489,7 @@ class Scheduler:
                     embeds_array = embeds_array[:, n_to_process:]
                     if extra_kwargs:
                         extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
+            _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
             _throttle_post = get_phys_footprint()
             self._record_chunk_transient(
                 n_to_process,
@@ -3592,6 +3623,39 @@ class Scheduler:
 
             # Reclaim Metal intermediates between prefill chunks.
             _sync_and_clear_cache(self._stream)
+            if getattr(request, "benchmark_trace", False):
+                _trace_total_ms = (
+                    time.perf_counter() - _trace_chunk_start
+                ) * 1000.0
+                _ane_sequence = int(
+                    getattr(request, "benchmark_ane_sequence_length", 0) or 0
+                )
+                _ane_full_tiles, _ane_tail_tokens = (0, n_to_process)
+                if _ane_sequence > 0:
+                    _ane_full_tiles, _ane_tail_tokens = divmod(
+                        n_to_process, _ane_sequence
+                    )
+                logger.info(
+                    "[benchmark-prefill] rid=%s path=external chunk_tokens=%d "
+                    "processed=%d->%d kv_before=%d requested_step=%d "
+                    "boundary_enabled=%s cache_block_size=%d ane_tile=%d "
+                    "ane_full_tiles=%d ane_tail_tokens=%d model_cache_ms=%.3f "
+                    "total_ms=%.3f overhead_ms=%.3f",
+                    request.request_id,
+                    n_to_process,
+                    _trace_processed_before,
+                    processed_tokens,
+                    base_size + _trace_processed_before,
+                    prefill_step_size,
+                    boundary_enabled,
+                    block_size if boundary_enabled else 0,
+                    _ane_sequence,
+                    _ane_full_tiles,
+                    _ane_tail_tokens,
+                    _trace_model_ms,
+                    _trace_total_ms,
+                    max(0.0, _trace_total_ms - _trace_model_ms),
+                )
 
         # Emit final boundary snapshot if prompt lands exactly on boundary.
         if boundary_enabled:
@@ -4800,7 +4864,11 @@ class Scheduler:
 
         adaptive_prefill = getattr(self, "_minimax_m3_adaptive_prefill", None)
         if adaptive_prefill is None:
-            return self.config.prefill_step_size
+            size = self.config.prefill_step_size
+            floor = getattr(self, "_qwen35_prefill_floor", 0)
+            if floor and size < floor:
+                size = floor
+            return size
         from .patches.minimax_m3.generate_patch import (
             _prefill_step_size_for_progress as _minimax_prefill_step_size,
         )
@@ -4839,6 +4907,9 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
+        if getattr(request, "benchmark_trace", False):
+            request.benchmark_boundary_enabled = boundary_enabled
+            request.benchmark_cache_block_size = block_size if boundary_enabled else 0
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         if (
             boundary_enabled
@@ -4891,6 +4962,7 @@ class Scheduler:
             return True
 
         _t_chunk_start = time.perf_counter()
+        _trace_processed_before = state.tokens_processed
         remaining = state.tokens_remaining.shape[1]
         prefill_step_size = self._prefill_step_size_for_progress(
             state.tokens_processed, remaining
@@ -4929,12 +5001,16 @@ class Scheduler:
             loop_label="chunked_step",
             request_id=state.request.request_id,
         )
+        if getattr(state.request, "benchmark_trace", False):
+            state.request.benchmark_prefill_chunks.append(int(n))
+            state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
         _throttle_pre = get_phys_footprint()
         # Chunked prefill also bypasses BatchGenerator and must establish the
         # same per-engine stream context as the regular external prefill path.
         # The chunk views stay inside it for the same reason (single-stream
         # chunk eval graph, #2197/#2183).
+        _trace_model_start = time.perf_counter()
         with mx.stream(self._stream):
             chunk = state.tokens_remaining[:, :n]
             state.tokens_remaining = state.tokens_remaining[:, n:]
@@ -4943,6 +5019,7 @@ class Scheduler:
             else:
                 self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
+        _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _throttle_post = get_phys_footprint()
         self._record_chunk_transient(
             n,
@@ -5050,6 +5127,34 @@ class Scheduler:
         if self._should_clear_after_chunk():
             _sync_and_clear_cache(self._stream)
         chunk_dt = time.perf_counter() - _t_chunk_start
+        if getattr(state.request, "benchmark_trace", False):
+            _ane_sequence = int(
+                getattr(state.request, "benchmark_ane_sequence_length", 0) or 0
+            )
+            _ane_full_tiles, _ane_tail_tokens = (0, n)
+            if _ane_sequence > 0:
+                _ane_full_tiles, _ane_tail_tokens = divmod(n, _ane_sequence)
+            logger.info(
+                "[benchmark-prefill] rid=%s path=chunked_step chunk_tokens=%d "
+                "processed=%d->%d kv_before=%d requested_step=%d "
+                "boundary_enabled=%s cache_block_size=%d ane_tile=%d "
+                "ane_full_tiles=%d ane_tail_tokens=%d model_cache_ms=%.3f "
+                "total_ms=%.3f overhead_ms=%.3f",
+                state.request.request_id,
+                n,
+                _trace_processed_before,
+                state.tokens_processed,
+                state.base_size + _trace_processed_before,
+                prefill_step_size,
+                state.boundary_enabled,
+                state.block_size if state.boundary_enabled else 0,
+                _ane_sequence,
+                _ane_full_tiles,
+                _ane_tail_tokens,
+                _trace_model_ms,
+                chunk_dt * 1000.0,
+                max(0.0, chunk_dt * 1000.0 - _trace_model_ms),
+            )
         # Full-size chunks only: boundary/tail slivers under-measure, and
         # the running max must reflect sustained capability.
         if chunk_dt > 0.0 and n >= _CONTENDED_CHUNK_FLOOR:
@@ -6188,20 +6293,30 @@ class Scheduler:
                     layer_state["meta_state"] = _copy_containers(
                         layer_state.get("meta_state")
                     )
+                # Walk with an explicit stack rather than a recursive nested
+                # function. A recursive closure holds itself through its own
+                # cell, so the closure — and everything else it captured —
+                # becomes cyclic garbage that only the generational collector
+                # can reclaim. The captured leaf list names every array in the
+                # boundary state, and mx.array is tiny on the Python heap while
+                # backing GBs of Metal memory, so the collector has no reason to
+                # run and the whole chain stays resident. Caches that grow in
+                # place (KVCache) hide this because the stranded references
+                # alias the live buffers; caches that reallocate on growth
+                # (TurboQuant) strand a full extra chain per snapshot — measured
+                # at 0.74 GiB per turn on a 32k Qwen3.8-27B conversation.
                 leaves: list[Any] = []
-
-                def _collect(value: Any) -> None:
+                pending: list[Any] = [
+                    layer_state.get("state") for layer_state in extracted
+                ]
+                while pending:
+                    value = pending.pop()
                     if isinstance(value, mx.array):
                         leaves.append(value)
                     elif isinstance(value, (list, tuple)):
-                        for item in value:
-                            _collect(item)
+                        pending.extend(value)
                     elif isinstance(value, dict):
-                        for item in value.values():
-                            _collect(item)
-
-                for layer_state in extracted:
-                    _collect(layer_state.get("state"))
+                        pending.extend(value.values())
                 if leaves:
                     mx.eval(leaves)
             return (self._PREFILL_SNAPSHOT_MARKER, extracted)
@@ -8023,27 +8138,39 @@ class Scheduler:
             )
             return None
 
-        # Gemma4AssistantDraftModel keeps ``_shared_kv`` / ``_input_embed`` on
-        # the module instance, so multiple in-flight ``_mtp_rounds`` generators
-        # share one drafter and effectively serialize on it: each round has
-        # to ``set_shared_kv`` for its own request before ``draft_block`` runs.
-        # Output stays correct because target-side verify is the source of
-        # truth in speculative decoding (a stale-drafter round just rejects
-        # everything and falls back to a target-only step), but the
-        # per-request tok/s is roughly halved under concurrency. Empirically
-        # at 4 concurrent, vlm_mtp gives ~14 tok/s each vs BatchGenerator's
-        # ~27 tok/s each — BG's batched matmul beats serialized speculative
-        # rounds. So we route only the first eligible request through
-        # vlm_mtp and let subsequent concurrent requests fall back. A future
-        # commit can swap this gate for true batched MTP via
-        # ``_mtp_rounds_batch`` if and when omlx prefill exposes batched
-        # hidden/shared_kv outputs.
+        # The drafter stores request-specific state on the module instance, so
+        # only one vlm_mtp generator can own it at a time. A request that
+        # arrives after MTP has started cannot be migrated here; retain the
+        # existing safe BatchGenerator fallback for that late-arrival case.
         if self._vlm_mtp_active:
             logger.info(
                 "vlm_mtp routing skipped for %s: drafter is busy with %d "
                 "request(s); falling back to BatchGenerator",
                 request.request_id,
                 len(self._vlm_mtp_active),
+            )
+            return None
+
+        # Prefer ordinary batching when a peer is already ready or admitted.
+        # Starting MTP for the first request and falling its peers back creates
+        # a slower mixed decode group, while also paying this path's extra
+        # final target forward. A chunked-prefill request still appears in
+        # ``prefilling`` while it is finalized, so exclude the request itself.
+        waiting_count = len(getattr(self, "waiting", ()))
+        running_count = len(getattr(self, "running", ()))
+        prefilling_count = sum(
+            getattr(prefill, "request_id", None) != request.request_id
+            for prefill in getattr(self, "prefilling", ())
+        )
+        if waiting_count or running_count or prefilling_count:
+            logger.info(
+                "vlm_mtp routing skipped for %s: scheduler contention "
+                "(running=%d waiting=%d prefilling=%d); falling back to "
+                "BatchGenerator",
+                request.request_id,
+                running_count,
+                waiting_count,
+                prefilling_count,
             )
             return None
 
@@ -10348,6 +10475,22 @@ class Scheduler:
                 generated_at=output_generated_at,
                 generated_until=output_generated_at,
                 cached_tokens=request.cached_tokens,
+                benchmark_prefill_chunks=(
+                    list(getattr(request, "benchmark_prefill_chunks", []))
+                    if getattr(request, "benchmark_trace", False)
+                    else []
+                ),
+                benchmark_requested_steps=(
+                    list(getattr(request, "benchmark_requested_steps", []))
+                    if getattr(request, "benchmark_trace", False)
+                    else []
+                ),
+                benchmark_boundary_enabled=bool(
+                    getattr(request, "benchmark_boundary_enabled", False)
+                ),
+                benchmark_cache_block_size=int(
+                    getattr(request, "benchmark_cache_block_size", 0) or 0
+                ),
             )
 
             if not is_finished:
@@ -11923,13 +12066,29 @@ class Scheduler:
                 num_heads = _cfg_get(config, "num_attention_heads") or num_kv_heads
                 head_dim = hidden_size // num_heads
 
+            # Determine the activation dtype from an explicit model property or,
+            # for mlx-lm text models (including DeepSeek V4), the embedding
+            # weight that produces the hidden-state stream. ``mx.Dtype`` cannot
+            # be compared with ``None`` safely, so keep matching guarded.
+            model_dtype = getattr(self.model, "dtype", None)
+            if model_dtype is None:
+                model_body = getattr(self.model, "model", None)
+                embed_tokens = getattr(model_body, "embed_tokens", None)
+                embed_weight = getattr(embed_tokens, "weight", None)
+                model_dtype = getattr(embed_weight, "dtype", None)
+
+            def _dtype_matches(dtype: Any, expected: Any) -> bool:
+                if dtype is None:
+                    return False
+                try:
+                    return bool(dtype == expected)
+                except (TypeError, ValueError):
+                    return False
+
             # Determine base dtype size for uncompressed KV cache elements.
             base_dtype_size: float = 2  # Default float16/bfloat16
-            if hasattr(self.model, "dtype"):
-                if self.model.dtype == mx.float32:
-                    base_dtype_size = 4
-                elif self.model.dtype == mx.bfloat16:
-                    base_dtype_size = 2
+            if _dtype_matches(model_dtype, mx.float32):
+                base_dtype_size = 4
             dtype_size = base_dtype_size
 
             # Extract num_attention_heads (query heads) for SDPA peak estimation
@@ -12010,6 +12169,7 @@ class Scheduler:
                 make_prefill_memory_profile(
                     config,
                     compute_dtype_size=base_dtype_size,
+                    wsdpa_dtype_supported=_dtype_matches(model_dtype, mx.bfloat16),
                 )
                 if make_prefill_memory_profile is not None
                 else None

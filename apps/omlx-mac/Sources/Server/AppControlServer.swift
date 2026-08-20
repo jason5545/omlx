@@ -248,7 +248,6 @@ final class AppControlServer: @unchecked Sendable {
         case .stopped: return "stopped"
         case .starting: return "starting"
         case .running: return "running"
-        case .attached: return "attached"
         case .stopping: return "stopping"
         case .unresponsive: return "unresponsive"
         case .failed: return "failed"

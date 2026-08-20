@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
@@ -176,6 +176,7 @@ from .api.utils import (
     uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
+from .engine.distributed import DistributedInferenceError
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -294,6 +295,20 @@ def get_mcp_manager():
     return _server_state.mcp_manager
 
 
+def mcp_tools_exposed() -> bool:
+    """Whether backend MCP tools are exposed to clients.
+
+    Controlled by the dashboard toggle (Settings > Global Settings > MCP).
+    Defaults to True (backward compatible) when global settings are
+    unavailable, e.g. when MCP was started via env var/CLI without a
+    settings file.
+    """
+    gs = _server_state.global_settings
+    if gs is None:
+        return True
+    return bool(getattr(gs.mcp, "expose_tools", True))
+
+
 async def verify_api_key(
     request: FastAPIRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -303,7 +318,7 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import fingerprint_key, identify_api_key
+    from .admin.auth import fingerprint_key, verify_any_api_key
 
     # No auth required if no API key is configured
     if _server_state.api_key is None:
@@ -331,170 +346,11 @@ async def verify_api_key(
         if _server_state.global_settings is not None
         else []
     )
-    identity = identify_api_key(api_key_value, _server_state.api_key, sub_keys)
-    if identity is None:
+    if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
         logger.warning("Rejected API key (fp=%s)", fingerprint_key(api_key_value))
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    state = getattr(request, "state", None)
-    if state is not None:
-        state.omlx_api_key_kind = identity.get("kind")
-        state.omlx_api_key_name = identity.get("name")
-        state.omlx_sub_key = identity.get("sub_key")
-
     return True
-
-
-REQUEST_CLIENT_HEADERS = ("x-omlx-client", "x-client-name", "x-request-client")
-DEFAULT_SUB_KEY_POLICIES: dict[str, dict[str, Any]] = {
-    "voco": {"max_context_window": 16384, "enable_thinking": False},
-}
-
-
-def _clean_requester_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _normalized_policy_name(value: Any) -> str:
-    return (_clean_requester_value(value) or "").lower().replace("_", "-")
-
-
-def _positive_int_or_none(value: Any) -> int | None:
-    if value is None or value is False:
-        return None
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return None
-    return number if number > 0 else None
-
-
-def _bool_or_none(value: Any) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "off"}:
-            return False
-    return None
-
-
-def _get_request_state_attr(http_request: FastAPIRequest | None, attr: str) -> Any:
-    state = getattr(http_request, "state", None)
-    if state is None:
-        return None
-    return getattr(state, attr, None)
-
-
-def _identify_request_client(
-    http_request: FastAPIRequest | None,
-    request_user: Any = None,
-) -> tuple[str | None, str | None]:
-    sub_key_name = _clean_requester_value(
-        _get_request_state_attr(http_request, "omlx_api_key_name")
-    )
-    sub_key = _get_request_state_attr(http_request, "omlx_sub_key")
-    if sub_key is not None and sub_key_name and sub_key_name != "sub-key":
-        return sub_key_name, "api-sub-key"
-
-    for header in REQUEST_CLIENT_HEADERS:
-        header_value = _clean_requester_value(
-            http_request.headers.get(header) if http_request is not None else None
-        )
-        if header_value:
-            return header_value, f"header:{header}"
-
-    user_value = _clean_requester_value(request_user)
-    if user_value:
-        return user_value, "request.user"
-
-    if sub_key_name:
-        return sub_key_name, "api-key"
-    return None, None
-
-
-def _build_request_policy(
-    http_request: FastAPIRequest | None,
-    request_user: Any = None,
-) -> dict[str, Any]:
-    client, source = _identify_request_client(http_request, request_user=request_user)
-    policy: dict[str, Any] = {"client": client, "source": source}
-
-    sub_key = _get_request_state_attr(http_request, "omlx_sub_key")
-    if sub_key is not None:
-        max_context_window = _positive_int_or_none(
-            getattr(sub_key, "max_context_window", None)
-        )
-        enable_thinking = _bool_or_none(getattr(sub_key, "enable_thinking", None))
-        thinking_budget = _positive_int_or_none(
-            getattr(sub_key, "thinking_budget_tokens", None)
-        )
-        if max_context_window is not None:
-            policy["max_context_window"] = max_context_window
-        if enable_thinking is not None:
-            policy["enable_thinking"] = enable_thinking
-        if thinking_budget is not None:
-            policy["thinking_budget_tokens"] = thinking_budget
-
-    default_policy = DEFAULT_SUB_KEY_POLICIES.get(_normalized_policy_name(client))
-    if default_policy:
-        for key, value in default_policy.items():
-            if policy.get(key) is None:
-                policy[key] = value
-
-    return policy
-
-
-def _request_policy_has_overrides(policy: dict[str, Any] | None) -> bool:
-    return bool(
-        policy
-        and (
-            policy.get("max_context_window") is not None
-            or policy.get("enable_thinking") is not None
-            or policy.get("thinking_budget_tokens") is not None
-        )
-    )
-
-
-def _log_request_policy(policy: dict[str, Any], model_id: str | None) -> None:
-    if not _request_policy_has_overrides(policy) or policy.get("_logged"):
-        return
-    parts = []
-    if policy.get("max_context_window") is not None:
-        parts.append(f"max_context_window<={policy['max_context_window']}")
-    if policy.get("enable_thinking") is not None:
-        parts.append(f"enable_thinking={policy['enable_thinking']}")
-    if policy.get("thinking_budget_tokens") is not None:
-        parts.append(f"thinking_budget_tokens={policy['thinking_budget_tokens']}")
-    logger.info(
-        "Request policy active: client=%s source=%s model=%s %s",
-        policy.get("client") or "(unknown)",
-        policy.get("source") or "(unknown)",
-        model_id or "(unknown)",
-        ", ".join(parts),
-    )
-    policy["_logged"] = True
-
-
-def _apply_request_chat_template_overrides(
-    merged_ct_kwargs: dict[str, Any],
-    request_policy: dict[str, Any] | None,
-) -> None:
-    if not request_policy:
-        return
-    enable_thinking = _bool_or_none(request_policy.get("enable_thinking"))
-    if enable_thinking is None:
-        return
-    merged_ct_kwargs["enable_thinking"] = enable_thinking
-    if enable_thinking is False:
-        merged_ct_kwargs.pop("preserve_thinking", None)
 
 
 def distributed_inference_enabled() -> bool:
@@ -565,6 +421,24 @@ async def lifespan(app: FastAPI):
             logger.warning("Server alias auto-detection failed: %s", exc)
 
     _reset_boundary_snapshots_for_server()
+
+    # Publish the interpreter another Mac's coordinator discovers over SSH.
+    # Without it a packaged-app peer fails every discovery candidate and gets
+    # reported as "worker runtime is not installed" (#2680). Best effort: a
+    # read-only home must never keep this node from serving inference.
+    try:
+        from .cluster.worker_shim import ensure_cluster_python_shim
+
+        ensure_cluster_python_shim()
+    except (ImportError, OSError, RuntimeError) as exc:
+        # RuntimeError: Path.home() cannot resolve a home directory.
+        # Anything outside this set is a real bug and should surface loudly
+        # rather than be swallowed by a start-up convenience path.
+        logger.warning(
+            "Could not publish the cluster interpreter shim; a peer "
+            "coordinator may not discover this node over SSH: %r",
+            exc,
+        )
 
     # Advertise this oMLX instance so another Mac can identify it by hostname
     # and API port without asking the user to type an SSH target. Publication
@@ -949,6 +823,31 @@ async def scheduler_queue_full_handler(
         content=content,
         headers={"Retry-After": "1"},
     )
+
+
+@app.exception_handler(DistributedInferenceError)
+async def distributed_unavailable_handler(
+    request: FastAPIRequest, exc: DistributedInferenceError
+):
+    """Map a failed distributed cluster check to a clean HTTP 503.
+
+    The distributed engine's preflight health gate raises this before the
+    StreamingResponse is built, which is what turns a dead or half-dead
+    cluster into an honest error instead of an empty 200 whose failure only
+    surfaces mid-stream (#2708). Errors raised after streaming has started
+    still land in-band; this handler covers every pre-commit path.
+    """
+    logger.warning(
+        "%s %s -> 503: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(str(exc), 503)
+    else:
+        content = {"detail": str(exc)}
+    return JSONResponse(status_code=503, content=content)
 
 
 def _prefill_memory_error_detail(exc: PrefillMemoryExceededError) -> str:
@@ -1368,19 +1267,31 @@ class _LLMEngineLease:
             await get_engine_pool().release_engine(self.model_id)
 
     def abort_requested(self) -> bool:
+        return self.abort_reason() is not None
+
+    def abort_reason(self) -> str | None:
         if self.model_id is None or self.released:
-            return False
+            return None
         pool = _server_state.engine_pool
         if pool is None:
-            return False
+            return None
+        get_reason = getattr(pool, "get_abort_requested_reason", None)
+        if callable(get_reason):
+            return get_reason(self.model_id)
         is_abort_requested = getattr(pool, "is_abort_requested", None)
         if not callable(is_abort_requested):
-            return False
-        return bool(is_abort_requested(self.model_id))
+            return None
+        return "hard memory pressure" if is_abort_requested(self.model_id) else None
 
 
 async def _raise_if_llm_lease_abort_requested(lease: _LLMEngineLease) -> None:
-    if lease.abort_requested():
+    reason = lease.abort_reason()
+    if reason == "manual admin unload":
+        raise HTTPException(
+            status_code=409,
+            detail="Request aborted because this model is being unloaded.",
+        )
+    if reason is not None:
         raise HTTPException(
             status_code=507,
             detail=(
@@ -1699,15 +1610,8 @@ def _strip_synthetic_think_prefix(chunk_text: str, think_tag: str) -> str:
     return chunk_text[len(prefix) :] if chunk_text.startswith(prefix) else chunk_text
 
 
-def _resolve_thinking_budget(
-    request,
-    model_id: str | None,
-    request_policy: dict[str, Any] | None = None,
-) -> int | None:
-    """Resolve thinking budget: request > sub-key policy > model settings."""
-    if request_policy and _bool_or_none(request_policy.get("enable_thinking")) is False:
-        return None
-
+def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
+    """Resolve thinking budget: request param > model settings > None."""
     # Check request-level override (OpenAI format)
     req_budget = getattr(request, "thinking_budget", None)
     # For Anthropic: check thinking.budget_tokens
@@ -1715,15 +1619,6 @@ def _resolve_thinking_budget(
         req_budget = getattr(request.thinking, "budget_tokens", None)
     if req_budget is not None:
         return req_budget
-
-    policy_budget = (
-        _positive_int_or_none(request_policy.get("thinking_budget_tokens"))
-        if request_policy
-        else None
-    )
-    if policy_budget is not None:
-        return policy_budget
-
     ms = get_model_settings_for_request(model_id)
     if ms and ms.thinking_budget_enabled and ms.thinking_budget_tokens:
         return ms.thinking_budget_tokens
@@ -1847,10 +1742,7 @@ def _get_ocr_defaults(model_id: str | None) -> dict | None:
     return None
 
 
-def get_max_context_window(
-    model_id: str | None = None,
-    request_policy: dict[str, Any] | None = None,
-) -> int | None:
+def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
 
@@ -1884,40 +1776,24 @@ def get_max_context_window(
     model_settings = get_model_settings_for_request(requested_model_id)
     model_id = resolve_model_id(model_id)
 
-    # Priority 1: explicit per-model override (not capped by global policy)
+    # Priority 1: explicit per-model override (not capped by policy)
     if model_settings and model_settings.max_context_window is not None:
-        effective_context = model_settings.max_context_window
-    else:
-        effective_context = None
-        # Priority 2: model-native context, optionally clamped by global policy
-        pool = _server_state.engine_pool
-        if model_id and pool is not None:
-            entry = pool.get_entry(model_id)
-            if entry is not None and entry.model_context_length is not None:
-                native = entry.model_context_length
-                policy = getattr(
-                    _server_state.sampling, "max_context_window_policy", None
-                )
-                if policy is not None and policy > 0:
-                    effective_context = min(native, policy)
-                else:
-                    effective_context = native
+        return model_settings.max_context_window
 
-        # Priority 3: fallback default (not capped by global policy).
-        if effective_context is None:
-            effective_context = _server_state.sampling.max_context_window
+    # Priority 2: model-native context, optionally clamped by policy
+    pool = _server_state.engine_pool
+    if model_id and pool is not None:
+        entry = pool.get_entry(model_id)
+        if entry is not None and entry.model_context_length is not None:
+            native = entry.model_context_length
+            policy = getattr(_server_state.sampling, "max_context_window_policy", None)
+            if policy is not None and policy > 0:
+                return min(native, policy)
+            return native
 
-    # Per-request/sub-key policy can only shrink the effective window.
-    policy_context = (
-        _positive_int_or_none(request_policy.get("max_context_window"))
-        if request_policy
-        else None
-    )
-    if policy_context is None:
-        return effective_context
-    if effective_context is None:
-        return policy_context
-    return min(effective_context, policy_context)
+    # Priority 3: fallback default (not capped — preserves legacy
+    # settings.json behavior).
+    return _server_state.sampling.max_context_window
 
 
 def get_embedding_max_length(
@@ -1939,16 +1815,14 @@ def get_embedding_max_length(
 
 
 def validate_context_window(
-    num_prompt_tokens: int,
-    model_id: str | None = None,
-    request_policy: dict[str, Any] | None = None,
+    num_prompt_tokens: int, model_id: str | None = None
 ) -> None:
     """
     Validate that prompt token count does not exceed max context window.
 
     Raises HTTPException 400 if the prompt is too long.
     """
-    max_ctx = get_max_context_window(model_id, request_policy=request_policy)
+    max_ctx = get_max_context_window(model_id)
     if max_ctx and num_prompt_tokens > max_ctx:
         raise HTTPException(
             status_code=400,
@@ -2084,11 +1958,13 @@ def init_server(
         scheduler_config=scheduler_config,
     )
     from .cluster.enrollment import configure_cluster_enrollment
+    from .cluster.incidents import configure_cluster_incidents
     from .cluster.registry import configure_cluster_registry
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
+    configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
 
     # Discover models (use pinned models from settings file)
@@ -3324,11 +3200,6 @@ async def create_completion(
     _: bool = Depends(verify_api_key),
 ):
     """Create a text completion."""
-    request_policy = _build_request_policy(
-        http_request, request_user=getattr(request, "user", None)
-    )
-    _log_request_policy(request_policy, request.model)
-
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -3351,11 +3222,7 @@ async def create_completion(
         for prompt in prompts:
             prompt_token_ids = list(engine.tokenizer.encode(prompt))
             prompt_token_ids_by_prompt.append(prompt_token_ids)
-            validate_context_window(
-                len(prompt_token_ids),
-                request.model,
-                request_policy=request_policy,
-            )
+            validate_context_window(len(prompt_token_ids), request.model)
 
         # Pre-flight prefill memory guard — see create_chat_completion for
         # the reason this must precede any StreamingResponse return.
@@ -3384,7 +3251,6 @@ async def create_completion(
                             prompt_token_ids=prompt_token_ids_by_prompt[0],
                             resolved_model=resolved_model,
                             response_id=response_id,
-                            request_policy=request_policy,
                         ),
                         http_request=http_request,
                         keepalive_chunk=keepalive,
@@ -3430,11 +3296,7 @@ async def create_completion(
             )
 
             gen_kwargs = {}
-            thinking_budget = _resolve_thinking_budget(
-                request,
-                request.model,
-                request_policy=request_policy,
-            )
+            thinking_budget = _resolve_thinking_budget(request, request.model)
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
 
@@ -3565,11 +3427,6 @@ async def create_chat_completion(
                 5, "  Message[%d]: role=%s, content=%s...", i, msg.role, content_preview
             )
 
-    request_policy = _build_request_policy(
-        http_request, request_user=getattr(request, "user", None)
-    )
-    _log_request_policy(request_policy, request.model)
-
     if is_markitdown_model(request.model):
         return await _create_markitdown_chat_completion(request, http_request)
 
@@ -3607,7 +3464,6 @@ async def create_chat_completion(
                 request.reasoning_effort,
             ),
         )
-        _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
         # Extract messages - different engines need different content handling.
         # Templates that expose message.reasoning_content natively (Qwen 3.6+)
@@ -3730,7 +3586,11 @@ async def create_chat_completion(
                 )
             tools_disabled = True
         effective_tools = None if tools_disabled else request.tools
-        if _server_state.mcp_manager and not tools_disabled:
+        if (
+            _server_state.mcp_manager
+            and not tools_disabled
+            and mcp_tools_exposed()
+        ):
             # Convert Pydantic ToolDefinition models to dicts for merge_tools
             user_tools_dicts = (
                 [t.model_dump() for t in request.tools] if request.tools else None
@@ -3775,11 +3635,7 @@ async def create_chat_completion(
             ):
                 raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
             raise
-        validate_context_window(
-            num_prompt_tokens,
-            request.model,
-            request_policy=request_policy,
-        )
+        validate_context_window(num_prompt_tokens, request.model)
 
         # Prepare kwargs
         (
@@ -3824,11 +3680,7 @@ async def create_chat_completion(
             chat_kwargs["seed"] = request.seed
 
         # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(
-            request,
-            request.model,
-            request_policy=request_policy,
-        )
+        thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
@@ -4490,7 +4342,6 @@ async def stream_completion(
     prompt_token_ids: list[int] | None = None,
     resolved_model: str | None = None,
     response_id: str | None = None,
-    request_policy: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -4529,11 +4380,7 @@ async def stream_completion(
         req_xtc_threshold=getattr(request, "xtc_threshold", None),
     )
     gen_kwargs = {}
-    thinking_budget = _resolve_thinking_budget(
-        request,
-        request.model,
-        request_policy=request_policy,
-    )
+    thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         gen_kwargs["thinking_budget"] = thinking_budget
     try:
@@ -4795,7 +4642,12 @@ async def stream_chat_completion(
     stream_content = True
     if has_tools:
         _content_filter = ToolCallStreamFilter(engine.tokenizer)
-        _thinking_filter = ToolCallStreamFilter(engine.tokenizer)
+        # The thinking channel never contains a separator-prefixed DSML
+        # block; holding trailing newlines would flush them as a late
+        # reasoning delta after the channel closed.
+        _thinking_filter = ToolCallStreamFilter(
+            engine.tokenizer, consume_dsml_separator=False
+        )
         if _content_filter.active:
             tool_filter = _content_filter
             thinking_filter = _thinking_filter
@@ -5222,7 +5074,12 @@ async def stream_anthropic_messages(
     thinking_filter = None
     if has_tools:
         _content_filter = ToolCallStreamFilter(engine.tokenizer)
-        _thinking_filter = ToolCallStreamFilter(engine.tokenizer)
+        # The thinking channel never contains a separator-prefixed DSML
+        # block; holding trailing newlines would flush them as a late
+        # reasoning delta after the channel closed.
+        _thinking_filter = ToolCallStreamFilter(
+            engine.tokenizer, consume_dsml_separator=False
+        )
         if _content_filter.active:
             tool_filter = _content_filter
             thinking_filter = _thinking_filter
@@ -5301,14 +5158,15 @@ async def stream_anthropic_messages(
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
                         # When tools are requested AND we haven't yet opened
-                        # a text block, drop pure-whitespace deltas. Models
-                        # often emit a leading newline around <tool_call>
-                        # envelopes that tool_filter passes through
-                        # (whitespace isn't part of the envelope markers).
-                        # Without this guard, the `\n` opens a text block
-                        # that then holds only whitespace — surfacing as
-                        # a phantom empty-ish text block before the
-                        # tool_use blocks.
+                        # a text block, drop pure-whitespace deltas. Most
+                        # models emit a leading newline around <tool_call>
+                        # envelopes that tool_filter passes through (their
+                        # whitespace isn't part of the envelope markers;
+                        # DeepSeek V4's separator is, and the filter
+                        # consumes it itself). Without this guard, the `\n`
+                        # opens a text block that then holds only
+                        # whitespace — surfacing as a phantom empty-ish
+                        # text block before the tool_use blocks.
                         if (
                             not text_block_started
                             and kwargs.get("tools")
@@ -5389,7 +5247,14 @@ async def stream_anthropic_messages(
     # Flush any remaining buffered content from the tool-call filter
     if tool_filter:
         remaining = tool_filter.finish()
-        if remaining:
+        # Same guard as the delta path above: the filter can now flush
+        # held newlines here, and pure whitespace must not open a
+        # phantom text block.
+        if remaining and not (
+            not text_block_started
+            and kwargs.get("tools")
+            and not remaining.strip()
+        ):
             if not text_block_started:
                 if thinking_block_started:
                     yield create_content_block_stop_event(index=block_index)
@@ -5580,11 +5445,6 @@ async def create_anthropic_message(
         f"messages={len(request.messages)}, stream={request.stream}, "
         f"max_tokens={request.max_tokens}"
     )
-    metadata_user = None
-    if isinstance(getattr(request, "metadata", None), dict):
-        metadata_user = request.metadata.get("user_id") or request.metadata.get("user")
-    request_policy = _build_request_policy(http_request, request_user=metadata_user)
-    _log_request_policy(request_policy, request.model)
 
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
@@ -5618,7 +5478,6 @@ async def create_anthropic_message(
                     merged_ct_kwargs["enable_thinking"] = True
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
-        _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
         _entry = get_engine_pool().get_entry(resolved_model)
 
@@ -5724,11 +5583,7 @@ async def create_anthropic_message(
         }
 
         # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(
-            request,
-            request.model,
-            request_policy=request_policy,
-        )
+        thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
@@ -5762,7 +5617,7 @@ async def create_anthropic_message(
                     field="tools",
                 )
             internal_tools = None
-        elif _server_state.mcp_manager:
+        elif _server_state.mcp_manager and mcp_tools_exposed():
             mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
             combined = (mcp_openai_tools or []) + (user_internal or [])
             # Deduplicate by function name (user tools take precedence)
@@ -5818,11 +5673,7 @@ async def create_anthropic_message(
             ):
                 raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
             raise
-        validate_context_window(
-            num_prompt_tokens,
-            request.model,
-            request_policy=request_policy,
-        )
+        validate_context_window(num_prompt_tokens, request.model)
 
         # Add stop sequences
         if request.stop_sequences:
@@ -6091,10 +5942,6 @@ async def create_response(
     logger.debug(
         f"Responses API request: model={request.model}, stream={request.stream}"
     )
-    request_policy = _build_request_policy(
-        http_request, request_user=getattr(request, "user", None)
-    )
-    _log_request_policy(request_policy, request.model)
 
     load_start = time.perf_counter()
     lease = _LLMEngineLease()
@@ -6153,7 +6000,6 @@ async def create_response(
                 ),
             ),
         )
-        _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
         _entry = get_engine_pool().get_entry(resolved_model)
 
@@ -6165,6 +6011,7 @@ async def create_response(
         # Handle text.format (structured output)
         response_format = None
         compiled_grammar = None
+        response_format_warning = None
         if request.text and request.text.format:
             fmt = request.text.format
             if fmt.type == "json_object":
@@ -6194,6 +6041,11 @@ async def create_response(
                     reasoning_parser=reasoning_parser,
                 )
                 if compiled_grammar is None:
+                    # Non-strict formats still degrade to prompt injection, so
+                    # surface it to the caller with the same Warning response
+                    # header /v1/chat/completions uses; the log line alone only
+                    # ever reaches the operator (#1241).
+                    response_format_warning = _response_format_warning_header(rf)
                     json_instruction = build_json_system_prompt(rf)
                     if json_instruction:
                         messages = _inject_json_instruction(messages, json_instruction)
@@ -6209,7 +6061,11 @@ async def create_response(
             )
             else openai_tools
         )
-        if _server_state.mcp_manager and effective_tools:
+        if (
+            _server_state.mcp_manager
+            and effective_tools
+            and mcp_tools_exposed()
+        ):
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
 
         # Convert tools for chat template
@@ -6247,11 +6103,7 @@ async def create_response(
             ):
                 raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
             raise
-        validate_context_window(
-            num_prompt_tokens,
-            request.model,
-            request_policy=request_policy,
-        )
+        validate_context_window(num_prompt_tokens, request.model)
 
         # Build sampling kwargs
         (
@@ -6291,11 +6143,7 @@ async def create_response(
             chat_kwargs["seed"] = request.seed
 
         # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(
-            request,
-            request.model,
-            request_policy=request_policy,
-        )
+        thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
@@ -6341,6 +6189,9 @@ async def create_response(
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
+            sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+            if response_format_warning:
+                sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
                     _with_sse_keepalive(
@@ -6362,7 +6213,7 @@ async def create_response(
                     lease,
                 ),
                 media_type="text/event-stream",
-                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+                headers=sse_headers,
             )
 
         # Non-streaming with keepalive during prefill
@@ -6480,9 +6331,13 @@ async def create_response(
                 cached_tokens=output.cached_tokens,
             )
 
+            # Surface max_output_tokens truncation so clients can tell an
+            # incomplete turn from a natural stop. The Responses API has no
+            # finish_reason field; status + incomplete_details is the signal.
+            truncated = getattr(output, "finish_reason", None) == "length"
             response_obj = ResponseObject(
                 model=request.model,
-                status="completed",
+                status="incomplete" if truncated else "completed",
                 output=output_items,
                 usage=usage,
                 tools=request.tools or [],
@@ -6491,6 +6346,7 @@ async def create_response(
                 top_p=top_p,
                 max_output_tokens=request.max_output_tokens,
                 previous_response_id=request.previous_response_id,
+                incomplete_details={"reason": "max_output_tokens"} if truncated else None,
             )
 
             # Store response
@@ -6502,12 +6358,16 @@ async def create_response(
 
             return response_obj.model_dump_json()
 
+        json_headers = (
+            {"Warning": response_format_warning} if response_format_warning else None
+        )
         return StreamingResponse(
             _release_after_stream(
                 _with_json_keepalive(http_request, _build_responses_api()),
                 lease,
             ),
             media_type="application/json",
+            headers=json_headers,
         )
 
     except BaseException:
@@ -6775,7 +6635,12 @@ async def stream_responses_api(
     stream_content = True
     if has_tools:
         _content_filter = ToolCallStreamFilter(engine.tokenizer)
-        _thinking_filter = ToolCallStreamFilter(engine.tokenizer)
+        # The thinking channel never contains a separator-prefixed DSML
+        # block; holding trailing newlines would flush them as a late
+        # reasoning delta after the channel closed.
+        _thinking_filter = ToolCallStreamFilter(
+            engine.tokenizer, consume_dsml_separator=False
+        )
         if _content_filter.active:
             tool_filter = _content_filter
             thinking_filter = _thinking_filter
@@ -7183,13 +7048,15 @@ async def stream_responses_api(
             "output_tokens_details": {"reasoning_tokens": reasoning_token_count},
         }
 
-    # 13. response.completed — MUST always be sent
+    # 13. Emit the terminal event matching the final response status.
+    truncated = getattr(last_output, "finish_reason", None) == "length"
+    terminal_event = "response.incomplete" if truncated else "response.completed"
     final_response = {
         "id": response_id,
         "object": "response",
         "created_at": initial_response.created_at,
         "model": request.model,
-        "status": "completed",
+        "status": "incomplete" if truncated else "completed",
         "output": output_items,
         "usage": usage_data,
         "tool_choice": request.tool_choice or "auto",
@@ -7202,14 +7069,16 @@ async def stream_responses_api(
         "top_p": request.top_p,
         "max_output_tokens": request.max_output_tokens,
     }
+    if truncated:
+        final_response["incomplete_details"] = {"reason": "max_output_tokens"}
     if request.previous_response_id:
         final_response["previous_response_id"] = request.previous_response_id
 
     seq += 1
     yield format_sse_event(
-        "response.completed",
+        terminal_event,
         {
-            "type": "response.completed",
+            "type": terminal_event,
             "response": final_response,
             "sequence_number": seq,
         },

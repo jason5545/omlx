@@ -15,6 +15,18 @@ def test_missing_worker_runtime_is_explained_as_online_setup():
     assert "SSH and hardware discovery succeeded" in guidance.explanation
 
 
+def test_unverifiable_runtime_is_not_reported_as_a_missing_one():
+    """#2680: a probe that could not run is not proof the runtime is absent."""
+
+    unverified = explain("studio is online, but oMLX worker runtime could not be verified.")
+    missing = explain("studio is online, but oMLX worker runtime is not installed.")
+
+    assert unverified.title != missing.title
+    assert "could not be checked" in unverified.title
+    assert "install" not in unverified.title.lower()
+    assert any("open omlx once" in step.lower() for step in unverified.steps)
+
+
 @pytest.mark.parametrize(
     ("message", "expected_in_title"),
     [
@@ -75,8 +87,18 @@ def test_guidance_serialises_for_the_dashboard():
         "doc_anchor",
         "command",
         "keygen_command",
+        "code",
     }
     assert isinstance(payload["steps"], list)
+
+
+def test_every_rule_carries_a_stable_code():
+    from omlx.cluster.guidance import _FALLBACK, _RULES
+
+    assert _FALLBACK.code == "unknown_failure"
+    codes = [guidance.code for _pattern, guidance in _RULES]
+    assert all(codes)
+    assert len(set(codes)) == len(codes)
 
 
 def test_first_seen_host_key_has_a_copyable_terminal_fallback():

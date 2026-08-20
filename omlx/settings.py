@@ -328,7 +328,7 @@ class CacheSettings:
     # True/False preserve the legacy explicit split/embedded choices.
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
-    gdn_sidecar_state_dtype: str = "rht_int16"
+    gdn_sidecar_state_dtype: str = "fp32"
 
     def get_gdn_snapshot_storage(self) -> str:
         """Return the user-facing GDN storage policy."""
@@ -408,7 +408,12 @@ class CacheSettings:
             "gdn_ssd_split_enabled": self.get_gdn_ssd_split_enabled(),
             "gdn_snapshot_storage": self.get_gdn_snapshot_storage(),
             "gdn_ssd_pending_max_size": self.gdn_ssd_pending_max_size,
-            "gdn_sidecar_state_dtype": self.gdn_sidecar_state_dtype,
+            # This public key deliberately differs from the v0.6.0 key.
+            # v0.6.0 persisted its lossy rht_int16 default without recording
+            # whether the user selected it. Ignoring that legacy key resets
+            # every existing install to the exact fp32 default; reduced
+            # precision is retained only after an explicit new-key selection.
+            "gdn_sidecar_precision": self.gdn_sidecar_state_dtype,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -445,7 +450,6 @@ class CacheSettings:
             ):
                 legacy_split = "conflict"
 
-        legacy_settings = "gdn_ssd_split_enabled" in data and storage_mode is None
         return cls(
             enabled=data.get("enabled", True),
             hot_cache_only=data.get("hot_cache_only", False),
@@ -454,10 +458,7 @@ class CacheSettings:
                 "gdn_ssd_pending_max_size", "512MB"
             ),
             gdn_sidecar_state_dtype=str(
-                data.get(
-                    "gdn_sidecar_state_dtype",
-                    "fp32" if legacy_settings else "rht_int16",
-                )
+                data.get("gdn_sidecar_precision", "fp32")
             ).lower(),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
@@ -550,24 +551,14 @@ class SubKeyEntry:
     key: str
     name: str = ""
     created_at: str = ""
-    max_context_window: int | None = None
-    enable_thinking: bool | None = None
-    thinking_budget_tokens: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        data = {
+        return {
             "key": self.key,
             "name": self.name,
             "created_at": self.created_at,
         }
-        if self.max_context_window is not None:
-            data["max_context_window"] = self.max_context_window
-        if self.enable_thinking is not None:
-            data["enable_thinking"] = self.enable_thinking
-        if self.thinking_budget_tokens is not None:
-            data["thinking_budget_tokens"] = self.thinking_budget_tokens
-        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SubKeyEntry:
@@ -576,9 +567,6 @@ class SubKeyEntry:
             key=data.get("key", ""),
             name=data.get("name", ""),
             created_at=data.get("created_at", ""),
-            max_context_window=data.get("max_context_window"),
-            enable_thinking=data.get("enable_thinking"),
-            thinking_budget_tokens=data.get("thinking_budget_tokens"),
         )
 
 
@@ -616,15 +604,19 @@ class MCPSettings:
     """MCP (Model Context Protocol) configuration settings."""
 
     config_path: str | None = None
+    expose_tools: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"config_path": self.config_path}
+        return {"config_path": self.config_path, "expose_tools": self.expose_tools}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MCPSettings:
         """Create from dictionary."""
-        return cls(config_path=data.get("config_path"))
+        return cls(
+            config_path=data.get("config_path"),
+            expose_tools=data.get("expose_tools", True),
+        )
 
 
 @dataclass

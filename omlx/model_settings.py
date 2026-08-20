@@ -109,6 +109,18 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
+        qwen35_ane_prefill_enabled: Enable private fixed-shape Qwen3.5/3.6/3.8
+            ANE/GPU prompt processing.
+        qwen35_ane_prefill_sequence_length: Exact flattened token count routed
+            through the eagerly compiled ANE programs.
+        qwen35_ane_prefill_fraction: Fraction of eligible MLP outputs assigned
+            across the ANE instances.
+        qwen35_ane_prefill_max_layers: Maximum eligible MLP layers accelerated.
+        qwen35_ane_prefill_dual_ane: Pin a procedure bank to each physical ANE.
+        qwen35_ane_prefill_gdn: Also accelerate eligible GDN input projections.
+        qwen35_ane_prefill_gdn_fraction: Fraction of eligible GDN projection
+            outputs assigned across the ANE instances.
+        qwen35_ane_prefill_gdn_max_layers: Maximum eligible GDN layers accelerated.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -125,10 +137,12 @@ class ModelSettings:
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
         dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
-        dflash_draft_window_size: Draft model sliding-attention window (None = dflash default 1024).
+        dflash_draft_window_size: Draft model sliding-attention window
+            (None = use the draft checkpoint's sliding_window when present).
             Helps stabilise acceptance rate on long-context prompts.
         dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
-            (None = dflash default 64).
+            (default 0, disabling sink tokens).
+        dflash_block_size: Draft/verify tokens per cycle (None = checkpoint default).
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
@@ -199,6 +213,18 @@ class ModelSettings:
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
 
+    # Experimental private-API ANE/GPU prefill for dense Qwen3.5/3.6/3.8 MLPs.
+    # Off by default because the fixed-shape ANE models add load-time/runtime
+    # cache memory and rely on undocumented AppleNeuralEngine interfaces.
+    qwen35_ane_prefill_enabled: bool = False
+    qwen35_ane_prefill_sequence_length: int = 2048
+    qwen35_ane_prefill_fraction: float = 0.53
+    qwen35_ane_prefill_max_layers: int = 64
+    qwen35_ane_prefill_dual_ane: bool = True
+    qwen35_ane_prefill_gdn: bool = True
+    qwen35_ane_prefill_gdn_fraction: float = 0.50
+    qwen35_ane_prefill_gdn_max_layers: int = 48
+
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
     specprefill_draft_model: Optional[str] = (
@@ -230,11 +256,11 @@ class ModelSettings:
         False  # Requires in-memory cache and an omlx paged SSD cache dir
     )
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
-    # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
-    # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
-    # agentic workloads where acceptance drops on the default sliding window.
+    # DFlash runtime tuning knobs. None window size uses the draft checkpoint's
+    # sliding_window when present; sink size defaults to no attention-sink tokens.
     dflash_draft_window_size: Optional[int] = None
-    dflash_draft_sink_size: Optional[int] = None
+    dflash_draft_sink_size: Optional[int] = 0
+    dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
@@ -1134,6 +1160,10 @@ class ModelSettingsManager:
             merged["active_profile_name"] = name
             if settings_sanitizer is not None:
                 settings_sanitizer(merged)
+            # Keep persistent profile application consistent with request-time
+            # profile overlays: output-shaping settings win over the speed-only
+            # VLM MTP toggle when the merged settings need logits processors.
+            merged, _ = resolve_vlm_mtp_conflicts(merged)
             new_settings = ModelSettings.from_dict(merged)
             self._settings[model_id] = new_settings
             try:
