@@ -20,17 +20,13 @@ upstream https://github.com/jundot/omlx.git
 
 ## 目前本地改動
 
-這個 fork 不是乾淨 upstream。它包含幾個 Jason 目前需要的本地功能：
+自 0.6.3rc1 merge 起，這個 fork 盡量貼齊 upstream，只保留三個本地功能；其他一律 follow upstream（舊的 VLM/MTP、MTPLX、thinking-budget patch stack 已整批丟棄，存在 `backup/pre-upstream-merge` 分支僅供查閱，不要回移植）：
 
-- VLM + Native MTP：VLM 模型啟用 `mtp_enabled=true` 時仍走 `VLMBatchedEngine`，不能退回 LM-only dispatch。
-- `VLMModelAdapter` 要保留 `mtp_forward`、`make_mtp_cache`、`return_hidden=True` passthrough。
-- mlx-vlm Qwen3.5/Qwen3.6 runtime 有 Native MTP hook。
-- 多 token verify 時要保留正確的 mRoPE / position_ids / rope_deltas 行為。
-- 只維持一個非 pinned 模型常駐；切換 request model 時會 unload 前一個模型。
-- API sub-key 可以套 request policy。`voco` 預設是 `max_context_window<=16384` 且 `enable_thinking=false`。
-- `Formula/omlx.rb` 的 HEAD 指向 `https://github.com/jason5545/omlx.git`，並保留 xgrammar macOS arm64 post-install patch。
+- API sub-key 可以套 request policy（`identify_api_key` → `DEFAULT_SUB_KEY_POLICIES`）。`voco` 預設是 `max_context_window<=16384` 且 `enable_thinking=false`。相關檔案：`omlx/server.py`、`omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`。
+- Mac app attach mode：`8000` 上已有健康 oMLX server 時 app 直接 attach，不顯示 port conflict；細節見下面 Mac app 章節。相關檔案：`apps/omlx-mac/Sources/Server/ServerProcess.swift` 等 6 個 Swift 檔。
+- `Formula/omlx.rb` 的 homepage/HEAD 指向 `https://github.com/jason5545/omlx.git`（xgrammar macOS arm64 post-install patch 已被 upstream 吸收，不需再維護本地版）。
 
-不要用「關掉 MTP」當 workaround。不要留下手動改 site-packages 的最終狀態。
+追 upstream 時，conflict 只要守住上面三塊，其餘一律取 upstream 版本。不要留下手動改 site-packages 的最終狀態。
 
 ## Homebrew 操作
 
@@ -153,15 +149,12 @@ brew install --HEAD --with-grammar jason5545/omlx/omlx
 brew services restart jason5545/omlx/omlx
 ```
 
-如果衝突落在 VLM/MTP 相關檔案，特別檢查：
+如果衝突落在本地保留的三塊功能，特別檢查：
 
-- `omlx/engine_pool.py`
-- `omlx/engine/vlm.py`
-- `omlx/models/vlm.py`
-- `omlx/patches/mlx_lm_mtp/batch_generator.py`
-- `omlx/patches/mlx_vlm_mtp/`
-- `omlx/server.py`
-- `omlx/settings.py`
+- `omlx/server.py`（sub-key policy hooks、`DEFAULT_SUB_KEY_POLICIES`）
+- `omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`
+- `apps/omlx-mac/Sources/Server/ServerProcess.swift`（attach mode）
+- `Formula/omlx.rb`（homepage/head 要維持 jason5545）
 
 ## 最小驗證
 
@@ -175,20 +168,11 @@ brew audit --formula jason5545/omlx/omlx
 /opt/homebrew/opt/omlx/libexec/bin/python -m py_compile \
   omlx/admin/auth.py \
   omlx/api/openai_models.py \
-  omlx/engine/vlm.py \
-  omlx/engine_pool.py \
-  omlx/models/vlm.py \
-  omlx/patches/mlx_lm_mtp/batch_generator.py \
-  omlx/patches/step3p7/__init__.py \
-  omlx/patches/step3p7/step3p7_model.py \
-  omlx/patches/mlx_vlm_mtp/__init__.py \
-  omlx/patches/mlx_vlm_mtp/qwen35_vlm_runtime.py \
   omlx/server.py \
-  omlx/settings.py \
-  omlx/utils/model_loading.py
+  omlx/settings.py
 ```
 
-Homebrew venv 通常沒有 `pytest`。如果沒有安裝，不要說已經跑過 pytest；改說 pytest 不在 venv。
+Homebrew venv 通常沒有 `pytest`。如果沒有安裝，不要說已經跑過 pytest；改說 pytest 不在 venv。要跑測試可用隔離 target：`pip install --target=/tmp/omlx-pytest-target pytest`，再用 venv python 跑 `PYTHONPATH=/tmp/omlx-pytest-target python -m pytest tests/test_admin_api_key.py tests/test_context_window.py tests/test_api_auth.py -q`，不要裝進 venv 的 site-packages。
 
 安裝後確認：
 
@@ -207,12 +191,6 @@ curl -sS http://127.0.0.1:8000/health
 
 ```text
 Request policy active: client=voco source=api-sub-key ... max_context_window<=16384, enable_thinking=False
-```
-
-VLM + MTP 兼容模型的 log 不應再出現：
-
-```text
-forcing LM-only dispatch, vision components ignored
 ```
 
 ## 操作習慣
