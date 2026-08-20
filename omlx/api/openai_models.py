@@ -328,6 +328,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # OpenAI-compatible caller identifier
+    user: Optional[str] = None
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -418,6 +420,8 @@ class CompletionRequest(BaseModel):
     seed: Optional[int] = None
     # Cap reasoning/thinking tokens (parity with /v1/chat/completions)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
+    # OpenAI-compatible caller identifier
+    user: Optional[str] = None
 
     @field_validator("stop", mode="before")
     @classmethod
