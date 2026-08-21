@@ -55,7 +55,29 @@ NB_MODULE(_ext, m) {
           &omlx::qwen35_prefill_kernels::AneLinearModel::output_dim)
       .def_prop_ro(
           "sequence_length",
-          &omlx::qwen35_prefill_kernels::AneLinearModel::sequence_length);
+          &omlx::qwen35_prefill_kernels::AneLinearModel::sequence_length)
+      .def(
+          "warmup",
+          &omlx::qwen35_prefill_kernels::AneLinearModel::warmup,
+          nb::call_guard<nb::gil_scoped_release>());
+  nb::class_<omlx::qwen35_prefill_kernels::AneLinearBankBuilder>(
+      m, "AneLinearBankBuilder")
+      .def(nb::init<int>(), "sequence_length"_a)
+      .def(
+          "add",
+          &omlx::qwen35_prefill_kernels::AneLinearBankBuilder::add,
+          "weight"_a,
+          nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro(
+          "size",
+          &omlx::qwen35_prefill_kernels::AneLinearBankBuilder::size)
+      .def(
+          "compile",
+          &omlx::qwen35_prefill_kernels::AneLinearBankBuilder::compile,
+          "ane_instance"_a,
+          "start"_a,
+          "stop"_a,
+          nb::call_guard<nb::gil_scoped_release>());
   m.def(
       "qwen35_ane_compile_linear",
       static_cast<std::shared_ptr<
@@ -100,6 +122,29 @@ NB_MODULE(_ext, m) {
       "group_size"_a = 128,
       "profile_category"_a = 1,
       "stream"_a = nb::none());
+  m.def("qwen35_ane_cpu_fp16_affine_qmm_t",
+        &omlx::qwen35_prefill_kernels::qwen35_ane_cpu_fp16_affine_qmm_t, "x"_a,
+        "cpu_weight"_a, "gpu_weight"_a, "gpu_scales"_a, "gpu_biases"_a,
+        "ane_model"_a, "bits"_a, "variant"_a = 8, "group_size"_a = 128,
+        "profile_category"_a = 1, "cpu_threads"_a = 0,
+        "cpu_shared_resource"_a = false, "stream"_a = nb::none());
+  m.def(
+      "qwen35_cpu_shared_resource_available",
+      &omlx::qwen35_prefill_kernels::qwen35_cpu_shared_resource_available);
+  m.def(
+      "qwen35_cpu_fp16_affine_qmm_t",
+      &omlx::qwen35_prefill_kernels::qwen35_cpu_fp16_affine_qmm_t,
+      "x"_a,
+      "cpu_weight"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "bits"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "cpu_threads"_a = 0,
+      "cpu_shared_resource"_a = false,
+      "stream"_a = nb::none());
   m.def(
       "qwen35_ane_q4_affine_qmm_t",
       &omlx::qwen35_prefill_kernels::qwen35_ane_q4_affine_qmm_t,
@@ -135,6 +180,18 @@ NB_MODULE(_ext, m) {
       "variant"_a = 8,
       "group_size"_a = 128,
       "stream"_a = nb::none());
+  m.def("qwen35_ane_cpu_fp16_swiglu_t",
+        &omlx::qwen35_prefill_kernels::qwen35_ane_cpu_fp16_swiglu_t, "x"_a,
+        "cpu_weight"_a, "gpu_weight"_a, "gpu_scales"_a, "gpu_biases"_a,
+        "ane_model"_a, "bits"_a, "variant"_a = 8, "group_size"_a = 128,
+        "cpu_threads"_a = 0, "cpu_shared_resource"_a = false,
+        "stream"_a = nb::none());
+  m.def("qwen35_ane_cpu_fp16_q4_swiglu_t",
+        &omlx::qwen35_prefill_kernels::qwen35_ane_cpu_fp16_q4_swiglu_t, "x"_a,
+        "cpu_weight"_a, "gpu_weight"_a, "gpu_scales"_a, "gpu_biases"_a,
+        "ane_model"_a, "variant"_a = 8, "group_size"_a = 128,
+        "cpu_threads"_a = 0, "cpu_shared_resource"_a = false,
+        "stream"_a = nb::none());
   m.def(
       "qwen35_ane_dual_affine_qmm_t",
       &omlx::qwen35_prefill_kernels::qwen35_ane_dual_affine_qmm_t,
@@ -148,6 +205,39 @@ NB_MODULE(_ext, m) {
       "variant"_a = 8,
       "group_size"_a = 128,
       "profile_category"_a = 1,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_cpu_fp16_affine_qmm_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_cpu_fp16_affine_qmm_t,
+      "x"_a,
+      "cpu_weight"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "bits"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "profile_category"_a = 1,
+      "cpu_threads"_a = 0,
+      "cpu_shared_resource"_a = false,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_cpu_fp16_swiglu_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_cpu_fp16_swiglu_t,
+      "x"_a,
+      "cpu_weight"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "bits"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "cpu_threads"_a = 0,
+      "cpu_shared_resource"_a = false,
       "stream"_a = nb::none());
   m.def(
       "qwen35_ane_dual_q4_swiglu_t",
@@ -173,6 +263,21 @@ NB_MODULE(_ext, m) {
       "bits"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_ane_dual_cpu_fp16_q4_swiglu_t",
+      &omlx::qwen35_prefill_kernels::qwen35_ane_dual_cpu_fp16_q4_swiglu_t,
+      "x"_a,
+      "cpu_weight"_a,
+      "gpu_weight"_a,
+      "gpu_scales"_a,
+      "gpu_biases"_a,
+      "ane_model0"_a,
+      "ane_model1"_a,
+      "variant"_a = 8,
+      "group_size"_a = 128,
+      "cpu_threads"_a = 0,
+      "cpu_shared_resource"_a = false,
       "stream"_a = nb::none());
   m.def(
       "qwen35_ane_q4_swiglu_down_t",

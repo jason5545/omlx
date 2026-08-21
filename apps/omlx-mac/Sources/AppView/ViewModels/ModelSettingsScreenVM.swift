@@ -39,6 +39,10 @@ final class ModelSettingsScreenVM {
         case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
         case qwen35AnePrefillDualAne, qwen35AnePrefillGdn
         case qwen35AnePrefillGdnFraction, qwen35AnePrefillGdnMaxLayers
+        case qwen35AnePrefillCpuEnabled, qwen35AnePrefillCpuFraction
+        case qwen35AnePrefillCpuDownFraction
+        case qwen35AnePrefillCpuGdnFraction
+        case qwen35AnePrefillCpuThreads, qwen35AnePrefillCpuSharedResource
         case indexCacheEnabled, indexCacheFreq
         case specprefillEnabled, specprefillDraftModel, specprefillKeepPct, specprefillThreshold
         case dflashEnabled, dflashDraftModel, dflashMaxCtx
@@ -269,11 +273,21 @@ final class ModelSettingsScreenVM {
     var qwen35AnePrefillGdn: Bool = true
     var qwen35AnePrefillGdnFraction: String = "0.5"
     var qwen35AnePrefillGdnMaxLayers: String = "48"
+    var qwen35AnePrefillCpuEnabled: Bool = false
+    var qwen35AnePrefillCpuFraction: String = "0.135"
+    var qwen35AnePrefillCpuDownFraction: String = "0"
+    var qwen35AnePrefillCpuGdnFraction: String = "0"
+    var qwen35AnePrefillCpuThreads: String = "8"
+    var qwen35AnePrefillCpuSharedResource: Bool = true
     var aneTuningID: String?
     var aneTuningIsRunning: Bool = false
     var aneTuningStatus: ANETuningStatusResponse?
-    var aneTuningIsApplying: Bool = false
+    var aneTuningAllowCPU: Bool = true
+    var aneTuningAllowCPUGate: Bool = true
+    var aneTuningAllowCPUDown: Bool = true
     var aneTuningAllowANEGDN: Bool = true
+    var aneTuningAllowCPUGDN: Bool = true
+    var aneTuningAllowCPUSharedResource: Bool = true
 
     // Experimental: IndexCache (DSA-only)
     var indexCacheEnabled: Bool = false
@@ -370,6 +384,11 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillDualAne, .qwen35AnePrefillGdn:
             return true
         case .qwen35AnePrefillGdnFraction, .qwen35AnePrefillGdnMaxLayers:
+            return true
+        case .qwen35AnePrefillCpuEnabled, .qwen35AnePrefillCpuFraction,
+             .qwen35AnePrefillCpuDownFraction, .qwen35AnePrefillCpuGdnFraction:
+            return true
+        case .qwen35AnePrefillCpuThreads, .qwen35AnePrefillCpuSharedResource:
             return true
         case .indexCacheEnabled, .indexCacheFreq:
             return true
@@ -505,6 +524,12 @@ final class ModelSettingsScreenVM {
                 self.qwen35AnePrefillGdn = s?.qwen35AnePrefillGdn ?? true
                 self.qwen35AnePrefillGdnFraction = s?.qwen35AnePrefillGdnFraction.map { Self.formatPct($0) } ?? "0.5"
                 self.qwen35AnePrefillGdnMaxLayers = s?.qwen35AnePrefillGdnMaxLayers.map(String.init) ?? "48"
+                self.qwen35AnePrefillCpuEnabled = s?.qwen35AnePrefillCpuEnabled ?? false
+                self.qwen35AnePrefillCpuFraction = s?.qwen35AnePrefillCpuFraction.map { Self.formatPct($0) } ?? "0.135"
+                self.qwen35AnePrefillCpuDownFraction = s?.qwen35AnePrefillCpuDownFraction.map { Self.formatPct($0) } ?? "0"
+                self.qwen35AnePrefillCpuGdnFraction = s?.qwen35AnePrefillCpuGdnFraction.map { Self.formatPct($0) } ?? "0"
+                self.qwen35AnePrefillCpuThreads = s?.qwen35AnePrefillCpuThreads.map(String.init) ?? "8"
+                self.qwen35AnePrefillCpuSharedResource = s?.qwen35AnePrefillCpuSharedResource ?? true
                 self.indexCacheEnabled = s?.indexCacheFreq != nil
                 self.indexCacheFreq = s?.indexCacheFreq.map(String.init) ?? "4"
                 self.specprefillEnabled = s?.specprefillEnabled ?? false
@@ -645,7 +670,10 @@ final class ModelSettingsScreenVM {
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillFraction:
-            switch QwenAneSettingsValidator.mlpFraction(qwen35AnePrefillFraction) {
+            switch QwenAneSettingsValidator.mlpFraction(
+                qwen35AnePrefillFraction,
+                cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuFraction : "0"
+            ) {
             case .success(let value): patch.qwen35AnePrefillFraction = value
             case .failure(let error): lastError = error.message; return
             }
@@ -657,7 +685,10 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillDualAne: patch.qwen35AnePrefillDualAne = qwen35AnePrefillDualAne
         case .qwen35AnePrefillGdn:     patch.qwen35AnePrefillGdn = qwen35AnePrefillGdn
         case .qwen35AnePrefillGdnFraction:
-            switch QwenAneSettingsValidator.gdnFraction(qwen35AnePrefillGdnFraction) {
+            switch QwenAneSettingsValidator.gdnFraction(
+                qwen35AnePrefillGdnFraction,
+                cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuGdnFraction : "0"
+            ) {
             case .success(let value): patch.qwen35AnePrefillGdnFraction = value
             case .failure(let error): lastError = error.message; return
             }
@@ -666,6 +697,36 @@ final class ModelSettingsScreenVM {
             case .success(let value): patch.qwen35AnePrefillGdnMaxLayers = value
             case .failure(let error): lastError = error.message; return
             }
+        case .qwen35AnePrefillCpuEnabled:
+            patch.qwen35AnePrefillCpuEnabled = qwen35AnePrefillCpuEnabled
+        case .qwen35AnePrefillCpuFraction:
+            switch QwenAneSettingsValidator.cpuFraction(
+                qwen35AnePrefillCpuFraction,
+                mlpFraction: qwen35AnePrefillFraction
+            ) {
+            case .success(let value): patch.qwen35AnePrefillCpuFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
+        case .qwen35AnePrefillCpuDownFraction:
+            switch QwenAneSettingsValidator.cpuDownFraction(qwen35AnePrefillCpuDownFraction) {
+            case .success(let value): patch.qwen35AnePrefillCpuDownFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
+        case .qwen35AnePrefillCpuGdnFraction:
+            switch QwenAneSettingsValidator.cpuGdnFraction(
+                qwen35AnePrefillCpuGdnFraction,
+                gdnFraction: qwen35AnePrefillGdnFraction
+            ) {
+            case .success(let value): patch.qwen35AnePrefillCpuGdnFraction = value
+            case .failure(let error): lastError = error.message; return
+            }
+        case .qwen35AnePrefillCpuThreads:
+            switch QwenAneSettingsValidator.cpuThreads(qwen35AnePrefillCpuThreads) {
+            case .success(let value): patch.qwen35AnePrefillCpuThreads = value
+            case .failure(let error): lastError = error.message; return
+            }
+        case .qwen35AnePrefillCpuSharedResource:
+            patch.qwen35AnePrefillCpuSharedResource = qwen35AnePrefillCpuSharedResource
         case .indexCacheEnabled:
             patch.indexCacheFreq = indexCacheEnabled ? (Int(indexCacheFreq) ?? 4) : 0
         case .indexCacheFreq:
@@ -738,7 +799,15 @@ final class ModelSettingsScreenVM {
                     modelId: modelID,
                     sequenceLength: sequenceLength,
                     repeats: 2,
-                    allowAneGdn: aneTuningAllowANEGDN
+                    allowCpu: aneTuningAllowCPU,
+                    allowCpuGate: aneTuningAllowCPU && aneTuningAllowCPUGate,
+                    allowCpuDown: aneTuningAllowCPU && aneTuningAllowCPUDown,
+                    allowAneGdn: aneTuningAllowANEGDN,
+                    allowCpuGdn: aneTuningAllowCPU
+                        && aneTuningAllowANEGDN
+                        && aneTuningAllowCPUGDN,
+                    allowCpuSharedResource: aneTuningAllowCPU
+                        && aneTuningAllowCPUSharedResource
                 )
             )
             aneTuningID = started.tuningId
@@ -774,39 +843,38 @@ final class ModelSettingsScreenVM {
         }
     }
 
-    func applyANETuningRecommendation(client: OMLXClient) async {
+    /// Stage the best tuner result in the working profile. The user can then
+    /// update the active profile or save it as a new one without detaching the
+    /// model from its current profile via a direct settings write.
+    func applyANETuningRecommendation() {
         guard let recommendation = aneTuningStatus?.recommendation else { return }
-        aneTuningIsApplying = true
-        defer { aneTuningIsApplying = false }
-
-        var patch = ModelSettingsPatch()
-        patch.qwen35AnePrefillEnabled = recommendation.enabled
-        patch.qwen35AnePrefillSequenceLength = recommendation.sequenceLength
-        if recommendation.enabled {
-            patch.qwen35AnePrefillFraction = recommendation.mlpFraction
-            patch.qwen35AnePrefillDualAne = true
-            patch.qwen35AnePrefillGdn = recommendation.gdnEnabled
-            if recommendation.gdnEnabled {
-                patch.qwen35AnePrefillGdnFraction = recommendation.gdnFraction
-            }
+        qwen35AnePrefillEnabled = recommendation.enabled
+        qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
+        if let fraction = recommendation.mlpFraction {
+            qwen35AnePrefillFraction = Self.formatPct(fraction)
         }
-
-        do {
-            _ = try await client.updateModelSettings(id: modelID, patch: patch)
-            qwen35AnePrefillEnabled = recommendation.enabled
-            qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
-            if let fraction = recommendation.mlpFraction {
-                qwen35AnePrefillFraction = Self.formatPct(fraction)
-            }
-            qwen35AnePrefillDualAne = true
-            qwen35AnePrefillGdn = recommendation.gdnEnabled
-            if let fraction = recommendation.gdnFraction {
-                qwen35AnePrefillGdnFraction = Self.formatPct(fraction)
-            }
-            lastError = nil
-        } catch {
-            lastError = error.omlxDescription
+        qwen35AnePrefillGdn = recommendation.gdnEnabled
+        if let fraction = recommendation.gdnFraction {
+            qwen35AnePrefillGdnFraction = Self.formatPct(fraction)
         }
+        qwen35AnePrefillCpuEnabled = recommendation.cpuEnabled ?? false
+        if let fraction = recommendation.cpuFraction {
+            qwen35AnePrefillCpuFraction = Self.formatPct(fraction)
+        }
+        if let fraction = recommendation.cpuDownFraction {
+            qwen35AnePrefillCpuDownFraction = Self.formatPct(fraction)
+        }
+        if let fraction = recommendation.cpuGdnFraction {
+            qwen35AnePrefillCpuGdnFraction = Self.formatPct(fraction)
+        }
+        if let threads = recommendation.cpuThreads {
+            qwen35AnePrefillCpuThreads = String(threads)
+        }
+        if let sharedResource = recommendation.cpuSharedResource {
+            qwen35AnePrefillCpuSharedResource = sharedResource
+        }
+        profileDirty = true
+        lastError = nil
     }
 
     // MARK: - Chat-template kwarg list mutation
@@ -1064,6 +1132,14 @@ final class ModelSettingsScreenVM {
                     putDouble(ProfileSettingsKey.qwen35AnePrefillGdnFraction, qwen35AnePrefillGdnFraction)
                     putInt(ProfileSettingsKey.qwen35AnePrefillGdnMaxLayers, qwen35AnePrefillGdnMaxLayers)
                 }
+                putBool(ProfileSettingsKey.qwen35AnePrefillCpuEnabled, qwen35AnePrefillCpuEnabled)
+                if qwen35AnePrefillCpuEnabled {
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillCpuFraction, qwen35AnePrefillCpuFraction)
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillCpuDownFraction, qwen35AnePrefillCpuDownFraction)
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillCpuGdnFraction, qwen35AnePrefillCpuGdnFraction)
+                    putInt(ProfileSettingsKey.qwen35AnePrefillCpuThreads, qwen35AnePrefillCpuThreads)
+                    putBool(ProfileSettingsKey.qwen35AnePrefillCpuSharedResource, qwen35AnePrefillCpuSharedResource)
+                }
             }
             if indexCacheEnabled, let n = Int(indexCacheFreq), n >= 2 {
                 out[ProfileSettingsKey.indexCacheFreq] = AnyCodable(n)
@@ -1239,6 +1315,7 @@ final class ModelSettingsScreenVM {
     func saveWorkingAs(scope: ProfileScope, name: String, client: OMLXClient) async {
         let cleanName = name.trimmingCharacters(in: .whitespaces)
         guard !cleanName.isEmpty, scope != .preset else { return }
+        guard validateQwenAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1285,6 +1362,7 @@ final class ModelSettingsScreenVM {
     /// ProfileDetailCard preview's "Update with working" button.
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
         guard scope != .preset else { return }
+        guard validateQwenAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1319,6 +1397,38 @@ final class ModelSettingsScreenVM {
             await load(modelID: modelID, client: client)
         } catch {
             self.lastError = error.omlxDescription
+        }
+    }
+
+    private func validateQwenAneWorkingSettings() -> Bool {
+        guard qwen35AnePrefillEnabled else { return true }
+
+        switch QwenAneSettingsValidator.promptBlock(qwen35AnePrefillSequenceLength) {
+        case .success: break
+        case .failure(let error): lastError = error.message; return false
+        }
+        switch QwenAneSettingsValidator.mlpFraction(
+            qwen35AnePrefillFraction,
+            cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuFraction : "0"
+        ) {
+        case .success: break
+        case .failure(let error): lastError = error.message; return false
+        }
+        switch QwenAneSettingsValidator.mlpLayers(qwen35AnePrefillMaxLayers) {
+        case .success: break
+        case .failure(let error): lastError = error.message; return false
+        }
+        guard qwen35AnePrefillGdn else { return true }
+        switch QwenAneSettingsValidator.gdnFraction(
+            qwen35AnePrefillGdnFraction,
+            cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuGdnFraction : "0"
+        ) {
+        case .success: break
+        case .failure(let error): lastError = error.message; return false
+        }
+        switch QwenAneSettingsValidator.gdnLayers(qwen35AnePrefillGdnMaxLayers) {
+        case .success: return true
+        case .failure(let error): lastError = error.message; return false
         }
     }
 
@@ -1431,12 +1541,84 @@ enum QwenAneSettingsValidator {
         }
     }
 
-    static func mlpFraction(_ raw: String) -> Result<Double, SamplingValidationError> {
-        fraction(raw, label: "MLP ANE fraction", range: 0.05...0.90)
+    static func mlpFraction(
+        _ raw: String, cpuFraction: String
+    ) -> Result<Double, SamplingValidationError> {
+        switch fraction(raw, label: "MLP ANE fraction", range: 0.05...0.90) {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            let cpu: Double
+            switch fraction(cpuFraction, label: "CPU MLP fraction", range: 0...0.25) {
+            case .failure(let error): return .failure(error)
+            case .success(let parsed): cpu = parsed
+            }
+            guard value + cpu < 1 else {
+                return .failure(.init(message: "MLP ANE and CPU fractions must total less than 1.0."))
+            }
+            return .success(value)
+        }
     }
 
-    static func gdnFraction(_ raw: String) -> Result<Double, SamplingValidationError> {
-        fraction(raw, label: "GDN ANE fraction", range: 0.05...0.90)
+    static func gdnFraction(
+        _ raw: String, cpuFraction: String = "0"
+    ) -> Result<Double, SamplingValidationError> {
+        switch fraction(raw, label: "GDN ANE fraction", range: 0.05...0.90) {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            switch fraction(cpuFraction, label: "CPU GDN fraction", range: 0...0.50) {
+            case .failure(let error): return .failure(error)
+            case .success(let cpu):
+                guard value + cpu < 1 else {
+                    return .failure(.init(message: "GDN ANE and CPU fractions must total less than 1.0."))
+                }
+                return .success(value)
+            }
+        }
+    }
+
+    static func cpuFraction(
+        _ raw: String, mlpFraction: String
+    ) -> Result<Double, SamplingValidationError> {
+        switch fraction(raw, label: "CPU MLP fraction", range: 0...0.25) {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            let ane: Double
+            switch fraction(mlpFraction, label: "MLP ANE fraction", range: 0.05...0.90) {
+            case .failure(let error): return .failure(error)
+            case .success(let parsed): ane = parsed
+            }
+            guard value + ane < 1 else {
+                return .failure(.init(message: "MLP ANE and CPU fractions must total less than 1.0."))
+            }
+            return .success(value)
+        }
+    }
+
+    static func cpuDownFraction(_ raw: String) -> Result<Double, SamplingValidationError> {
+        fraction(raw, label: "CPU MLP down fraction", range: 0...0.50)
+    }
+
+    static func cpuGdnFraction(
+        _ raw: String, gdnFraction: String
+    ) -> Result<Double, SamplingValidationError> {
+        switch fraction(raw, label: "CPU GDN fraction", range: 0...0.50) {
+        case .failure(let error): return .failure(error)
+        case .success(let value):
+            switch fraction(gdnFraction, label: "GDN ANE fraction", range: 0.05...0.90) {
+            case .failure(let error): return .failure(error)
+            case .success(let ane):
+                guard value + ane < 1 else {
+                    return .failure(.init(message: "GDN ANE and CPU fractions must total less than 1.0."))
+                }
+                return .success(value)
+            }
+        }
+    }
+
+    static func cpuThreads(_ raw: String) -> Result<Int, SamplingValidationError> {
+        integer(raw, label: "CPU worker count") { (0...64).contains($0)
+            ? nil : "CPU worker count must be between 0 and 64."
+        }
     }
 
     static func mlpLayers(_ raw: String) -> Result<Int, SamplingValidationError> {
