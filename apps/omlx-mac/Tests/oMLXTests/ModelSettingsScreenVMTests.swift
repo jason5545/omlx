@@ -89,6 +89,13 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(try? QwenAneSettingsValidator.promptBlock("2112").get(), 2112)
         XCTAssertThrowsError(try QwenAneSettingsValidator.promptBlock("2100").get())
         XCTAssertEqual(
+            try? QwenAneSettingsValidator.tailPadding("1357", sequenceLength: "2048").get(),
+            1357
+        )
+        XCTAssertThrowsError(
+            try QwenAneSettingsValidator.tailPadding("2048", sequenceLength: "2048").get()
+        )
+        XCTAssertEqual(
             try? QwenAneSettingsValidator.mlpFraction("0.467", cpuFraction: "0.137").get(),
             0.467
         )
@@ -174,11 +181,13 @@ final class ModelSettingsScreenVMTests: XCTestCase {
                 cpuFraction: nil,
                 cpuDownFraction: nil,
                 cpuGdnFraction: nil,
+                fusedDown: true,
                 cpuThreads: nil,
                 cpuSharedResource: nil,
                 processingTps: 123.4,
                 speedupPercent: 12.3,
-                sequenceLength: 2112
+                sequenceLength: 2112,
+                tailPaddingMinTokens: 1400
             ),
             error: nil,
             terminationReason: nil
@@ -193,7 +202,9 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(vm.profileDirty)
         XCTAssertTrue(vm.qwen35AnePrefillEnabled)
         XCTAssertEqual(vm.qwen35AnePrefillSequenceLength, "2112")
+        XCTAssertEqual(vm.qwen35AnePrefillTailPaddingMinTokens, "1400")
         XCTAssertEqual(vm.qwen35AnePrefillFraction, "0.467")
+        XCTAssertTrue(vm.qwen35AnePrefillFusedDown)
         XCTAssertFalse(vm.qwen35AnePrefillDualAne)
         XCTAssertTrue(vm.qwen35AnePrefillGdn)
         XCTAssertEqual(vm.qwen35AnePrefillGdnFraction, "0.527")

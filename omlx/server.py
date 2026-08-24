@@ -3549,6 +3549,13 @@ async def create_completion(
             )
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
+            # Widen the repetition-penalty look-back window when the client
+            # asks for it (mlx-lm default window is 20 tokens).
+            repetition_context_size = getattr(
+                request, "repetition_context_size", None
+            )
+            if repetition_context_size is not None:
+                gen_kwargs["repetition_context_size"] = repetition_context_size
 
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
@@ -3934,6 +3941,14 @@ async def create_chat_completion(
             "xtc_probability": xtc_probability,
             "xtc_threshold": xtc_threshold,
         }
+
+        # Widen the repetition-penalty look-back window when the client
+        # asks for it (mlx-lm default window is 20 tokens).
+        repetition_context_size = getattr(
+            request, "repetition_context_size", None
+        )
+        if repetition_context_size is not None:
+            chat_kwargs["repetition_context_size"] = repetition_context_size
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -4652,6 +4667,13 @@ async def stream_completion(
     )
     if thinking_budget is not None:
         gen_kwargs["thinking_budget"] = thinking_budget
+    # Widen the repetition-penalty look-back window when the client
+    # asks for it (mlx-lm default window is 20 tokens).
+    repetition_context_size = getattr(
+        request, "repetition_context_size", None
+    )
+    if repetition_context_size is not None:
+        gen_kwargs["repetition_context_size"] = repetition_context_size
     try:
         async for output in engine.stream_generate(
             prompt=prompt,
@@ -5857,6 +5879,14 @@ async def create_anthropic_message(
             "xtc_threshold": xtc_threshold,
         }
 
+        # Widen the repetition-penalty look-back window when the client
+        # asks for it (mlx-lm default window is 20 tokens).
+        repetition_context_size = getattr(
+            request, "repetition_context_size", None
+        )
+        if repetition_context_size is not None:
+            chat_kwargs["repetition_context_size"] = repetition_context_size
+
         # Add thinking budget if applicable
         thinking_budget = _resolve_thinking_budget(
             request,
@@ -6238,9 +6268,17 @@ async def create_response(
 
         resolved_model = _serving_model_id(lease, request.model)
 
+        # Images in function_call_output lists survive only for engines that
+        # can extract them; text engines get a placeholder instead so base64
+        # payloads never reach the prompt (#2989).
+        preserve_tool_images = isinstance(engine, VLMBatchedEngine) or getattr(
+            engine, "supports_multimodal_fallback", False
+        )
+
         current_input_messages = convert_responses_input_to_messages(
             request.input,
             consolidate_system_messages=False,
+            preserve_images=preserve_tool_images,
         )
 
         # Build previous context from previous_response_id
@@ -6256,6 +6294,7 @@ async def create_response(
             request.instructions,
             previous_messages,
             consolidate_system_messages=False,
+            preserve_images=preserve_tool_images,
         )
 
         # Convert tools: flat → nested
@@ -6429,6 +6468,14 @@ async def create_response(
             "xtc_probability": xtc_probability,
             "xtc_threshold": xtc_threshold,
         }
+
+        # Widen the repetition-penalty look-back window when the client
+        # asks for it (mlx-lm default window is 20 tokens).
+        repetition_context_size = getattr(
+            request, "repetition_context_size", None
+        )
+        if repetition_context_size is not None:
+            chat_kwargs["repetition_context_size"] = repetition_context_size
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:

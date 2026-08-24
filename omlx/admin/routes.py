@@ -137,7 +137,9 @@ class ModelSettingsRequest(BaseModel):
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
     qwen35_ane_prefill_enabled: bool | None = None
     qwen35_ane_prefill_sequence_length: int | None = None
+    qwen35_ane_prefill_tail_padding_min_tokens: int | None = None
     qwen35_ane_prefill_fraction: float | None = None
+    qwen35_ane_prefill_fused_down: bool | None = None
     qwen35_ane_prefill_max_layers: int | None = None
     qwen35_ane_prefill_dual_ane: bool | None = None
     qwen35_ane_prefill_gdn: bool | None = None
@@ -2330,6 +2332,25 @@ async def update_model_settings(
                 detail="ANE prompt block must be a multiple of 64 and at least 1024.",
             )
         current_settings.qwen35_ane_prefill_sequence_length = int(value)
+        if (
+            current_settings.qwen35_ane_prefill_tail_padding_min_tokens
+            >= int(value)
+        ):
+            # A crossover is calibrated for one fixed program width. Changing
+            # that width invalidates it; disable padding until the next tune.
+            current_settings.qwen35_ane_prefill_tail_padding_min_tokens = 0
+    if "qwen35_ane_prefill_tail_padding_min_tokens" in sent:
+        value = request.qwen35_ane_prefill_tail_padding_min_tokens
+        sequence_length = int(current_settings.qwen35_ane_prefill_sequence_length)
+        if value is None or not 0 <= value < sequence_length:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "ANE tail padding threshold must be zero or less than the "
+                    "ANE prompt block."
+                ),
+            )
+        current_settings.qwen35_ane_prefill_tail_padding_min_tokens = int(value)
     if "qwen35_ane_prefill_fraction" in sent:
         value = request.qwen35_ane_prefill_fraction
         if value is None or not 0.05 <= value <= 0.90:
@@ -2371,6 +2392,10 @@ async def update_model_settings(
         current_settings.qwen35_ane_prefill_cpu_enabled = bool(
             request.qwen35_ane_prefill_cpu_enabled
         )
+    if "qwen35_ane_prefill_fused_down" in sent:
+        current_settings.qwen35_ane_prefill_fused_down = bool(
+            request.qwen35_ane_prefill_fused_down
+        )
     if "qwen35_ane_prefill_cpu_fraction" in sent:
         value = request.qwen35_ane_prefill_cpu_fraction
         if value is None or not 0.0 <= value <= 0.25:
@@ -2408,14 +2433,33 @@ async def update_model_settings(
             request.qwen35_ane_prefill_cpu_shared_resource
         )
     if (
+        current_settings.qwen35_ane_prefill_fused_down
+        and current_settings.qwen35_ane_prefill_fraction > 0.50
+    ):
+        # The fused loader reuses the MLP fraction for the down projection and
+        # rejects anything above 0.50 at enable time. Without this check the
+        # save succeeds and the next load silently disables ANE prefill.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Fused MLP/down offload needs an MLP ANE fraction of 0.50 or "
+                "less."
+            ),
+        )
+    if (
         current_settings.qwen35_ane_prefill_cpu_enabled
         and current_settings.qwen35_ane_prefill_fraction
+        * (2 if current_settings.qwen35_ane_prefill_fused_down else 1)
         + current_settings.qwen35_ane_prefill_cpu_fraction
         >= 1.0
     ):
         raise HTTPException(
             status_code=400,
-            detail="MLP ANE and CPU fractions must total less than 1.0.",
+            detail=(
+                "Two per-ANE MLP shares and the CPU share must total less than 1.0."
+                if current_settings.qwen35_ane_prefill_fused_down
+                else "MLP ANE and CPU fractions must total less than 1.0."
+            ),
         )
     if (
         current_settings.qwen35_ane_prefill_cpu_enabled

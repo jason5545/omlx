@@ -29,6 +29,18 @@ def test_ane_compile_bindings_release_the_python_gil():
         assert guard in block
 
 
+def test_dual_ane_ticket_acquisition_rolls_back_the_first_ticket():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+    ).read_text(encoding="utf-8")
+    helper = source.split("static AneTicketPair begin_ane_ticket_pair(", 1)[1]
+    helper = helper.split("bool qwen35_ane_available()", 1)[0]
+
+    assert "first->cancel_ticket(first_ticket);" in helper
+    assert source.count("begin_ane_ticket_pair(") == 3
+
+
 @pytest.fixture(autouse=True)
 def _restore_lm_gdn_backend():
     import omlx.patches.qwen35_q4_mlp as q4_patch
@@ -355,6 +367,56 @@ def test_mlp_wide_call_tiles_full_blocks_and_keeps_gpu_tail(monkeypatch):
     assert result[:, 2048:].tolist()[0][0][0] == 30
 
 
+def test_mlp_profitable_tail_is_padded_and_sliced(monkeypatch):
+    calls = []
+
+    def exact(_mlp, block, _target_verify=False):
+        calls.append((int(block.shape[-2]), float(mx.sum(block).item())))
+        return mx.full(block.shape, 7, dtype=block.dtype)
+
+    monkeypatch.setattr(ane_patch, "_backend_exact", exact)
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
+            2048, 0.53, 8, tail_padding_min_tokens=1358
+        )
+    )
+    x = mx.ones((1, 4095, 8), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    assert result is not None
+    mx.eval(result)
+
+    assert result.shape == (1, 4095, 8)
+    assert calls == [(2048, 16384.0), (2048, 16376.0)]
+    assert bool(mx.all(result == 7))
+
+
+def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
+    seen = []
+
+    def exact(_mlp, block, _target_verify=False):
+        seen.append(block)
+        return block + 2
+
+    monkeypatch.setattr(ane_patch, "_backend_exact", exact)
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
+            2048, 0.53, 8, tail_padding_min_tokens=1358
+        )
+    )
+    x = mx.ones((1, 1400, 8), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    assert result is not None
+    mx.eval(result, *seen)
+
+    assert result.shape == x.shape
+    assert seen[0].shape == (1, 2048, 8)
+    assert bool(mx.all(seen[0][:, :1400] == 1))
+    assert bool(mx.all(seen[0][:, 1400:] == 0))
+    assert bool(mx.all(result == 3))
+
+
 def test_low_fraction_wide_mlp_still_dispatches_complete_tile(monkeypatch):
     calls = []
 
@@ -425,6 +487,33 @@ def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
     ]
     assert [part[0, 0, 0].item() for part in result] == [1, 2, 3, 4]
     assert [part[0, -1, 0].item() for part in result] == [10, 20, 30, 40]
+
+
+def test_gdn_profitable_tail_is_padded_before_recurrence(monkeypatch):
+    calls = []
+
+    def exact(_gdn, block, _target_verify=False):
+        calls.append((int(block.shape[-2]), float(mx.sum(block).item())))
+        return tuple(
+            mx.full((1, block.shape[-2], 1), value, dtype=block.dtype)
+            for value in (1, 2, 3, 4)
+        )
+
+    monkeypatch.setattr(ane_patch, "_gdn_backend_exact", exact)
+    gdn = SimpleNamespace(
+        _omlx_ane_gdn_config=ane_patch._AneGDNConfig(
+            2048, 0.50, 8, tail_padding_min_tokens=1358
+        )
+    )
+    x = mx.ones((1, 4095, 8), dtype=mx.float16)
+
+    result = ane_patch._gdn_backend(gdn, x)
+    assert result is not None
+    mx.eval(*result)
+
+    assert [part.shape for part in result] == [(1, 4095, 1)] * 4
+    assert calls == [(2048, 16384.0), (2048, 16376.0)]
+    assert [part[0, -1, 0].item() for part in result] == [1, 2, 3, 4]
 
 
 def test_install_dispatch_adds_gdn_projection_compatibility_hook(monkeypatch):
@@ -563,13 +652,11 @@ def test_cpu_shared_resource_scheduler_is_capability_guarded(
 
 
 def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     mlp = _MLP()
     linear = mlp.down_proj
     linear.scales = linear.scales.astype(mx.float16)
     linear.biases = linear.biases.astype(mx.float16)
-    monkeypatch.setattr(
-        fast, "has_symbol", lambda name: name == "qwen35_cpu_fp16_affine_qmm_t"
-    )
     state = ane_patch._prepare_cpu_linear(linear, 0.5)
 
     assert state is not None
@@ -1879,6 +1966,70 @@ def test_backend_uses_both_ane_models_for_one_prompt(monkeypatch):
     )
 
 
+def test_fused_down_backend_runs_compatible_cpu_hidden_branch(monkeypatch):
+    output = mx.zeros((1, 1, 8), dtype=mx.float16)
+    captured = {}
+
+    def fused(*args):
+        captured["args"] = args
+        return output
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t", fused
+    )
+    model0, model1 = object(), object()
+    state = ane_patch._FusedDownMLPState(
+        model=model0,
+        model1=model1,
+        gate_up_weight=mx.zeros((4, 1), dtype=mx.uint32),
+        gate_up_scales=mx.zeros((4, 1), dtype=mx.float16),
+        gate_up_biases=mx.zeros((4, 1), dtype=mx.float16),
+        down_weight=mx.zeros((8, 1), dtype=mx.uint32),
+        down_scales=mx.zeros((8, 1), dtype=mx.float16),
+        down_biases=mx.zeros((8, 1), dtype=mx.float16),
+        cpu_gate_up_weight=mx.zeros((4, 8), dtype=mx.float16),
+        cpu_down_weight=mx.zeros((8, 2), dtype=mx.float16),
+    )
+    config = ane_patch._AnePrefillConfig(
+        1,
+        0.5,
+        8,
+        dual_ane=True,
+        cpu_fraction=0.14,
+        cpu_threads=12,
+        cpu_shared_resource=True,
+        ane_down_fraction=0.19,
+        fused_down=True,
+    )
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=config,
+        _omlx_ane_fused_down_state=state,
+    )
+    x = mx.zeros((1, 1, 8), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result)
+
+    assert result is output
+    assert captured["args"] == (
+        x,
+        state.cpu_gate_up_weight,
+        state.cpu_down_weight,
+        state.gate_up_weight,
+        state.gate_up_scales,
+        state.gate_up_biases,
+        state.down_weight,
+        state.down_scales,
+        state.down_biases,
+        model0,
+        model1,
+        8,
+        128,
+        12,
+        True,
+    )
+
+
 @pytest.mark.parametrize(
     ("bits", "expected_kernel"),
     [(4, "q4"), (5, "generic"), (6, "generic"), (8, "generic")],
@@ -2126,30 +2277,25 @@ def test_enable_env_kill_switch_wins(monkeypatch):
     assert installed == []
 
 
-# --- ANE prefill observability (feat/ane-prefill-observability) ---
-
-
 def test_prefill_status_reports_configured_layers():
-    """qwen35_ane_prefill_status surfaces the counters enable_ attaches."""
     model = SimpleNamespace(
         _omlx_ane_mlp_prefill_count=12,
         _omlx_ane_gdn_prefill_count=4,
         _omlx_ane_dual_prefill_count=8,
         _omlx_ane_resident_program_count=24,
     )
-    status = ane_patch.qwen35_ane_prefill_status(model)
-    assert status == {
+    assert ane_patch.qwen35_ane_prefill_status(model) == {
         "attempted": True,
         "configured": True,
         "mlp_layers": 12,
         "gdn_layers": 4,
         "dual_ane_layers": 8,
         "resident_programs": 24,
+        "tail_padding_min_tokens": 0,
     }
 
 
 def test_prefill_status_flags_attempted_but_empty():
-    """A model that ran enable_ but compiled nothing reports the no-op, not silence."""
     model = SimpleNamespace(
         _omlx_ane_mlp_prefill_count=0,
         _omlx_ane_gdn_prefill_count=0,
@@ -2162,7 +2308,6 @@ def test_prefill_status_flags_attempted_but_empty():
 
 
 def test_prefill_status_safe_on_untouched_model():
-    """Any model that never attempted ANE prefill is reported cleanly."""
     status = ane_patch.qwen35_ane_prefill_status(SimpleNamespace())
     assert status["attempted"] is False
     assert status["configured"] is False
@@ -2170,39 +2315,25 @@ def test_prefill_status_safe_on_untouched_model():
 
 
 def test_enable_warns_when_no_eligible_layers(monkeypatch, caplog):
-    """The dominant silent no-op (ANE requested, no eligible MLP) now warns."""
-    from omlx.custom_kernels.qwen35_prefill import fast
-
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
-    # force the banked path to decline so the plain loop reports the empty result
-    monkeypatch.setattr(ane_patch, "_enable_dual_procedure_banks", lambda *a, **k: None)
+    monkeypatch.setattr(
+        ane_patch, "_enable_dual_procedure_banks", lambda *args, **kwargs: None
+    )
     monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
 
-    model = SimpleNamespace(modules=lambda: [])  # no dense MLP modules at all
-
+    model = SimpleNamespace(modules=lambda: [])
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         count = ane_patch.enable_qwen35_ane_prefill(model)
 
     assert count == 0
     assert "no eligible MLP layers found" in caplog.text
-    # counters are attached even on the empty path, so status is never silent
     assert ane_patch.qwen35_ane_prefill_status(model)["attempted"] is True
 
 
-# --- follow-up fixes after the CPU sharing merge (#2892) ---
-
-
 def test_bank_prepare_keeps_packed_q6_suffix():
-    """The packed q6 b/a suffix must survive bank preparation intact.
-
-    A late unconditional slice reassignment used to clobber the packed
-    weight while keeping b_outputs/a_outputs, which made the runtime slice
-    b/a beyond the combined width and latch q6 GDN off at first prefill.
-    """
     gdn = _make_affine_gdn(6, 128)
     config = ane_patch._AneGDNConfig(2048, 0.5, 8, True)
-
     packed = ane_patch._pack_affine_gdn_suffix(
         gdn.in_proj_qkv, gdn.in_proj_b, gdn.in_proj_a, 0, (6, 128)
     )
@@ -2211,7 +2342,7 @@ def test_bank_prepare_keeps_packed_q6_suffix():
 
     prepared = ane_patch._prepare_gdn_for_bank(gdn, config)
     assert prepared is not None
-    state, dense0, dense1 = prepared
+    state, _dense0, dense1 = prepared
     assert (state.b_outputs, state.a_outputs) == (b_outputs, a_outputs)
     assert state.weight.shape == expected_weight.shape
     assert bool(mx.array_equal(state.weight, expected_weight))
@@ -2221,7 +2352,6 @@ def test_bank_prepare_keeps_packed_q6_suffix():
 
 
 def test_enable_survives_warmup_failure(monkeypatch, caplog):
-    """A procedure whose warmup throws must not abort the whole ANE setup."""
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
@@ -2234,12 +2364,14 @@ def test_enable_survives_warmup_failure(monkeypatch, caplog):
         def warmup(self):
             raise RuntimeError("ANE evaluation failed")
 
-    def compile_bank(weights, sequence_length, ane_instance):
-        return [_FailingModel() for _ in weights]
-
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear_bank",
+        lambda weights, sequence_length, ane_instance: [
+            _FailingModel() for _ in weights
+        ],
+    )
     model = _Model(2)
-
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         count = ane_patch.enable_qwen35_ane_prefill(
             model,
@@ -2254,7 +2386,6 @@ def test_enable_survives_warmup_failure(monkeypatch, caplog):
 
 
 def test_prepare_cpu_linear_needs_the_native_symbol(monkeypatch):
-    """Without the CPU qmm symbol the down split stays a clean no-op."""
     linear = nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=4)
     linear.scales = linear.scales.astype(mx.float16)
     linear.biases = linear.biases.astype(mx.float16)
@@ -2349,6 +2480,39 @@ def test_ane_prefill_transient_bytes_zero_without_ane():
     assert ane_patch.ane_prefill_transient_bytes(SimpleNamespace()) == 0
     plain = SimpleNamespace(modules=lambda: [SimpleNamespace()])
     assert ane_patch.ane_prefill_transient_bytes(plain) == 0
+
+
+def test_ane_prefill_transient_bytes_prices_fused_and_down_states():
+    """Fused SwiGLU/down banks and ANE down slices hold IOSurfaces too."""
+    seq = 2048
+
+    def _ane_model(input_dim, output_dim):
+        return SimpleNamespace(
+            input_dim=input_dim, output_dim=output_dim, sequence_length=seq
+        )
+
+    fused = SimpleNamespace(
+        _omlx_ane_fused_down_state=SimpleNamespace(
+            model=_ane_model(5120, 5120), model1=_ane_model(5120, 5120)
+        )
+    )
+    down = SimpleNamespace(
+        _omlx_ane_prefill_state=SimpleNamespace(
+            model=_ane_model(5120, 4608),
+            model1=None,
+            down_ane=SimpleNamespace(
+                model=_ane_model(4608, 5120), model1=_ane_model(4608, 5120)
+            ),
+        )
+    )
+    model = SimpleNamespace(modules=lambda: [fused, down])
+
+    expected = (
+        2 * (5120 + 5120) * seq * 2
+        + (5120 + 4608) * seq * 2
+        + 2 * (4608 + 5120) * seq * 2
+    )
+    assert ane_patch.ane_prefill_transient_bytes(model) == expected
 
 
 # --- incremental bank builder staging (issue #2781) ---
@@ -2486,3 +2650,144 @@ def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
     assert not getattr(model.layers[2], "_omlx_ane_prefill_failed", False)
     assert sorted(warm_calls) == [0, 0, 2, 2]
     assert "disabling ANE" in caplog.text
+
+
+# --- fused bank streaming + CPU warm helper (post-#2935 follow-up) ---
+
+
+class _RecorderFusedBankBuilder:
+    """Stands in for the native AneFusedBankBuilder."""
+
+    def __init__(self):
+        self.added = []
+        self.compiled_spans = []
+
+    def add(self, gate, up, down):
+        self.added.append((gate, up, down))
+
+    @property
+    def size(self):
+        return len(self.added)
+
+    def compile(self, ane_instance, start, stop):
+        self.compiled_spans.append((ane_instance, start, stop))
+        return [object() for _ in range(stop - start)]
+
+
+def _fused_bank_state():
+    return ane_patch._FusedDownMLPState(
+        model=None,
+        model1=None,
+        gate_up_weight=mx.zeros((4, 1), dtype=mx.uint32),
+        gate_up_scales=mx.zeros((4, 1), dtype=mx.float16),
+        gate_up_biases=mx.zeros((4, 1), dtype=mx.float16),
+        down_weight=mx.zeros((8, 1), dtype=mx.uint32),
+        down_scales=mx.zeros((8, 1), dtype=mx.float16),
+        down_biases=mx.zeros((8, 1), dtype=mx.float16),
+    )
+
+
+def test_fused_bank_staging_streams_through_builder(monkeypatch):
+    """Fused enable stages one gate/up/down triple at a time (issue #2781)."""
+    builders = []
+
+    def _make_builder(sequence_length):
+        assert sequence_length == 2048
+        builder = _RecorderFusedBankBuilder()
+        builders.append(builder)
+        return builder
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_fused_bank_builder", _make_builder, raising=False
+    )
+    monkeypatch.setattr(
+        ane_patch,
+        "_prepare_fused_down_for_bank",
+        lambda module, config: (
+            _fused_bank_state(),
+            tuple(mx.zeros((2, 2)) for _ in range(6)),
+        ),
+    )
+    monkeypatch.setattr(ane_patch, "_warm_ane_models", lambda models: None)
+
+    config = ane_patch._AnePrefillConfig(
+        2048, 0.3, 8, dual_ane=True, fused_down=True
+    )
+    model = SimpleNamespace()
+    modules = [SimpleNamespace() for _ in range(3)]
+
+    result = ane_patch._enable_fused_down_banks(model, modules, config)
+
+    assert result == (3, 2)
+    assert len(builders) == 2
+    assert [len(builder.added) for builder in builders] == [3, 3]
+    assert builders[0].compiled_spans == [(1, 0, 3)]
+    assert builders[1].compiled_spans == [(2, 0, 3)]
+    for module in modules:
+        assert module._omlx_ane_fused_down_state.model is not None
+        assert module._omlx_ane_fused_down_state.model1 is not None
+    assert model._omlx_ane_down_prefill_count == 3
+
+
+def test_fused_bank_staging_falls_back_without_builder(monkeypatch):
+    """Old extensions without the fused builder keep the one-shot path."""
+    monkeypatch.delattr(fast, "qwen35_ane_fused_bank_builder", raising=False)
+    compiled = []
+
+    def _compile_bank(gates, ups, downs, sequence_length, ane_instance):
+        compiled.append((len(gates), sequence_length, ane_instance))
+        return [object() for _ in gates]
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_compile_swiglu_down_bank", _compile_bank
+    )
+    monkeypatch.setattr(
+        ane_patch,
+        "_prepare_fused_down_for_bank",
+        lambda module, config: (
+            _fused_bank_state(),
+            tuple(mx.zeros((2, 2)) for _ in range(6)),
+        ),
+    )
+    monkeypatch.setattr(ane_patch, "_warm_ane_models", lambda models: None)
+
+    config = ane_patch._AnePrefillConfig(
+        2048, 0.3, 8, dual_ane=True, fused_down=True
+    )
+    model = SimpleNamespace()
+    modules = [SimpleNamespace() for _ in range(2)]
+
+    result = ane_patch._enable_fused_down_banks(model, modules, config)
+
+    assert result == (2, 2)
+    assert compiled == [(2, 2048, 1), (2, 2048, 2)]
+    for module in modules:
+        assert module._omlx_ane_fused_down_state.model is not None
+
+
+def test_warm_cpu_sharing_path_dispatches_mlp_and_gdn(monkeypatch):
+    """The shared helper warms MLP and GDN modules with exact-shape zeros."""
+    calls = []
+
+    def _mlp_backend(module, x):
+        calls.append(("mlp", x.shape))
+        return mx.zeros((1,))
+
+    def _gdn_backend(module, x):
+        calls.append(("gdn", x.shape))
+        return (mx.zeros((1,)),)
+
+    monkeypatch.setattr(ane_patch, "_backend", _mlp_backend)
+    monkeypatch.setattr(ane_patch, "_gdn_backend", _gdn_backend)
+
+    linear = SimpleNamespace(
+        weight=mx.zeros((4, 4), dtype=mx.uint32),
+        bits=4,
+        scales=mx.zeros((1,), dtype=mx.float16),
+    )
+    mlp = SimpleNamespace(gate_proj=linear)
+    gdn = SimpleNamespace(in_proj_qkv=linear)
+
+    ane_patch._warm_cpu_sharing_path(64, [mlp], [gdn])
+
+    assert calls == [("mlp", (1, 64, 32)), ("gdn", (1, 64, 32))]

@@ -269,7 +269,8 @@ NSString *fp16_linear_mil(int input_dim, int output_dim, int sequence_length) {
 }
 
 NSString *fp16_swiglu_down_mil(int input_dim, int hidden_dim, int output_dim,
-                               int sequence_length) {
+                               int sequence_length, uint64_t gate_offset,
+                               uint64_t up_offset, uint64_t down_offset) {
   return [NSString
       stringWithFormat:
           @"program(1.3)\n"
@@ -280,13 +281,13 @@ NSString *fp16_swiglu_down_mil(int input_dim, int hidden_dim, int output_dim,
            "  func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n"
            "    tensor<fp16, [%d, %d, 1, 1]> gw = const()[name=string(\"gw\"), "
            "val=tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path=string("
-           "\"@model_path/weights/gate.bin\"), offset=uint64(64)))];\n"
+           "\"@model_path/weights/weight.bin\"), offset=uint64(%llu)))];\n"
            "    tensor<fp16, [%d, %d, 1, 1]> uw = const()[name=string(\"uw\"), "
            "val=tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path=string("
-           "\"@model_path/weights/up.bin\"), offset=uint64(64)))];\n"
+           "\"@model_path/weights/weight.bin\"), offset=uint64(%llu)))];\n"
            "    tensor<fp16, [%d, %d, 1, 1]> dw = const()[name=string(\"dw\"), "
            "val=tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path=string("
-           "\"@model_path/weights/down.bin\"), offset=uint64(64)))];\n"
+           "\"@model_path/weights/weight.bin\"), offset=uint64(%llu)))];\n"
            "    string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"
            "    tensor<int32, [2]> st = const()[name=string(\"st\"), "
            "val=tensor<int32, [2]>([1,1])];\n"
@@ -301,11 +302,9 @@ NSString *fp16_swiglu_down_mil(int input_dim, int hidden_dim, int output_dim,
            "    tensor<fp16, [1, %d, 1, %d]> up = conv(dilations=dl, "
            "groups=gr, pad=pd, pad_type=pt, strides=st, weight=uw, x=x)"
            "[name=string(\"up\")];\n"
-           "    tensor<fp16, [1, %d, 1, %d]> sig = sigmoid(x=gate)"
-           "[name=string(\"sigmoid\")];\n"
-           "    tensor<fp16, [1, %d, 1, %d]> silu = mul(x=gate, y=sig)"
+           "    tensor<fp16, [1, %d, 1, %d]> silu_out = silu(x=gate)"
            "[name=string(\"silu\")];\n"
-           "    tensor<fp16, [1, %d, 1, %d]> act = mul(x=silu, y=up)"
+           "    tensor<fp16, [1, %d, 1, %d]> act = mul(x=silu_out, y=up)"
            "[name=string(\"swiglu\")];\n"
            "    tensor<fp16, [1, %d, 1, %d]> y = conv(dilations=dl, "
            "groups=gr, pad=pd, pad_type=pt, strides=st, weight=dw, x=act)"
@@ -313,11 +312,77 @@ NSString *fp16_swiglu_down_mil(int input_dim, int hidden_dim, int output_dim,
            "  } -> (y);\n}\n",
           input_dim, sequence_length,
           hidden_dim, input_dim, hidden_dim, input_dim,
+          static_cast<unsigned long long>(gate_offset),
           hidden_dim, input_dim, hidden_dim, input_dim,
+          static_cast<unsigned long long>(up_offset),
           output_dim, hidden_dim, output_dim, hidden_dim,
+          static_cast<unsigned long long>(down_offset),
           hidden_dim, sequence_length, hidden_dim, sequence_length,
           hidden_dim, sequence_length, hidden_dim, sequence_length,
-          hidden_dim, sequence_length, output_dim, sequence_length];
+          output_dim, sequence_length];
+}
+
+struct SwiGLUDownShape {
+  int input_dim;
+  int hidden_dim;
+  int output_dim;
+};
+
+NSString *fp16_swiglu_down_bank_mil(
+    const std::vector<SwiGLUDownShape> &shapes,
+    const std::vector<std::array<uint64_t, 3>> &offsets,
+    int sequence_length) {
+  NSMutableString *mil = [NSMutableString
+      stringWithString:
+          @"program(1.3)\n"
+           "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", "
+           "\"3520.4.1\"}, {\"coremlc-version\", \"3520.5.1\"}})]\n{\n"];
+  for (size_t index = 0; index < shapes.size(); ++index) {
+    const auto &shape = shapes[index];
+    const auto &weight_offsets = offsets[index];
+    [mil appendFormat:
+             @"  func procedure%03zu<ios18>(tensor<fp16, [1, %d, 1, %d]> x) "
+              "{\n"
+              "    tensor<fp16, [%d, %d, 1, 1]> gw = const()[name=string("
+              "\"gw\"), val=tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path=string("
+              "\"@model_path/weights/weight.bin\"), offset=uint64(%llu)))];\n"
+              "    tensor<fp16, [%d, %d, 1, 1]> uw = const()[name=string("
+              "\"uw\"), val=tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path=string("
+              "\"@model_path/weights/weight.bin\"), offset=uint64(%llu)))];\n"
+              "    tensor<fp16, [%d, %d, 1, 1]> dw = const()[name=string("
+              "\"dw\"), val=tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path=string("
+              "\"@model_path/weights/weight.bin\"), offset=uint64(%llu)))];\n"
+              "    string pt = const()[name=string(\"pt\"), "
+              "val=string(\"valid\")];\n"
+              "    tensor<int32, [2]> st = const()[name=string(\"st\"), "
+              "val=tensor<int32, [2]>([1,1])];\n"
+              "    tensor<int32, [4]> pd = const()[name=string(\"pd\"), "
+              "val=tensor<int32, [4]>([0,0,0,0])];\n"
+              "    tensor<int32, [2]> dl = const()[name=string(\"dl\"), "
+              "val=tensor<int32, [2]>([1,1])];\n"
+              "    int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"
+              "    tensor<fp16, [1, %d, 1, %d]> gate = conv(dilations=dl, "
+              "groups=gr, pad=pd, pad_type=pt, strides=st, weight=gw, x=x);\n"
+              "    tensor<fp16, [1, %d, 1, %d]> up = conv(dilations=dl, "
+              "groups=gr, pad=pd, pad_type=pt, strides=st, weight=uw, x=x);\n"
+              "    tensor<fp16, [1, %d, 1, %d]> silu_out = silu(x=gate);\n"
+              "    tensor<fp16, [1, %d, 1, %d]> act = mul(x=silu_out, y=up);\n"
+              "    tensor<fp16, [1, %d, 1, %d]> y = conv(dilations=dl, "
+              "groups=gr, pad=pd, pad_type=pt, strides=st, weight=dw, x=act);\n"
+              "  } -> (y);\n",
+         index, shape.input_dim, sequence_length,
+         shape.hidden_dim, shape.input_dim, shape.hidden_dim, shape.input_dim,
+         static_cast<unsigned long long>(weight_offsets[0]),
+         shape.hidden_dim, shape.input_dim, shape.hidden_dim, shape.input_dim,
+         static_cast<unsigned long long>(weight_offsets[1]),
+         shape.output_dim, shape.hidden_dim, shape.output_dim, shape.hidden_dim,
+         static_cast<unsigned long long>(weight_offsets[2]),
+         shape.hidden_dim, sequence_length, shape.hidden_dim, sequence_length,
+         shape.hidden_dim, sequence_length, shape.hidden_dim, sequence_length,
+         shape.output_dim, sequence_length];
+  }
+  [mil appendString:@"}\n"];
+  return mil;
 }
 
 std::vector<_Float16> fp16_rows(const float *weight, int output_dim,
@@ -428,6 +493,30 @@ public:
   NSDictionary *execution_options_;
   std::mutex evaluation_mutex_;
 };
+
+// Ceiling on every wait for an ANE signal on the live request path. A healthy
+// readiness spin resolves in microseconds (the producer buffer is committed
+// and waited on before the evaluation thread is spawned) and a healthy
+// evaluation in milliseconds-to-seconds (first-eval JIT), but a wedged ANE
+// driver never signals at all (#2974) — without a bound, one lost signal
+// spins a core forever and hangs the server. OMLX_ANE_WAIT_TIMEOUT_S
+// overrides the 30s default; 0 restores the old unbounded behavior.
+static std::chrono::seconds ane_wait_timeout() {
+  static const std::chrono::seconds timeout = [] {
+    if (const char *raw = std::getenv("OMLX_ANE_WAIT_TIMEOUT_S")) {
+      char *end = nullptr;
+      const long parsed = std::strtol(raw, &end, 10);
+      if (end != raw) {
+        if (parsed <= 0) {
+          return std::chrono::seconds(std::chrono::hours(24 * 365));
+        }
+        return std::chrono::seconds(parsed);
+      }
+    }
+    return std::chrono::seconds(30);
+  }();
+  return timeout;
+}
 
 class AneLinearModel::Impl {
 public:
@@ -565,30 +654,32 @@ public:
 
   Impl(const float *gate_weight, const float *up_weight,
        const float *down_weight, int hidden_dim, int output_dim, int input_dim,
-       int sequence_length)
+       int sequence_length, int ane_instance)
       : input_dim_(input_dim), output_dim_(output_dim),
         sequence_length_(sequence_length) {
     @autoreleasepool {
       load_ane_framework();
-      execution_options_ = [@{} retain];
+      execution_options_ = [ane_execution_options(ane_instance) copy];
       auto gate = fp16_rows(gate_weight, hidden_dim, input_dim);
       auto up = fp16_rows(up_weight, hidden_dim, input_dim);
       auto down = fp16_rows(down_weight, output_dim, hidden_dim);
-      NSData *mil = [fp16_swiglu_down_mil(input_dim, hidden_dim, output_dim,
-                                          sequence_length)
+      NSMutableData *weight_blob = [NSMutableData dataWithLength:64];
+      const uint64_t gate_offset = append_blob_chunk(
+          weight_blob, gate.data(), gate.size() * sizeof(gate.front()), 1);
+      const uint64_t up_offset = append_blob_chunk(
+          weight_blob, up.data(), up.size() * sizeof(up.front()), 1);
+      const uint64_t down_offset = append_blob_chunk(
+          weight_blob, down.data(), down.size() * sizeof(down.front()), 1);
+      auto *weight_header = static_cast<uint32_t *>(weight_blob.mutableBytes);
+      weight_header[0] = 3;
+      weight_header[1] = 2;
+      NSData *mil = [fp16_swiglu_down_mil(
+                          input_dim, hidden_dim, output_dim, sequence_length,
+                          gate_offset, up_offset, down_offset)
           dataUsingEncoding:NSUTF8StringEncoding];
-      NSData *gate_data =
-          make_blob(gate.data(), gate.size() * sizeof(gate.front()));
-      NSData *up_data = make_blob(up.data(), up.size() * sizeof(up.front()));
-      NSData *down_data =
-          make_blob(down.data(), down.size() * sizeof(down.front()));
       NSDictionary *weights = @{
-        @"@model_path/weights/gate.bin" :
-            @{ @"offset" : @0, @"data" : gate_data },
-        @"@model_path/weights/up.bin" :
-            @{ @"offset" : @0, @"data" : up_data },
-        @"@model_path/weights/down.bin" :
-            @{ @"offset" : @0, @"data" : down_data },
+        @"@model_path/weights/weight.bin" :
+            @{ @"offset" : @0, @"data" : weight_blob },
       };
 
       Class descriptor_class =
@@ -627,9 +718,7 @@ public:
       [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
             atomically:YES];
       NSDictionary *files = @{
-        @"gate.bin" : gate_data,
-        @"up.bin" : up_data,
-        @"down.bin" : down_data,
+        @"weight.bin" : weight_blob,
       };
       for (NSString *name in files) {
         [files[name]
@@ -782,15 +871,36 @@ public:
     }
   }
 
-  AneLinearModel::Ticket begin(MTL::CommandBuffer *command_buffer) {
+  bool has_error() {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    return !completion_error_.empty();
+  }
+
+  AneLinearModel::Ticket begin(MTL::CommandBuffer *command_buffer) {
+    std::unique_lock<std::mutex> lock(state_mutex_);
     if (!completion_error_.empty()) {
       throw std::runtime_error("Prior ANE evaluation failed: " +
                                completion_error_);
     }
     if (submitted_ != completed_) {
-      throw std::runtime_error("The same fixed-shape ANE model cannot have "
-                               "overlapping evaluations.");
+      // A pending evaluation can be legitimately in flight for a moment
+      // (another request aborted between spawn and wait); give it one bounded
+      // grace period, then latch — a counter stuck past the timeout is the
+      // wedged-driver state and must not stay indistinguishable from a race.
+      const bool settled = completion_cv_.wait_for(
+          lock, ane_wait_timeout(),
+          [this] { return completed_ >= submitted_; });
+      if (!settled) {
+        if (completion_error_.empty()) {
+          completion_error_ = "a prior ANE evaluation never completed";
+        }
+        throw std::runtime_error("Prior ANE evaluation failed: " +
+                                 completion_error_);
+      }
+      if (!completion_error_.empty()) {
+        throw std::runtime_error("Prior ANE evaluation failed: " +
+                                 completion_error_);
+      }
     }
     const uint64_t ready = next_event_value_++;
     const uint64_t done = next_event_value_++;
@@ -802,7 +912,20 @@ public:
   }
 
   void evaluate_and_signal(AneLinearModel::Ticket ticket) {
+    const auto deadline = std::chrono::steady_clock::now() + ane_wait_timeout();
     while ([event_ signaledValue] < ticket.ready) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          completion_error_ =
+              "ANE readiness signal timed out; the producer command buffer "
+              "never signaled the shared event";
+          ++completed_;
+        }
+        [event_ setSignaledValue:ticket.done];
+        completion_cv_.notify_all();
+        return;
+      }
       std::this_thread::yield();
     }
     NSError *error = nil;
@@ -840,9 +963,37 @@ public:
     [buffer encodeWaitForEvent:event_ value:ticket.done];
   }
 
+  void cancel_ticket(AneLinearModel::Ticket ticket) {
+    // The ticket's producer command buffer failed, so its encoded ready
+    // signal will never fire. Retire the ticket before any evaluation thread
+    // is spawned: balance the counters, publish the done value, and wake any
+    // waiter. This is a per-submission failure (typically a request abort
+    // tearing down Metal state mid-prefill), not a program fault, so
+    // completion_error_ is left clear and the next request may use this
+    // program again.
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      ++completed_;
+    }
+    [event_ setSignaledValue:ticket.done];
+    completion_cv_.notify_all();
+  }
+
   void wait(AneLinearModel::Ticket) {
     std::unique_lock<std::mutex> lock(state_mutex_);
-    completion_cv_.wait(lock, [this] { return completed_ >= submitted_; });
+    const bool finished = completion_cv_.wait_for(
+        lock, ane_wait_timeout(), [this] { return completed_ >= submitted_; });
+    if (!finished) {
+      // The evaluation thread is parked inside the private ANE framework and
+      // cannot be unblocked from here; latch the error so begin() refuses
+      // further dispatches to this program and the per-module fallback takes
+      // over, instead of the caller sleeping forever.
+      if (completion_error_.empty()) {
+        completion_error_ = "ANE evaluation timed out; the driver never "
+                            "signaled completion for this program";
+      }
+      throw std::runtime_error(completion_error_);
+    }
     if (!completion_error_.empty()) {
       throw std::runtime_error(completion_error_);
     }
@@ -852,7 +1003,14 @@ public:
     AneLinearModel::Ticket ticket{};
     {
       std::unique_lock<std::mutex> lock(state_mutex_);
-      completion_cv_.wait(lock, [this] { return submitted_ == completed_; });
+      const bool idle = completion_cv_.wait_for(
+          lock, ane_wait_timeout(),
+          [this] { return submitted_ == completed_; });
+      if (!idle) {
+        throw std::runtime_error(
+            "Prior ANE evaluation never completed; refusing to warm this "
+            "program");
+      }
       if (!completion_error_.empty()) {
         throw std::runtime_error("Prior ANE evaluation failed: " +
                                  completion_error_);
@@ -895,6 +1053,7 @@ public:
 AneLinearModel::AneLinearModel(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 AneLinearModel::~AneLinearModel() = default;
+bool AneLinearModel::has_error() { return impl_->has_error(); }
 int AneLinearModel::input_dim() const { return impl_->input_dim_; }
 int AneLinearModel::output_dim() const { return impl_->output_dim_; }
 int AneLinearModel::sequence_length() const { return impl_->sequence_length_; }
@@ -916,6 +1075,9 @@ void AneLinearModel::execute(AneLinearModel::Ticket ticket) {
 void AneLinearModel::wait(AneLinearModel::Ticket ticket) {
   impl_->wait(ticket);
 }
+void AneLinearModel::cancel_ticket(AneLinearModel::Ticket ticket) {
+  impl_->cancel_ticket(ticket);
+}
 void AneLinearModel::warmup() {
   @autoreleasepool {
     impl_->warmup();
@@ -924,6 +1086,45 @@ void AneLinearModel::warmup() {
 void AneLinearModel::end(MTL::CommandBuffer *command_buffer,
                          AneLinearModel::Ticket ticket) {
   impl_->end(command_buffer, ticket);
+}
+
+// A pack-and-signal buffer that completed with an error never fired its
+// encoded ready signal, so a detached evaluation thread launched for its
+// ticket would spin on a value that never arrives (#3025: a request abort
+// mid-prefill tears down Metal state and fails the buffer). The dispatch
+// sites check this after waitUntilCompleted() and, on failure, retire the
+// tickets and fail the dispatch immediately instead of leaving the wait
+// timeout as the only backstop.
+static bool pack_buffer_failed(MTL::CommandBuffer *producer_buffer) {
+  id<MTLCommandBuffer> buffer =
+      (__bridge id<MTLCommandBuffer>)(static_cast<void *>(producer_buffer));
+  return buffer.status == MTLCommandBufferStatusError;
+}
+
+static std::string pack_buffer_error(MTL::CommandBuffer *producer_buffer) {
+  id<MTLCommandBuffer> buffer =
+      (__bridge id<MTLCommandBuffer>)(static_cast<void *>(producer_buffer));
+  return error_text(
+      @"ANE input pack command buffer failed; canceling this dispatch",
+      buffer.error);
+}
+
+struct AneTicketPair {
+  AneLinearModel::Ticket first;
+  AneLinearModel::Ticket second;
+};
+
+static AneTicketPair begin_ane_ticket_pair(
+    const std::shared_ptr<AneLinearModel> &first,
+    const std::shared_ptr<AneLinearModel> &second,
+    MTL::CommandBuffer *producer_buffer) {
+  auto first_ticket = first->begin(producer_buffer);
+  try {
+    return {first_ticket, second->begin(producer_buffer)};
+  } catch (...) {
+    first->cancel_ticket(first_ticket);
+    throw;
+  }
 }
 
 bool qwen35_ane_available() {
@@ -1175,7 +1376,7 @@ qwen35_ane_compile_fp16_linear(const array &weight, int sequence_length) {
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
     const array &gate_weight, const array &up_weight, const array &down_weight,
-    int sequence_length) {
+    int sequence_length, int ane_instance) {
   if (!qwen35_ane_available()) {
     throw std::runtime_error("Private ANE runtime is unavailable.");
   }
@@ -1197,8 +1398,188 @@ std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
   auto impl = std::make_unique<AneLinearModel::Impl>(
       gate_weight.data<float>(), up_weight.data<float>(),
       down_weight.data<float>(), hidden_dim, output_dim, input_dim,
-      sequence_length);
+      sequence_length, ane_instance);
   return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
+}
+
+struct AneFusedBankBuilder::Impl {
+  struct Chunk {
+    std::vector<_Float16> gate;
+    std::vector<_Float16> up;
+    std::vector<_Float16> down;
+    SwiGLUDownShape shape;
+  };
+  int sequence_length = 0;
+  std::vector<Chunk> chunks;
+};
+
+AneFusedBankBuilder::AneFusedBankBuilder(int sequence_length)
+    : impl_(std::make_unique<Impl>()) {
+  if (!qwen35_ane_available()) {
+    throw std::runtime_error("Private ANE runtime is unavailable.");
+  }
+  if (sequence_length <= 1) {
+    throw std::invalid_argument("Invalid ANE SwiGLU/down procedure bank.");
+  }
+  impl_->sequence_length = sequence_length;
+}
+
+AneFusedBankBuilder::~AneFusedBankBuilder() = default;
+
+void AneFusedBankBuilder::add(const array &gate_weight, const array &up_weight,
+                              const array &down_weight) {
+  for (const auto *weight : {&gate_weight, &up_weight, &down_weight}) {
+    if (weight->dtype() != float32 || weight->ndim() != 2 ||
+        !row_contiguous(*weight) || weight->shape(0) <= 0 ||
+        weight->shape(1) <= 0) {
+      throw std::invalid_argument(
+          "ANE SwiGLU/down bank weights must be contiguous float32 matrices.");
+    }
+  }
+  if (up_weight.shape() != gate_weight.shape() ||
+      down_weight.shape(1) != gate_weight.shape(0)) {
+    throw std::invalid_argument("ANE SwiGLU/down bank shape mismatch.");
+  }
+  // Convert to the fp16 program format now so the caller can drop the fp32
+  // staging arrays immediately; the retained chunk is half their size.
+  const auto to_fp16 = [](const array &weight) {
+    return fp16_rows(weight.data<float>(), static_cast<int>(weight.shape(0)),
+                     static_cast<int>(weight.shape(1)));
+  };
+  Impl::Chunk chunk{
+      to_fp16(gate_weight),
+      to_fp16(up_weight),
+      to_fp16(down_weight),
+      {static_cast<int>(gate_weight.shape(1)),
+       static_cast<int>(gate_weight.shape(0)),
+       static_cast<int>(down_weight.shape(0))},
+  };
+  impl_->chunks.emplace_back(std::move(chunk));
+}
+
+int AneFusedBankBuilder::size() const {
+  return static_cast<int>(impl_->chunks.size());
+}
+
+std::vector<std::shared_ptr<AneLinearModel>>
+AneFusedBankBuilder::compile(int ane_instance, int start, int stop) {
+  const int count = static_cast<int>(impl_->chunks.size());
+  if (start < 0 || stop <= start || stop > count || stop - start > 256) {
+    throw std::invalid_argument(
+        "Invalid ANE SwiGLU/down procedure bank span.");
+  }
+  const int sequence_length = impl_->sequence_length;
+  std::vector<SwiGLUDownShape> shapes;
+  shapes.reserve(stop - start);
+  for (int index = start; index < stop; ++index) {
+    shapes.push_back(impl_->chunks[index].shape);
+  }
+
+  @autoreleasepool {
+    load_ane_framework();
+    NSDictionary *execution_options = ane_execution_options(ane_instance);
+    NSMutableData *weight_blob = [NSMutableData dataWithLength:64];
+    std::vector<std::array<uint64_t, 3>> offsets;
+    offsets.reserve(shapes.size());
+    for (int index = start; index < stop; ++index) {
+      const auto append_fp16 = [&](const std::vector<_Float16> &dense) {
+        return append_blob_chunk(weight_blob, dense.data(),
+                                 dense.size() * sizeof(dense.front()), 1);
+      };
+      const auto &chunk = impl_->chunks[index];
+      offsets.push_back({append_fp16(chunk.gate), append_fp16(chunk.up),
+                         append_fp16(chunk.down)});
+    }
+    auto *weight_header = static_cast<uint32_t *>(weight_blob.mutableBytes);
+    weight_header[0] = static_cast<uint32_t>(shapes.size() * 3);
+    weight_header[1] = 2;
+    NSData *mil =
+        [fp16_swiglu_down_bank_mil(shapes, offsets, sequence_length)
+            dataUsingEncoding:NSUTF8StringEncoding];
+    NSDictionary *weight_map = @{
+      @"@model_path/weights/weight.bin" :
+          @{ @"offset" : @0, @"data" : weight_blob },
+    };
+
+    Class descriptor_class =
+        NSClassFromString(@"_ANEInMemoryModelDescriptor");
+    Class model_class = NSClassFromString(@"_ANEInMemoryModel");
+    id descriptor = ((id (*)(Class, SEL, id, id, id))objc_msgSend)(
+        descriptor_class, @selector(modelWithMILText:weights:optionsPlist:),
+        mil, weight_map, nil);
+    id model = ((id (*)(Class, SEL, id))objc_msgSend)(
+        model_class, @selector(inMemoryModelWithDescriptor:), descriptor);
+    if (!model) {
+      throw std::runtime_error(
+          "Private ANE SwiGLU/down bank model creation failed.");
+    }
+    id identifier = ((id (*)(id, SEL))objc_msgSend)(
+        model, @selector(hexStringIdentifier));
+    NSString *directory =
+        [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    NSString *weight_directory =
+        [directory stringByAppendingPathComponent:@"weights"];
+    [[NSFileManager defaultManager]
+        createDirectoryAtPath:weight_directory
+        withIntermediateDirectories:YES
+        attributes:nil
+        error:nil];
+    [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
+          atomically:YES];
+    [weight_blob
+        writeToFile:[weight_directory stringByAppendingPathComponent:
+                                          @"weight.bin"]
+         atomically:YES];
+
+    NSError *error = nil;
+    BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+        model, @selector(compileWithQoS:options:error:), 21,
+        execution_options, &error);
+    if (!ok) {
+      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+      throw std::runtime_error(
+          error_text(@"ANE SwiGLU/down bank compilation failed", error));
+    }
+    ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+        model, @selector(loadWithQoS:options:error:), 21, execution_options,
+        &error);
+    if (!ok) {
+      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+      throw std::runtime_error(
+          error_text(@"ANE SwiGLU/down bank load failed", error));
+    }
+
+    auto program =
+        std::make_shared<SharedAneProgram>(model, directory, execution_options);
+    std::vector<std::shared_ptr<AneLinearModel>> result;
+    result.reserve(shapes.size());
+    for (size_t index = 0; index < shapes.size(); ++index) {
+      auto impl = std::make_unique<AneLinearModel::Impl>(
+          program, shapes[index].input_dim, shapes[index].output_dim,
+          sequence_length, static_cast<int>(index));
+      result.emplace_back(new AneLinearModel(std::move(impl)));
+    }
+    return result;
+  }
+}
+
+std::vector<std::shared_ptr<AneLinearModel>>
+qwen35_ane_compile_swiglu_down_bank(
+    const std::vector<array> &gate_weights,
+    const std::vector<array> &up_weights,
+    const std::vector<array> &down_weights, int sequence_length,
+    int ane_instance) {
+  if (gate_weights.empty() || gate_weights.size() > 256 ||
+      gate_weights.size() != up_weights.size() ||
+      gate_weights.size() != down_weights.size()) {
+    throw std::invalid_argument("Invalid ANE SwiGLU/down procedure bank.");
+  }
+  AneFusedBankBuilder builder(sequence_length);
+  for (size_t index = 0; index < gate_weights.size(); ++index) {
+    builder.add(gate_weights[index], up_weights[index], down_weights[index]);
+  }
+  return builder.compile(ane_instance, 0, builder.size());
 }
 
 namespace {
@@ -1230,6 +1611,32 @@ std::string hybrid_classic_qmm_name(int bits, int group_size,
   return "qwen35_q" + std::to_string(bits) +
          (group_size == 128 ? "_affine_qmm128_t_" : "_affine_qmm_t_") +
          type + "_bm_64_bk_32_bn_64";
+}
+
+template <typename Device, typename Library>
+MTL::ComputePipelineState *hybrid_qmm_kernel(
+    Device &device, const Library &classic_library, int bits, int group_size,
+    const std::string &type, int K, int N) {
+  // The bundled hybrid NAX kernel currently uses the same 64x64x64 tile as
+  // variant 0 of the standalone qmm op. Select it per projection: the fused
+  // gate/up and down suffixes have different K/N shapes, and either one must
+  // be able to fall back independently if a future architecture is not tile
+  // compatible.
+  if (K % 64 == 0 && N % 64 == 0 && hybrid_nax_enabled()) {
+    try {
+      auto nax_library = device.get_library(
+          "omlx_qwen35_prefill_kernels_nax", binary_dir());
+      return device.get_kernel(
+          hybrid_nax_qmm_name(bits, group_size, type), nax_library);
+    } catch (const std::exception &) {
+      // Keep the fused ANE path usable with an older/incomplete app bundle.
+      // This mirrors the established hybrid suffix behavior and avoids
+      // retrying a missing NAX pipeline on every layer.
+      g_hybrid_nax_runtime_ok.store(false, std::memory_order_relaxed);
+    }
+  }
+  return device.get_kernel(
+      hybrid_classic_qmm_name(bits, group_size, type), classic_library);
 }
 
 BNNSNDArrayDescriptor cpu_matrix_descriptor(void *data, int rows, int cols,
@@ -1456,6 +1863,40 @@ void cpu_fp16_matmul(const array &input, const array &weight, array &output,
                  workspace.empty() ? nullptr : workspace.data(),
                  &filter_params) != 0) {
     throw std::runtime_error("Accelerate CPU fp16 matrix multiply failed.");
+  }
+}
+
+void cpu_fp16_swiglu(const array &gate_up, array &activation, int M, int N,
+                     int cpu_threads, bool shared_resource) {
+  const int requested_threads =
+      shared_resource && cpu_threads == 0 ? 8 : std::max(cpu_threads, 1);
+  const int shards = std::min(requested_threads, std::max(M, 1));
+  const auto *input = gate_up.data<_Float16>();
+  auto *output = activation.data<_Float16>();
+  void (^work)(size_t) = ^(size_t index) {
+    const int begin = static_cast<int>(
+        (static_cast<int64_t>(M) * static_cast<int64_t>(index)) / shards);
+    const int end = static_cast<int>(
+        (static_cast<int64_t>(M) * static_cast<int64_t>(index + 1)) / shards);
+    for (int m = begin; m < end; ++m) {
+      const auto *gate = input + static_cast<size_t>(m) * 2 * N;
+      const auto *up = gate + N;
+      auto *row = output + static_cast<size_t>(m) * N;
+      for (int n = 0; n < N; ++n) {
+        const float g = static_cast<float>(gate[n]);
+        row[n] = static_cast<_Float16>(
+            g * static_cast<float>(up[n]) / (1.0f + std::exp(-g)));
+      }
+    }
+  };
+  ScopedDispatchApplyAttributes attributes;
+  if (shared_resource && attributes.active()) {
+    dispatch_apply_attr_api().apply(static_cast<size_t>(shards),
+                                    attributes.get(), work);
+  } else {
+    dispatch_apply(static_cast<size_t>(shards),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                   work);
   }
 }
 
@@ -1715,6 +2156,12 @@ public:
     // both devices, complete it up front; the expensive ANE and qmm stages are
     // still launched concurrently below.
     producer_buffer->waitUntilCompleted();
+    if (pack_buffer_failed(producer_buffer)) {
+      const std::string reason = pack_buffer_error(producer_buffer);
+      producer_buffer->release();
+      model_->cancel_ticket(ticket);
+      throw std::runtime_error(reason);
+    }
     producer_buffer->release();
     if (profiling) {
       profile_add(profile_category, kPackNs,
@@ -2011,10 +2458,24 @@ public:
 
     auto *producer_buffer = encoder.get_command_buffer();
     producer_buffer->retain();
-    auto ticket0 = model0_->begin(producer_buffer);
-    auto ticket1 = model1_->begin(producer_buffer);
+    AneTicketPair tickets{};
+    try {
+      tickets = begin_ane_ticket_pair(model0_, model1_, producer_buffer);
+    } catch (...) {
+      producer_buffer->release();
+      throw;
+    }
+    const auto ticket0 = tickets.first;
+    const auto ticket1 = tickets.second;
     encoder.commit();
     producer_buffer->waitUntilCompleted();
+    if (pack_buffer_failed(producer_buffer)) {
+      const std::string reason = pack_buffer_error(producer_buffer);
+      producer_buffer->release();
+      model0_->cancel_ticket(ticket0);
+      model1_->cancel_ticket(ticket1);
+      throw std::runtime_error(reason);
+    }
     producer_buffer->release();
     if (profiling) {
       profile_add(profile_category, kPackNs,
@@ -2223,9 +2684,14 @@ class AneHybridQ4SwiGLUDownPrimitive : public Primitive {
 public:
   AneHybridQ4SwiGLUDownPrimitive(Stream stream,
                                  std::shared_ptr<AneLinearModel> model,
-                                 int variant, int group_size)
-      : Primitive(stream), model_(std::move(model)), variant_(variant),
-        group_size_(group_size) {}
+                                 int variant, int group_size,
+                                 std::shared_ptr<AneLinearModel> model1 = nullptr,
+                                 bool cpu_fp16 = false, int cpu_threads = 0,
+                                 bool cpu_shared_resource = false)
+      : Primitive(stream), model_(std::move(model)), model1_(std::move(model1)),
+        variant_(variant), group_size_(group_size), cpu_fp16_(cpu_fp16),
+        cpu_threads_(cpu_threads),
+        cpu_shared_resource_(cpu_shared_resource) {}
 
   void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
     throw std::runtime_error(
@@ -2244,12 +2710,30 @@ public:
     const auto &down_weight = inputs[4];
     const auto &down_scales = inputs[5];
     const auto &down_biases = inputs[6];
+    const array *cpu_gate_up_weight = cpu_fp16_ ? &inputs[7] : nullptr;
+    const array *cpu_down_weight = cpu_fp16_ ? &inputs[8] : nullptr;
     auto &output = outputs[0];
 
     const int input_dim = static_cast<int>(x.shape(-1));
     const int M = static_cast<int>(x.size() / input_dim);
     const int gpu_hidden = static_cast<int>(gate_up_weight.shape(0)) / 2;
+    const int cpu_hidden =
+        cpu_gate_up_weight
+            ? static_cast<int>(cpu_gate_up_weight->shape(0)) / 2
+            : 0;
     const int output_dim = model_->output_dim();
+    const bool profiling = ane_profile_enabled();
+    constexpr int profile_category = 0;
+    const uint64_t operation_start = profiling ? profile_now_ns() : 0;
+    if (profiling) {
+      profile_add(profile_category, kOperations, 1);
+      const uint64_t previous =
+          g_previous_ane_done_ns.load(std::memory_order_relaxed);
+      if (previous && operation_start > previous) {
+        profile_add(profile_category, kGapBeforeNs,
+                    operation_start - previous);
+      }
+    }
     output.set_data(allocator::malloc(output.nbytes()));
     array gate_up({M, 2 * gpu_hidden}, x.dtype(), nullptr, {});
     array activation({M, gpu_hidden}, x.dtype(), nullptr, {});
@@ -2257,31 +2741,100 @@ public:
     gate_up.set_data(allocator::malloc(gate_up.nbytes()));
     activation.set_data(allocator::malloc(activation.nbytes()));
     gpu_output.set_data(allocator::malloc(gpu_output.nbytes()));
+    std::unique_ptr<array> cpu_input;
+    std::unique_ptr<array> cpu_gate_up;
+    std::unique_ptr<array> cpu_activation;
+    std::unique_ptr<array> cpu_output;
+    if (cpu_fp16_) {
+      if (x.dtype() != float16) {
+        cpu_input = std::make_unique<array>(Shape{M, input_dim}, float16,
+                                            nullptr, std::vector<array>{});
+        cpu_input->set_data(allocator::malloc(cpu_input->nbytes()));
+      }
+      cpu_gate_up = std::make_unique<array>(Shape{M, 2 * cpu_hidden}, float16,
+                                            nullptr, std::vector<array>{});
+      cpu_activation = std::make_unique<array>(Shape{M, cpu_hidden}, float16,
+                                               nullptr, std::vector<array>{});
+      cpu_output = std::make_unique<array>(Shape{M, output_dim}, float16,
+                                           nullptr, std::vector<array>{});
+      cpu_gate_up->set_data(allocator::malloc(cpu_gate_up->nbytes()));
+      cpu_activation->set_data(allocator::malloc(cpu_activation->nbytes()));
+      cpu_output->set_data(allocator::malloc(cpu_output->nbytes()));
+    }
 
     auto library =
         device.get_library("omlx_qwen35_prefill_kernels", binary_dir());
     auto pack = device.get_kernel(
-        "qwen35_ane_pack_input_" + metal_type_name(x.dtype()), library);
+        std::string(model1_ ? "qwen35_ane_pack_input_dual_"
+                            : "qwen35_ane_pack_input_") +
+            metal_type_name(x.dtype()),
+        library);
     encoder.set_compute_pipeline_state(pack);
     encoder.set_input_array(x, 0);
     encoder.set_buffer(model_->input_buffer(), 1);
-    encoder.set_bytes(M, 2);
-    encoder.set_bytes(input_dim, 3);
+    if (model1_) {
+      encoder.set_buffer(model1_->input_buffer(), 2);
+      encoder.set_bytes(M, 3);
+      encoder.set_bytes(input_dim, 4);
+    } else {
+      encoder.set_bytes(M, 2);
+      encoder.set_bytes(input_dim, 3);
+    }
     encoder.dispatch_threads(MTL::Size(input_dim, M, 1),
                              MTL::Size(16, 16, 1));
     encoder.end_encoding();
+    if (cpu_input) {
+      auto cpu_pack = device.get_kernel(
+          "qwen35_cpu_pack_input_" + metal_type_name(x.dtype()), library);
+      encoder.set_compute_pipeline_state(cpu_pack);
+      encoder.set_input_array(x, 0);
+      encoder.set_output_array(*cpu_input, 1);
+      encoder.set_bytes(M, 2);
+      encoder.set_bytes(input_dim, 3);
+      encoder.dispatch_threads(MTL::Size(input_dim, M, 1),
+                               MTL::Size(16, 16, 1));
+      encoder.end_encoding();
+    }
 
     auto *producer_buffer = encoder.get_command_buffer();
     producer_buffer->retain();
-    auto ticket = model_->begin(producer_buffer);
+    AneLinearModel::Ticket ticket{};
+    AneLinearModel::Ticket ticket1{};
+    try {
+      if (model1_) {
+        const auto tickets =
+            begin_ane_ticket_pair(model_, model1_, producer_buffer);
+        ticket = tickets.first;
+        ticket1 = tickets.second;
+      } else {
+        ticket = model_->begin(producer_buffer);
+      }
+    } catch (...) {
+      producer_buffer->release();
+      throw;
+    }
     encoder.commit();
     producer_buffer->waitUntilCompleted();
+    if (pack_buffer_failed(producer_buffer)) {
+      const std::string reason = pack_buffer_error(producer_buffer);
+      producer_buffer->release();
+      model_->cancel_ticket(ticket);
+      if (model1_) {
+        model1_->cancel_ticket(ticket1);
+      }
+      throw std::runtime_error(reason);
+    }
     producer_buffer->release();
+    if (profiling) {
+      profile_add(profile_category, kPackNs,
+                  profile_now_ns() - operation_start);
+    }
 
-    std::string qmm_name = "qwen35_q4_affine_qmm128_t_" +
-                           metal_type_name(x.dtype()) + "_bm_64_bk_32_bn_64";
-    auto qmm = device.get_kernel(qmm_name, library);
-    encoder.set_compute_pipeline_state(qmm);
+    const std::string qmm_type = metal_type_name(x.dtype());
+    auto gate_up_qmm = hybrid_qmm_kernel(
+        device, library, 4, group_size_, qmm_type, input_dim,
+        2 * gpu_hidden);
+    encoder.set_compute_pipeline_state(gate_up_qmm);
     encoder.set_input_array(gate_up_weight, 0);
     encoder.set_input_array(gate_up_scales, 1);
     encoder.set_input_array(gate_up_biases, 2);
@@ -2306,7 +2859,9 @@ public:
                              MTL::Size(16, 16, 1));
     encoder.end_encoding();
 
-    encoder.set_compute_pipeline_state(qmm);
+    auto down_qmm = hybrid_qmm_kernel(
+        device, library, 4, group_size_, qmm_type, gpu_hidden, output_dim);
+    encoder.set_compute_pipeline_state(down_qmm);
     encoder.set_input_array(down_weight, 0);
     encoder.set_input_array(down_scales, 1);
     encoder.set_input_array(down_biases, 2);
@@ -2320,21 +2875,109 @@ public:
         MTL::Size(32, 2, 2));
     encoder.end_encoding();
 
+    const uint64_t launch = profiling ? profile_now_ns() : 0;
+    id<MTLCommandBuffer> suffix_buffer =
+        (__bridge id<MTLCommandBuffer>)(static_cast<void *>(
+            encoder.get_command_buffer()));
+    if (profiling) {
+      [suffix_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        const double duration = completed.GPUEndTime - completed.GPUStartTime;
+        if (duration > 0) {
+          profile_add(profile_category, kGpuQmmNs,
+                      static_cast<uint64_t>(duration * 1e9));
+        }
+        profile_add(profile_category, kGpuCompletionNs,
+                    profile_now_ns() - launch);
+      }];
+    }
+    [suffix_buffer retain];
     encoder.commit();
     auto model = model_;
-    std::thread([model = std::move(model), ticket] {
+    std::thread([model = std::move(model), ticket, profiling, launch] {
+      const uint64_t start = profiling ? profile_now_ns() : 0;
       model->execute(ticket);
+      if (profiling) {
+        const uint64_t end = profile_now_ns();
+        profile_add(profile_category, kAne0LaunchNs, start - launch);
+        profile_add(profile_category, kAne0EvalNs, end - start);
+      }
     }).detach();
-    model_->wait(ticket);
+    if (model1_) {
+      auto model1 = model1_;
+      std::thread([model1 = std::move(model1), ticket1, profiling, launch] {
+        const uint64_t start = profiling ? profile_now_ns() : 0;
+        model1->execute(ticket1);
+        if (profiling) {
+          const uint64_t end = profile_now_ns();
+          profile_add(profile_category, kAne1LaunchNs, start - launch);
+          profile_add(profile_category, kAne1EvalNs, end - start);
+        }
+      }).detach();
+    }
+    try {
+      if (cpu_fp16_) {
+        const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
+        cpu_fp16_matmul(cpu_input ? *cpu_input : x, *cpu_gate_up_weight,
+                        *cpu_gate_up, M, 2 * cpu_hidden, input_dim,
+                        cpu_threads_, cpu_shared_resource_);
+        cpu_fp16_swiglu(*cpu_gate_up, *cpu_activation, M, cpu_hidden,
+                        cpu_threads_, cpu_shared_resource_);
+        cpu_fp16_matmul(*cpu_activation, *cpu_down_weight, *cpu_output, M,
+                        output_dim, cpu_hidden, cpu_threads_,
+                        cpu_shared_resource_);
+        if (profiling) {
+          const uint64_t cpu_done = profile_now_ns();
+          profile_add(profile_category, kCpuMatmulNs, cpu_done - cpu_start);
+          profile_add(profile_category, kCpuCompletionNs, cpu_done - launch);
+        }
+      }
+      model_->wait(ticket);
+      if (model1_) {
+        model1_->wait(ticket1);
+      }
+    } catch (...) {
+      // Same unwind hazard as the shared linear paths: drain the committed
+      // suffix before this frame's MLX arrays can be recycled. The detached
+      // ANE threads hold their own model references.
+      [suffix_buffer waitUntilCompleted];
+      [suffix_buffer release];
+      throw;
+    }
+    [suffix_buffer waitUntilCompleted];
+    [suffix_buffer release];
+    if (profiling) {
+      const uint64_t done = profile_now_ns();
+      profile_add(profile_category, kAneRegionNs, done - launch);
+      g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
+    }
 
     auto sum = device.get_kernel(
-        "qwen35_ane_sum_output_" + metal_type_name(x.dtype()), library);
+        std::string(cpu_fp16_ ? "qwen35_ane_sum_dual_cpu_output_"
+                              : model1_ ? "qwen35_ane_sum_dual_output_"
+                            : "qwen35_ane_sum_output_") +
+            metal_type_name(x.dtype()),
+        library);
     encoder.set_compute_pipeline_state(sum);
     encoder.set_buffer(model_->output_buffer(), 0);
-    encoder.set_input_array(gpu_output, 1);
-    encoder.set_output_array(output, 2);
-    encoder.set_bytes(M, 3);
-    encoder.set_bytes(output_dim, 4);
+    if (cpu_fp16_) {
+      encoder.set_buffer(model1_->output_buffer(), 1);
+      encoder.set_input_array(*cpu_output, 2);
+      encoder.set_input_array(gpu_output, 3);
+      encoder.set_output_array(output, 4);
+      encoder.set_bytes(M, 5);
+      encoder.set_bytes(output_dim, 6);
+    } else if (model1_) {
+      encoder.set_buffer(model1_->output_buffer(), 1);
+      encoder.set_input_array(gpu_output, 2);
+      encoder.set_output_array(output, 3);
+      encoder.set_bytes(M, 4);
+      encoder.set_bytes(output_dim, 5);
+    } else {
+      encoder.set_input_array(gpu_output, 1);
+      encoder.set_output_array(output, 2);
+      encoder.set_bytes(M, 3);
+      encoder.set_bytes(output_dim, 4);
+    }
     encoder.dispatch_threads(MTL::Size(output_dim, M, 1),
                              MTL::Size(16, 16, 1));
 
@@ -2348,6 +2991,14 @@ public:
     encoder.add_temporary(std::move(gate_up));
     encoder.add_temporary(std::move(activation));
     encoder.add_temporary(std::move(gpu_output));
+    if (cpu_input) {
+      encoder.add_temporary(std::move(*cpu_input));
+    }
+    if (cpu_gate_up) {
+      encoder.add_temporary(std::move(*cpu_gate_up));
+      encoder.add_temporary(std::move(*cpu_activation));
+      encoder.add_temporary(std::move(*cpu_output));
+    }
   }
 
   DEFINE_NAME(Qwen35AneHybridQ4SwiGLUDown)
@@ -2355,21 +3006,32 @@ public:
   bool is_equivalent(const Primitive &other) const override {
     const auto &rhs =
         static_cast<const AneHybridQ4SwiGLUDownPrimitive &>(other);
-    return model_.get() == rhs.model_.get() && variant_ == rhs.variant_ &&
-           group_size_ == rhs.group_size_;
+    return model_.get() == rhs.model_.get() &&
+           model1_.get() == rhs.model1_.get() && variant_ == rhs.variant_ &&
+           group_size_ == rhs.group_size_ && cpu_fp16_ == rhs.cpu_fp16_ &&
+           cpu_threads_ == rhs.cpu_threads_ &&
+           cpu_shared_resource_ == rhs.cpu_shared_resource_;
   }
   auto state() const {
-    return std::make_tuple(reinterpret_cast<uintptr_t>(model_.get()), variant_,
-                           group_size_);
+    return std::make_tuple(reinterpret_cast<uintptr_t>(model_.get()),
+                           reinterpret_cast<uintptr_t>(model1_.get()), variant_,
+                           group_size_, cpu_fp16_, cpu_threads_,
+                           cpu_shared_resource_);
   }
 
 private:
   std::shared_ptr<AneLinearModel> model_;
+  std::shared_ptr<AneLinearModel> model1_;
   int variant_;
   int group_size_;
+  bool cpu_fp16_;
+  int cpu_threads_;
+  bool cpu_shared_resource_;
 };
 
 } // namespace
+
+bool qwen35_ane_hybrid_nax_enabled() { return hybrid_nax_enabled(); }
 
 bool qwen35_cpu_shared_resource_available() {
   return cpu_shared_resource_policy_available();
@@ -2887,6 +3549,133 @@ array qwen35_ane_q4_swiglu_down_t(
       std::vector<array>{x, gpu_gate_up_weight, gpu_gate_up_scales,
                          gpu_gate_up_biases, gpu_down_weight, gpu_down_scales,
                          gpu_down_biases});
+}
+
+array qwen35_ane_dual_q4_swiglu_down_t(
+    const array &x, const array &gpu_gate_up_weight,
+    const array &gpu_gate_up_scales, const array &gpu_gate_up_biases,
+    const array &gpu_down_weight, const array &gpu_down_scales,
+    const array &gpu_down_biases,
+    const std::shared_ptr<AneLinearModel> &ane_model0,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int variant,
+    int group_size, StreamOrDevice s) {
+  auto stream = to_stream(s);
+  const auto q4_valid = [&](const array &weight, const array &scales,
+                            const array &biases, int input_dim) {
+    return weight.dtype() == mlx::core::uint32 && scales.dtype() == x.dtype() &&
+           biases.dtype() == x.dtype() && weight.ndim() == 2 &&
+           scales.ndim() == 2 && biases.shape() == scales.shape() &&
+           row_contiguous(weight) && row_contiguous(scales) &&
+           row_contiguous(biases) && weight.shape(1) * 8 == input_dim &&
+           scales.shape(0) == weight.shape(0) &&
+           scales.shape(1) == input_dim / 128;
+  };
+  if (!ane_model0 || !ane_model1 || stream.device == Device::cpu ||
+      (x.dtype() != float16 && x.dtype() != bfloat16) || x.ndim() < 2 ||
+      !row_contiguous(x) || group_size != 128 || variant != 8) {
+    throw std::invalid_argument(
+        "Unsupported dual-ANE hybrid SwiGLU/down configuration.");
+  }
+  const int input_dim = static_cast<int>(x.shape(-1));
+  const int M = static_cast<int>(x.size() / input_dim);
+  const int gate_up_n = static_cast<int>(gpu_gate_up_weight.shape(0));
+  const int gpu_hidden = gate_up_n / 2;
+  const int output_dim = static_cast<int>(gpu_down_weight.shape(0));
+  if (input_dim != ane_model0->input_dim() ||
+      input_dim != ane_model1->input_dim() ||
+      output_dim != ane_model0->output_dim() ||
+      output_dim != ane_model1->output_dim() ||
+      M != ane_model0->sequence_length() ||
+      M != ane_model1->sequence_length() || gate_up_n <= 0 ||
+      gate_up_n % 128 != 0 || gpu_hidden % 128 != 0 ||
+      output_dim % 64 != 0 ||
+      !q4_valid(gpu_gate_up_weight, gpu_gate_up_scales, gpu_gate_up_biases,
+                input_dim) ||
+      !q4_valid(gpu_down_weight, gpu_down_scales, gpu_down_biases,
+                gpu_hidden)) {
+    throw std::invalid_argument(
+        "Dual-ANE hybrid SwiGLU/down shape mismatch.");
+  }
+  Shape shape = x.shape();
+  shape.back() = output_dim;
+  return array(
+      std::move(shape), x.dtype(),
+      std::make_shared<AneHybridQ4SwiGLUDownPrimitive>(
+          stream, ane_model0, variant, group_size, ane_model1),
+      std::vector<array>{x, gpu_gate_up_weight, gpu_gate_up_scales,
+                         gpu_gate_up_biases, gpu_down_weight, gpu_down_scales,
+                         gpu_down_biases});
+}
+
+array qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t(
+    const array &x, const array &cpu_gate_up_weight,
+    const array &cpu_down_weight, const array &gpu_gate_up_weight,
+    const array &gpu_gate_up_scales, const array &gpu_gate_up_biases,
+    const array &gpu_down_weight, const array &gpu_down_scales,
+    const array &gpu_down_biases,
+    const std::shared_ptr<AneLinearModel> &ane_model0,
+    const std::shared_ptr<AneLinearModel> &ane_model1, int variant,
+    int group_size, int cpu_threads, bool cpu_shared_resource,
+    StreamOrDevice s) {
+  auto stream = to_stream(s);
+  const auto q4_valid = [&](const array &weight, const array &scales,
+                            const array &biases, int input_dim) {
+    return weight.dtype() == mlx::core::uint32 && scales.dtype() == x.dtype() &&
+           biases.dtype() == x.dtype() && weight.ndim() == 2 &&
+           scales.ndim() == 2 && biases.shape() == scales.shape() &&
+           row_contiguous(weight) && row_contiguous(scales) &&
+           row_contiguous(biases) && weight.shape(1) * 8 == input_dim &&
+           scales.shape(0) == weight.shape(0) &&
+           scales.shape(1) == input_dim / 128;
+  };
+  if (!ane_model0 || !ane_model1 || stream.device == Device::cpu ||
+      (x.dtype() != float16 && x.dtype() != bfloat16) || x.ndim() < 2 ||
+      !row_contiguous(x) || group_size != 128 || variant != 8 ||
+      cpu_threads < 0 || cpu_threads > 64 ||
+      cpu_gate_up_weight.dtype() != float16 ||
+      cpu_down_weight.dtype() != float16 || cpu_gate_up_weight.ndim() != 2 ||
+      cpu_down_weight.ndim() != 2 || !row_contiguous(cpu_gate_up_weight) ||
+      !row_contiguous(cpu_down_weight)) {
+    throw std::invalid_argument(
+        "Unsupported dual-ANE/CPU fused SwiGLU/down configuration.");
+  }
+  const int input_dim = static_cast<int>(x.shape(-1));
+  const int M = static_cast<int>(x.size() / input_dim);
+  const int gate_up_n = static_cast<int>(gpu_gate_up_weight.shape(0));
+  const int gpu_hidden = gate_up_n / 2;
+  const int cpu_gate_up_n = static_cast<int>(cpu_gate_up_weight.shape(0));
+  const int cpu_hidden = cpu_gate_up_n / 2;
+  const int output_dim = static_cast<int>(gpu_down_weight.shape(0));
+  if (input_dim != ane_model0->input_dim() ||
+      input_dim != ane_model1->input_dim() ||
+      output_dim != ane_model0->output_dim() ||
+      output_dim != ane_model1->output_dim() ||
+      M != ane_model0->sequence_length() ||
+      M != ane_model1->sequence_length() || gate_up_n <= 0 ||
+      gate_up_n % 128 != 0 || gpu_hidden % 128 != 0 ||
+      cpu_gate_up_n <= 0 || cpu_gate_up_n % 128 != 0 ||
+      cpu_hidden % 64 != 0 || output_dim % 64 != 0 ||
+      cpu_gate_up_weight.shape(1) != input_dim ||
+      cpu_down_weight.shape(0) != output_dim ||
+      cpu_down_weight.shape(1) != cpu_hidden ||
+      !q4_valid(gpu_gate_up_weight, gpu_gate_up_scales, gpu_gate_up_biases,
+                input_dim) ||
+      !q4_valid(gpu_down_weight, gpu_down_scales, gpu_down_biases,
+                gpu_hidden)) {
+    throw std::invalid_argument(
+        "Dual-ANE/CPU fused SwiGLU/down shape mismatch.");
+  }
+  Shape shape = x.shape();
+  shape.back() = output_dim;
+  return array(
+      std::move(shape), x.dtype(),
+      std::make_shared<AneHybridQ4SwiGLUDownPrimitive>(
+          stream, ane_model0, variant, group_size, ane_model1,
+          /* cpu_fp16 */ true, cpu_threads, cpu_shared_resource),
+      std::vector<array>{x, gpu_gate_up_weight, gpu_gate_up_scales,
+                         gpu_gate_up_biases, gpu_down_weight, gpu_down_scales,
+                         gpu_down_biases, cpu_gate_up_weight,
+                         cpu_down_weight});
 }
 
 } // namespace omlx::qwen35_prefill_kernels
