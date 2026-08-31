@@ -1106,6 +1106,69 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
 
 
 @contextlib.contextmanager
+def _force_qwen35_moe_sanitize_on_load(model_dir: Path):
+    """Force ``Model.sanitize`` for Qwen3.5-MoE VLM checkpoints.
+
+    mlx-vlm decides ``is_mlx_format`` from the metadata of the FIRST
+    ``glob()``'ed shard — unsorted, so filesystem order picks. Conversion
+    tools can write MIXED ``format`` values across shards (Ornith-1.5 MXFP8:
+    mostly ``pt``, some ``mlx``, one missing). When an ``mlx`` shard sorts
+    first, sanitize is skipped: raw per-expert MTP MoE tensors
+    (``mtp.layers.N.mlp.experts.E.*``) never stack into ``switch_mlp``,
+    strict ``load_weights`` fails with "parameters not in model" and oMLX
+    falls back to LLM — vision is silently dropped (the Ornith-1.5 VLM
+    regression). Hide only the format marker for this model and this load;
+    the omlx-patched qwen3_5_moe sanitize is idempotent on canonical MLX
+    keys, so fully-MLX checkpoints are unaffected.
+    """
+    if _read_config_model_type(model_dir) != "qwen3_5_moe":
+        yield
+        return
+
+    import safetensors
+
+    original_safe_open = safetensors.safe_open
+    is_target_shard = _model_shard_matcher(model_dir)
+
+    class _SafeOpenMetadataWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def metadata(self):
+            metadata = self._inner.metadata()
+            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
+                metadata = dict(metadata)
+                metadata.pop("format", None)
+            return metadata
+
+    def _patched_safe_open(filename, *args, **kwargs):
+        handle = original_safe_open(filename, *args, **kwargs)
+        if is_target_shard(filename):
+            return _SafeOpenMetadataWrapper(handle)
+        return handle
+
+    safetensors.safe_open = _patched_safe_open
+    try:
+        logger.info(
+            "Qwen3.5-MoE sanitize forced (mixed shard metadata) for %s",
+            model_dir.name,
+        )
+        yield
+    finally:
+        safetensors.safe_open = original_safe_open
+
+
+@contextlib.contextmanager
 def _remap_nested_visual_on_load(model_dir: Path):
     """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
     ``load_model`` for MLX-format models where sanitize is skipped.
@@ -1658,6 +1721,7 @@ class VLMBatchedEngine(BaseEngine):
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
+                _force_qwen35_moe_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
                 _transpose_qwen35_mlx_vision_patch_embed_on_load(
                     Path(self._model_name)
