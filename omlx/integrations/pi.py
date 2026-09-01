@@ -42,17 +42,24 @@ class PiIntegration(Integration):
 
     @staticmethod
     def _is_reasoning_model(model: str | None) -> bool:
-        return bool(re.search(r"\b(thinking|o1|o3|r1)\b", (model or "").lower()))
+        return bool(
+            re.search(r"\b(thinking|o1|o3|r1|flash-next)\b", (model or "").lower())
+        )
 
     def configure(self, ctx: IntegrationContext) -> None:
         def update_models(config: dict) -> None:
             config.setdefault("providers", {})
+            existing = config["providers"].get("omlx") or {}
             provider_config: dict = {
                 "baseUrl": ctx.openai_base_url,
                 "api": "openai-completions",
                 "apiKey": ctx.auth_token,
                 "authHeader": True,
             }
+            # Keep hand-tuned provider compat (e.g. thinkingFormat /
+            # chatTemplateKwargs for Qwen3.8-Flash-Next) across re-launches.
+            if existing.get("compat"):
+                provider_config["compat"] = existing["compat"]
             if ctx.model:
                 reasoning = (
                     bool(ctx.reasoning)
@@ -75,6 +82,15 @@ class PiIntegration(Integration):
                     model_entry["contextWindow"] = ctx.context_window
                 if ctx.max_tokens:
                     model_entry["maxTokens"] = ctx.max_tokens
+                # Keep hand-tuned thinkingLevelMap for the same model id.
+                for old in existing.get("models") or []:
+                    if (
+                        isinstance(old, dict)
+                        and old.get("id") == ctx.model
+                        and old.get("thinkingLevelMap")
+                    ):
+                        model_entry["thinkingLevelMap"] = old["thinkingLevelMap"]
+                        break
                 provider_config["models"] = [model_entry]
             config["providers"]["omlx"] = provider_config
 
