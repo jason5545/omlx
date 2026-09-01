@@ -27,6 +27,7 @@ upstream https://github.com/jundot/omlx.git
 - `Formula/omlx.rb` 的 homepage/HEAD 指向 `https://github.com/jason5545/omlx.git`（xgrammar macOS arm64 post-install patch 已被 upstream 吸收，不需再維護本地版）。
 - qwen3_5_moe VLM 強制 sanitize（`omlx/engine/vlm.py` 的 `_force_qwen35_moe_sanitize_on_load`）：mlx-vlm 用第一個 glob 到的 shard metadata 判斷 `is_mlx_format`，mixed-metadata checkpoint（如 Ornith-1.5 MXFP8）會跳過 sanitize，per-expert MTP MoE 權重沒堆疊成 switch_mlp，strict load 失敗 → 退回純 LLM、視覺被靜默丟掉。追 upstream 時守住這段。
 - pi / OpenCode integration 的 thinking 支援（`omlx/integrations/pi.py`、`omlx/integrations/opencode.py`）：`_is_reasoning_model` 加 `flash-next`；pi 重寫 `models.json` 時保留手動調過的 provider `compat`（`thinkingFormat: chat-template` + `chatTemplateKwargs`）與 per-model `thinkingLevelMap`；OpenCode 對 reasoning model 自動寫 `reasoning`/`interleaved`/`variants`（off/low/medium/xhigh 走 `chat_template_kwargs.enable_thinking`，Qwen3.8-Flash-Next 只能靠這個關思考），並保留手動調過的 model entry keys。
+- thinking budget 診斷與 re-entry 修正（`omlx/scheduler.py`、`omlx/api/thinking.py`）：processor attach/skip/觸發/re-entry 各加 info log（排查「budget 沒生效」用）；scheduler 的 `think_start_id` 對沒有 mlx-lm 屬性的 tokenizer（如 Qwen3.8 的 Qwen2Tokenizer）加 `convert_tokens_to_ids("<think>")` fallback，否則模型自然關閉思考後再開 `<think>` 時 budget 不會重新生效。
 
 追 upstream 時，conflict 只要守住上面幾塊，其餘一律取 upstream 版本。不要留下手動改 site-packages 的最終狀態。
 

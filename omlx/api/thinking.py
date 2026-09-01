@@ -9,9 +9,12 @@ Used by reasoning models like DeepSeek R1, Qwen3/3.5, MiniMax that wrap
 their chain-of-thought reasoning in <think>...</think> tags.
 """
 
+import logging
 import re
 from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Tags used for thinking blocks
 _OPEN_TAG = "<think>"
@@ -468,6 +471,10 @@ class ThinkingBudgetProcessor:
                     self._forcing = True
                     self._force_idx = 0
                     self._recent_tokens = []
+                    logger.info(
+                        "Thinking budget reached (%d tokens); forcing close",
+                        self._budget,
+                    )
                     return self._force_next_token(logits, mx)
                 self._waiting_utf8 = True
                 self._recent_tokens = []
@@ -484,6 +491,7 @@ class ThinkingBudgetProcessor:
                 self._done = False
                 self._thinking_tokens = 0
                 self._recent_tokens = []
+                logger.info("Model re-entered thinking; budget re-armed")
             return
 
         if self._forcing:
@@ -523,6 +531,7 @@ class ThinkingBudgetProcessor:
             self._done = False
             self._thinking_tokens = 0
             self._recent_tokens = []
+            logger.info("Model re-entered thinking; budget re-armed")
 
     def _is_utf8_complete(self, token_id: int) -> bool:
         """Best-effort UTF-8 boundary check for accepted token bytes."""
