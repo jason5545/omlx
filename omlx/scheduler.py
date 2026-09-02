@@ -5814,24 +5814,6 @@ class Scheduler:
                 from .api.thinking import ThinkingBudgetProcessor
 
                 think_start_id = self._get_think_token_id("think_start_id")
-                if think_start_id is None:
-                    # Tokenizers without mlx-lm's think_start_id attribute
-                    # (e.g. Qwen3.8-Flash-Next's Qwen2Tokenizer): fall back
-                    # to a direct token lookup so re-entry detection in
-                    # ThinkingBudgetProcessor still works.
-                    think_start_text = (
-                        self._get_output_parser_thinking_start_text() or "<think>"
-                    )
-                    try:
-                        candidate = self.tokenizer.convert_tokens_to_ids(
-                            think_start_text
-                        )
-                        if isinstance(candidate, int) and candidate != getattr(
-                            self.tokenizer, "unk_token_id", None
-                        ):
-                            think_start_id = candidate
-                    except (AttributeError, KeyError, TypeError):
-                        pass
                 leading_ids, trailing_ids = self._resolve_think_close_pattern(
                     self._get_output_parser_thinking_end_text()
                 )
@@ -5849,25 +5831,6 @@ class Scheduler:
                     token_to_piece=self._thinking_budget_token_to_piece,
                 )
                 logits_processors.append(processor)
-                logger.info(
-                    "Thinking budget active: budget=%d request=%s",
-                    sampling_params.thinking_budget,
-                    getattr(request, "request_id", "?"),
-                )
-            else:
-                logger.info(
-                    "Thinking budget skipped: budget=%d request=%s "
-                    "(think_end token ids unresolved)",
-                    sampling_params.thinking_budget,
-                    getattr(request, "request_id", "?"),
-                )
-        elif sampling_params.thinking_budget is not None and request is not None:
-            logger.info(
-                "Thinking budget skipped: budget=%d request=%s "
-                "(prompt does not open a thinking block)",
-                sampling_params.thinking_budget,
-                getattr(request, "request_id", "?"),
-            )
 
         # Add grammar constraint processor for structured output.
         # Phase awareness (thinking vs output) is handled by the compiled
