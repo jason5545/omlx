@@ -10661,7 +10661,11 @@ class Scheduler:
                 extra = request.vlm_extra_kwargs or {}
                 captured = extra.get("_captured_rope_deltas")
                 if captured is not None:
-                    if hasattr(captured, "item"):
+                    if isinstance(captured, mx.array):
+                        request.rope_deltas = float(
+                            captured.reshape(-1)[0].item()
+                        )
+                    elif hasattr(captured, "item"):
                         request.rope_deltas = float(captured.item())
                     else:
                         request.rope_deltas = float(captured)
