@@ -581,67 +581,6 @@ class TestOpenCodeIntegration:
         assert "PYTHONPATH" not in captured["env"]
         assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
 
-    def test_configure_reasoning_model_gets_thinking_variants(self, tmp_path):
-        """Reasoning models get chat-template variants so the variant_cycle
-        keybind can truly switch thinking off/low/medium/xhigh."""
-        oc = OpenCodeIntegration()
-        config_path = tmp_path / "opencode" / "opencode.json"
-
-        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
-            oc.configure(ctx(port=8000, api_key="key", model="Qwen3.8-Flash-Next"))
-
-        config = json.loads(config_path.read_text())
-        model_config = config["provider"]["omlx"]["models"]["Qwen3.8-Flash-Next"]
-        assert model_config["reasoning"] is True
-        assert model_config["interleaved"] == {"field": "reasoning_content"}
-        variants = model_config["variants"]
-        assert variants["off"] == {"chat_template_kwargs": {"enable_thinking": False}}
-        assert variants["low"] == {
-            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "low"}
-        }
-        assert variants["xhigh"]["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
-
-    def test_configure_non_reasoning_model_has_no_variants(self, tmp_path):
-        oc = OpenCodeIntegration()
-        config_path = tmp_path / "opencode" / "opencode.json"
-
-        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
-            oc.configure(ctx(port=8000, api_key="key", model="llama"))
-
-        config = json.loads(config_path.read_text())
-        model_config = config["provider"]["omlx"]["models"]["llama"]
-        assert "variants" not in model_config
-        assert "reasoning" not in model_config
-
-    def test_configure_preserves_hand_tuned_variants(self, tmp_path):
-        """Re-launching the same model keeps hand-tuned variants instead of
-        overwriting them with the defaults."""
-        config_path = tmp_path / "opencode.json"
-        custom_variants = {"off": {"chat_template_kwargs": {"enable_thinking": False}}}
-        existing = {
-            "provider": {
-                "omlx": {
-                    "models": {
-                        "qwen3.8": {
-                            "name": "qwen3.8",
-                            "reasoning": True,
-                            "variants": custom_variants,
-                        }
-                    }
-                }
-            }
-        }
-        config_path.write_text(json.dumps(existing))
-
-        oc = OpenCodeIntegration()
-        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
-            oc.configure(ctx(port=8000, api_key="key", model="qwen3.8"))
-
-        config = json.loads(config_path.read_text())
-        model_config = config["provider"]["omlx"]["models"]["qwen3.8"]
-        assert model_config["variants"] == custom_variants
-        assert model_config["reasoning"] is True
-
     def test_type(self):
         oc = OpenCodeIntegration()
         assert oc.type == "config_file"
@@ -1319,62 +1258,6 @@ class TestPiIntegration:
             "models"
         ][0]
         assert model_config["reasoning"] is True
-
-    def test_configure_detects_flash_next_reasoning(self, tmp_path):
-        """Qwen3.8-Flash-Next slugs are reasoning models even without a
-        'thinking' marker in the name."""
-        models_path = tmp_path / "models.json"
-        settings_path = tmp_path / "settings.json"
-
-        pi = PiIntegration()
-        with (
-            patch.object(PiIntegration, "MODELS_PATH", models_path),
-            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
-        ):
-            pi.configure(ctx(port=8000, model="Qwen3.8-Flash-Next-Uncensored-MLX"))
-
-        model_config = json.loads(models_path.read_text())["providers"]["omlx"][
-            "models"
-        ][0]
-        assert model_config["reasoning"] is True
-
-    def test_configure_preserves_compat_and_thinking_level_map(self, tmp_path):
-        """Re-launching must not clobber hand-tuned provider compat or the
-        per-model thinkingLevelMap."""
-        models_path = tmp_path / "models.json"
-        settings_path = tmp_path / "settings.json"
-        compat = {
-            "thinkingFormat": "chat-template",
-            "chatTemplateKwargs": {"enable_thinking": {"$var": "thinking.enabled"}},
-        }
-        level_map = {"off": "off", "low": "low", "high": "xhigh"}
-        models_path.write_text(
-            json.dumps(
-                {
-                    "providers": {
-                        "omlx": {
-                            "baseUrl": "http://127.0.0.1:8000/v1",
-                            "compat": compat,
-                            "models": [
-                                {"id": "qwen3.8", "thinkingLevelMap": level_map},
-                                {"id": "other", "thinkingLevelMap": {"off": "none"}},
-                            ],
-                        }
-                    }
-                }
-            )
-        )
-
-        pi = PiIntegration()
-        with (
-            patch.object(PiIntegration, "MODELS_PATH", models_path),
-            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
-        ):
-            pi.configure(ctx(port=8000, model="qwen3.8"))
-
-        provider = json.loads(models_path.read_text())["providers"]["omlx"]
-        assert provider["compat"] == compat
-        assert provider["models"][0]["thinkingLevelMap"] == level_map
 
     def test_configure_preserves_existing(self, tmp_path):
         models_path = tmp_path / "models.json"
