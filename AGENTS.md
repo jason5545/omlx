@@ -20,12 +20,13 @@ upstream https://github.com/jundot/omlx.git
 
 ## 目前本地改動
 
-自 0.6.3rc1 merge 起，這個 fork 盡量貼齊 upstream，只保留三個本地功能；其他一律 follow upstream（舊的 VLM/MTP、MTPLX、thinking-budget patch stack 已整批丟棄，存在 `backup/pre-upstream-merge` 分支僅供查閱，不要回移植）：
+自 0.6.3rc1 merge 起，這個 fork 盡量貼齊 upstream，只保留四個本地功能；其他一律 follow upstream（舊的 VLM/MTP、MTPLX、thinking-budget patch stack 已整批丟棄，存在 `backup/pre-upstream-merge` 分支僅供查閱，不要回移植）：
 
 - API sub-key 可以套 request policy（`identify_api_key` → `DEFAULT_SUB_KEY_POLICIES`）。`voco` 預設是 `max_context_window<=16384` 且 `enable_thinking=false`。相關檔案：`omlx/server.py`、`omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`。
 - Mac app attach mode：`8000` 上已有健康 oMLX server 時 app 直接 attach，不顯示 port conflict；細節見下面 Mac app 章節。相關檔案：`apps/omlx-mac/Sources/Server/ServerProcess.swift` 等 6 個 Swift 檔。
 - `Formula/omlx.rb` 的 homepage/HEAD 指向 `https://github.com/jason5545/omlx.git`（xgrammar macOS arm64 post-install patch 已被 upstream 吸收，不需再維護本地版）。
 - qwen3_5_moe VLM 強制 sanitize（`omlx/engine/vlm.py` 的 `_force_qwen35_moe_sanitize_on_load`）：mlx-vlm 用第一個 glob 到的 shard metadata 判斷 `is_mlx_format`，mixed-metadata checkpoint（如 Ornith-1.5 MXFP8）會跳過 sanitize，per-expert MTP MoE 權重沒堆疊成 switch_mlp，strict load 失敗 → 退回純 LLM、視覺被靜默丟掉。追 upstream 時守住這段。
+- EnginePool 只允許一個 resident model：harness 或 API request 從 model A 切到 model B 時，先 unload 其他閒置 engine，再載入 B；如果 A 有 active request 或 lease，回 `ModelBusyError`，不要硬拆進行中的 request。相關檔案：`omlx/engine_pool.py`、`omlx/admin/routes.py`、`tests/test_engine_pool.py`。
 
 追 upstream 時，conflict 只要守住上面幾塊，其餘一律取 upstream 版本。不要留下手動改 site-packages 的最終狀態。
 
@@ -154,6 +155,7 @@ brew services restart jason5545/omlx/omlx
 
 - `omlx/server.py`（sub-key policy hooks、`DEFAULT_SUB_KEY_POLICIES`）
 - `omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`
+- `omlx/engine_pool.py`（single-model residency；不要恢復成可同時 resident 多個 model 的 admission 行為）
 - `apps/omlx-mac/Sources/Server/ServerProcess.swift`（attach mode）
 - `Formula/omlx.rb`（homepage/head 要維持 jason5545）
 
