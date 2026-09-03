@@ -1520,6 +1520,9 @@ class EnginePool:
                     await self._unload_engine(model_id)
                     unloaded_for_admission = True
                 elif entry.engine is not None:
+                    unloaded_for_admission = (
+                        await self._unload_other_models_for_single_model(model_id)
+                    )
                     self._validate_llm_engine_ready(model_id, entry.engine)
                     if entry.runtime_settings_signature is None:
                         entry.runtime_settings_signature = expected_signature
@@ -1530,6 +1533,10 @@ class EnginePool:
 
             self._raise_if_model_path_missing_locked(model_id, entry)
             self._raise_if_load_failed(model_id, entry)
+            unloaded_for_admission = (
+                await self._unload_other_models_for_single_model(model_id)
+                or unloaded_for_admission
+            )
 
             # Pre-load admission against the memory ceiling from the
             # process memory enforcer (min of static and dynamic). Try
@@ -1819,6 +1826,52 @@ class EnginePool:
             return None
         candidates.sort()  # Sort by last_access (oldest first)
         return candidates[0][1]
+
+    async def _unload_other_models_for_single_model(
+        self, model_id: str
+    ) -> bool:
+        """Unload every other resident model before loading ``model_id``.
+
+        The normal admission path is memory-aware, but allowing two models to
+        remain resident is still harmful for model-switching workloads such as
+        the benchmark harness: a second model can fit under the configured
+        ceiling while leaving the first model's weights, caches, and runtime
+        state alive. Keep the pool's resident set to one model instead.
+
+        Caller must hold ``self._lock``. Do not partially switch when another
+        model is active; first inspect all victims and fail with a useful busy
+        error if any of them still owns a lease or scheduler work.
+
+        Returns whether at least one model was unloaded. The admission path
+        uses this to distinguish reclaimable residue from unrelated process
+        memory when it rechecks the memory ceiling.
+        """
+        victims: list[str] = []
+        blocked: list[str] = []
+        for mid, entry in list(self._entries.items()):
+            if mid == model_id or entry.engine is None:
+                continue
+            if entry.is_loading or self._entry_is_busy(entry):
+                blocked.append(mid)
+            else:
+                victims.append(mid)
+
+        if blocked:
+            raise ModelBusyError(
+                blocked[0],
+                f"unload before loading '{model_id}' (other models are active: "
+                f"{', '.join(blocked)})",
+            )
+
+        for victim in victims:
+            logger.info(
+                "Unloading model '%s' before loading '%s' to enforce "
+                "single-model residency",
+                victim,
+                model_id,
+            )
+            await self._unload_engine(victim)
+        return bool(victims)
 
     async def _unload_other_dflash_engines(self, model_id: str) -> None:
         """Unload other idle DFlash engines before starting a new one.

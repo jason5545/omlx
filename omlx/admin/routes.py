@@ -2959,7 +2959,7 @@ async def update_model_settings(
             logger.warning(f"Auto-unload failed for {model_id}: {e}")
         if auto_unloaded and was_pinned:
             try:
-                await engine_pool._load_engine(model_id)
+                await engine_pool.get_engine(model_id)
                 auto_reloaded = True
                 logger.info(f"Auto-reloaded pinned model {model_id} with new settings.")
             except Exception as e:

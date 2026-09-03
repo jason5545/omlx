@@ -1592,6 +1592,65 @@ class TestEnginePoolAsync:
         shutdown_executor.assert_called_once_with()
 
 
+class TestEnginePoolSingleModelResidency:
+    """The pool keeps only the requested model resident."""
+
+    @pytest.mark.asyncio
+    async def test_switching_models_unloads_previous_model_even_when_it_fits(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+        monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+
+        engine_a = MagicMock()
+        engine_a.start = AsyncMock()
+        engine_a.stop = AsyncMock()
+        engine_a.has_active_requests.return_value = False
+        engine_b = MagicMock()
+        engine_b.start = AsyncMock()
+        engine_b.stop = AsyncMock()
+        engine_b.has_active_requests.return_value = False
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", side_effect=[engine_a, engine_b]),
+            patch("omlx.engine_pool.mx.synchronize"),
+            patch("omlx.engine_pool.mx.clear_cache"),
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+
+        engine_a.stop.assert_awaited_once()
+        assert pool.get_entry("model-a").engine is None
+        assert pool.get_entry("model-b").engine is engine_b
+        assert pool.loaded_model_count == 1
+
+    @pytest.mark.asyncio
+    async def test_switching_models_does_not_interrupt_active_model(
+        self, small_mock_model_dir
+    ):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        engine_a = MagicMock()
+        engine_a.start = AsyncMock()
+        engine_a.stop = AsyncMock()
+        engine_a.has_active_requests.return_value = False
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=engine_a):
+            await pool.get_engine("model-a")
+            pool.get_entry("model-a").in_use = 1
+
+            with pytest.raises(ModelBusyError, match="unload before loading"):
+                await pool.get_engine("model-b")
+
+        engine_a.stop.assert_not_awaited()
+        assert pool.get_entry("model-a").engine is engine_a
+        assert pool.get_entry("model-b").engine is None
+        assert pool.loaded_model_count == 1
+
+
 class TestEnginePoolEviction:
     """Tests for memory-based eviction."""
 
@@ -1804,8 +1863,10 @@ class TestEnginePoolEviction:
         assert pool.loaded_model_count == 0
 
     @pytest.mark.asyncio
-    async def test_insufficient_memory_all_pinned(self, tight_memory_pool):
-        """Test InsufficientMemoryError when all models are pinned."""
+    async def test_pinned_model_is_unloaded_when_switching(
+        self, tight_memory_pool
+    ):
+        """Single-model residency takes precedence over pinning on a switch."""
         pool = tight_memory_pool
 
         # Pin model-a
@@ -1813,14 +1874,20 @@ class TestEnginePoolEviction:
 
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        mock_engine.has_active_requests.return_value = False
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
             # Load pinned model-a
             await pool.get_engine("model-a")
 
-            # Try to load model-b - should fail (can't evict pinned model-a)
-            with pytest.raises(InsufficientMemoryError):
-                await pool.get_engine("model-b")
+            # Loading model-b still leaves exactly one model resident.
+            await pool.get_engine("model-b")
+
+        mock_engine.stop.assert_awaited_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is mock_engine
+        assert pool.loaded_model_count == 1
 
 
 class TestAdmissionSoftTargetEviction:
@@ -1884,16 +1951,16 @@ class TestAdmissionSoftTargetEviction:
         assert pool.loaded_model_count == 1
 
     @pytest.mark.asyncio
-    async def test_over_soft_with_nothing_evictable_admits_under_ceiling(
+    async def test_pinned_model_is_unloaded_before_switch(
         self, soft_band_pool, caplog
     ):
-        """The soft target only decides when eviction starts; with no idle
-        victim a load that fits the ceiling must still be admitted."""
+        """A pinned model cannot make the resident set exceed one model."""
         pool = soft_band_pool
         pool._entries["model-a"].is_pinned = True
 
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
         mock_engine.has_active_requests.return_value = False
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
@@ -1901,17 +1968,17 @@ class TestAdmissionSoftTargetEviction:
             with caplog.at_level(logging.INFO, logger="omlx.engine_pool"):
                 await pool.get_engine("model-b")
 
-        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-a"].engine is None
         assert pool._entries["model-b"].engine is not None
-        assert any(
-            "above the admission soft target" in r.message for r in caplog.records
-        )
+        assert pool.loaded_model_count == 1
+        mock_engine.stop.assert_awaited_once()
+        assert any("single-model residency" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_pair_under_soft_target_keeps_both_loaded(
+    async def test_pair_under_soft_target_still_keeps_one_loaded(
         self, small_mock_model_dir, monkeypatch
     ):
-        """No eviction when the projected total stays under the soft target."""
+        """Single-model residency applies even below the soft target."""
         pool = _make_pool(ceiling=8000)
         pool._get_admission_soft_target = lambda: 4000
         pool.discover_models(str(small_mock_model_dir))
@@ -1923,15 +1990,17 @@ class TestAdmissionSoftTargetEviction:
 
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
         mock_engine.has_active_requests.return_value = False
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
             await pool.get_engine("model-a")
             await pool.get_engine("model-b")
 
-        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-a"].engine is None
         assert pool._entries["model-b"].engine is not None
-        assert pool.loaded_model_count == 2
+        assert pool.loaded_model_count == 1
+        mock_engine.stop.assert_awaited_once()
 
 
 class TestGuardOffBestEffortAdmission:
@@ -1981,15 +2050,16 @@ class TestGuardOffBestEffortAdmission:
         assert pool._entries["model-b"].engine is not None
 
     @pytest.mark.asyncio
-    async def test_nothing_evictable_admits_over_ceiling(
+    async def test_pinned_model_is_unloaded_with_guard_off(
         self, guard_off_pool, caplog
     ):
-        """Guard off + nothing to evict: warn and load anyway, never raise."""
+        """The hard resident-model cap also applies when the guard is off."""
         pool = guard_off_pool
         pool._entries["model-a"].is_pinned = True
 
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
         mock_engine.has_active_requests.return_value = False
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
@@ -1997,15 +2067,17 @@ class TestGuardOffBestEffortAdmission:
             with caplog.at_level(logging.WARNING, logger="omlx.engine_pool"):
                 await pool.get_engine("model-b")
 
-        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-a"].engine is None
         assert pool._entries["model-b"].engine is not None
-        assert any("memory guard disabled" in r.message for r in caplog.records)
+        assert pool.loaded_model_count == 1
+        mock_engine.stop.assert_awaited_once()
+        assert any("single-model residency" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_no_admission_callback_admits_unconditionally(
+    async def test_no_admission_callback_still_enforces_single_model(
         self, small_mock_model_dir, monkeypatch
     ):
-        """Standalone pools (no enforcer wired) keep admitting everything."""
+        """Standalone pools also keep only the requested model resident."""
         pool = _make_pool(ceiling=None)
         pool.discover_models(str(small_mock_model_dir))
         monkeypatch.setattr(
@@ -2016,14 +2088,17 @@ class TestGuardOffBestEffortAdmission:
 
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
         mock_engine.has_active_requests.return_value = False
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
             await pool.get_engine("model-a")
             await pool.get_engine("model-b")
 
-        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-a"].engine is None
         assert pool._entries["model-b"].engine is not None
+        assert pool.loaded_model_count == 1
+        mock_engine.stop.assert_awaited_once()
 
 
 class TestEnginePoolPrefillEviction:
