@@ -1930,7 +1930,7 @@ class EnginePool:
             )
 
         for victim in victims:
-            logger.info(
+            logger.warning(
                 "Unloading model '%s' before loading '%s' to enforce "
                 "single-model residency",
                 victim,
