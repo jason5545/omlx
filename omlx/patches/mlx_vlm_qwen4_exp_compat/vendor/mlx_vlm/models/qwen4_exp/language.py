@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import mmap
 import os
 import struct
+import time
 import weakref
 from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
@@ -32,6 +35,9 @@ from .qsa_fast import (
     contiguous_causal_gathered_qsa_decode,
     pool_completed_index_keys,
 )
+from . import hc_fused
+
+logger = logging.getLogger(__name__)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
@@ -1009,6 +1015,18 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
         return size + self.indexer_nbytes
 
 
+# Dispatch each decoder layer's graph to the GPU as soon as it is built (decode and
+# verify rows only) so the GPU executes layer i while the host builds layer i+1.
+# Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0.
+_EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+_EAGER_DISPATCH_MAX_ROWS = 64
+
+
 class Qwen4ExpRMSNorm(nn.Module):
     """Qwen4 RMSNorm, whose checkpoint weights are centered at zero."""
 
@@ -1022,14 +1040,14 @@ class Qwen4ExpRMSNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
-        y = x.astype(mx.float32)
-        if self.group_size is not None:
-            y = y.reshape(*y.shape[:-1], -1, self.group_size)
-            weight = self.weight.reshape(-1, self.group_size)
-        else:
-            weight = self.weight
-        y = y * mx.rsqrt(mx.mean(mx.square(y), axis=-1, keepdims=True) + self.eps)
-        y = y * (1.0 + weight.astype(mx.float32))
+        scale = 1.0 + self.weight.astype(mx.float32)
+        if self.group_size is None:
+            return mx.fast.rms_norm(x, scale, self.eps).astype(dtype)
+        # rms_norm takes a 1-D weight, so a grouped norm cannot hand it the
+        # per-group scale; normalise over the group axis and scale afterwards.
+        # The scale stays fp32 -- rounding (1 + w) to bf16 costs half a ULP.
+        y = x.astype(mx.float32).reshape(*x.shape[:-1], -1, self.group_size)
+        y = mx.fast.rms_norm(y, None, self.eps) * scale.reshape(-1, self.group_size)
         return y.reshape(x.shape).astype(dtype)
 
 
@@ -1571,6 +1589,10 @@ class Qwen4ExpGatedResidual(nn.Module):
             )
 
     def __call__(self, hyper_input: mx.array, target_verify: bool = False):
+        if hc_fused.compatible(self, hyper_input):
+            fused = hc_fused.fused_forward(self, hyper_input)
+            if fused is not None:
+                return fused
         compiled_forward = getattr(self, "_compiled_forward", None)
         if (
             compiled_forward is not None
@@ -1816,6 +1838,18 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+# Prefetch unseen pages concurrently to overlap SSD reads; keep mmap as the
+# data path. Remembering pages avoids repeating thread-pool work on warm reads.
+# os.pread releases the GIL and does not change the shared file position.
+_PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
+_PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+# Slow gathers may indicate page eviction. Allow normal gather overhead and
+# rate-limit retries; elapsed time is a heuristic, not a residency check.
+_PLE_REARM_FLOOR_SECONDS = 0.0005
+_PLE_REARM_PER_ROW_SECONDS = 2e-6
+_PLE_REARM_MIN_INTERVAL_SECONDS = 60.0
+
+
 class _SafeTensorMMap:
     """Read selected dense or affine-packed rows without resident weights."""
 
@@ -1826,6 +1860,11 @@ class _SafeTensorMMap:
         self._header = json.loads(self._file.read(header_size))
         self._data_start = 8 + header_size
         self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        self._seen_pages = bytearray(
+            1 + (max(path.stat().st_size, 1) - 1) // _PLE_PAGE_SIZE
+        )
+        self._last_rearm = 0.0
+        self._rearm_count = 0
         try:
             self._mapping.madvise(mmap.MADV_RANDOM)
         except (AttributeError, OSError):
@@ -1854,19 +1893,84 @@ class _SafeTensorMMap:
         np_dtype, item_size = dtype_info
         if len(shape) != 2 or end - start != math.prod(shape) * item_size:
             raise ValueError(f"Invalid sparse PLE tensor layout for {key}")
-        view = np.ndarray(
-            shape,
-            dtype=np_dtype,
-            buffer=self._mapping,
-            offset=self._data_start + start,
-        )
-        copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
+        row_indices = np.asarray(rows, dtype=np.intp)
+        if row_indices.size == 0:
+            copied = np.empty((0, shape[1]), dtype=np_dtype)
+        else:
+            gather_start = None
+            if row_indices.size > 8:
+                fully_seen = self._prefetch_missing_pages(
+                    row_indices,
+                    self._data_start + start,
+                    shape[1] * item_size,
+                )
+                gather_start = time.perf_counter() if fully_seen else None
+            view = np.ndarray(
+                shape,
+                dtype=np_dtype,
+                buffer=self._mapping,
+                offset=self._data_start + start,
+            )
+            copied = np.array(view[row_indices], copy=True)
+            if gather_start is not None:
+                self._rearm_if_slow(
+                    time.perf_counter() - gather_start, row_indices.size
+                )
         if dtype == "BF16":
             values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
             return mx.array(values).astype(mx.bfloat16)
         if dtype == "F8_E4M3":
             return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
         return mx.array(copied)
+
+    def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
+        """Prefetch unmarked pages; return whether all were already marked."""
+        offsets = base_offset + row_indices * row_bytes
+        needed_pages = np.unique(
+            np.concatenate(
+                (offsets // _PLE_PAGE_SIZE, (offsets + row_bytes - 1) // _PLE_PAGE_SIZE)
+            )
+        )
+        seen = np.frombuffer(self._seen_pages, dtype=np.uint8)
+        fresh = needed_pages[seen[needed_pages] == 0]
+        if fresh.size == 0:
+            return True
+        fd = self._file.fileno()
+
+        def touch(page: int) -> None:
+            offset = int(page) * _PLE_PAGE_SIZE
+            remaining = _PLE_PAGE_SIZE
+            while remaining > 0:
+                chunk = os.pread(fd, remaining, offset + (_PLE_PAGE_SIZE - remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+
+        list(_PLE_IO_POOL.map(touch, (int(page) for page in fresh.tolist())))
+        for page in fresh.tolist():
+            self._seen_pages[page] = 1
+        return False
+
+    def _rearm_if_slow(self, elapsed: float, row_count: int) -> None:
+        """Allow another prefetch after a slow gather, at most once per interval."""
+        budget = _PLE_REARM_FLOOR_SECONDS + row_count * _PLE_REARM_PER_ROW_SECONDS
+        if elapsed < budget:
+            return
+        now = time.monotonic()
+        if now - self._last_rearm < _PLE_REARM_MIN_INTERVAL_SECONDS:
+            return
+        self._last_rearm = now
+        self._seen_pages = bytearray(len(self._seen_pages))
+        self._rearm_count += 1
+        logger.info(
+            "PLE: warm gather of %d rows took %.1f ms (memcpy budget %.1f ms); "
+            "eviction suspected, re-armed seen-page bitmap for %s (#%d)",
+            row_count,
+            elapsed * 1e3,
+            budget * 1e3,
+            self.path.name,
+            self._rearm_count,
+        )
 
     def close(self):
         if self._mapping is not None:
@@ -2585,6 +2689,12 @@ class Qwen4ExpModel(nn.Module):
                 gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
             )
+            if (
+                _EAGER_DISPATCH
+                and hidden_states.shape[0] * hidden_states.shape[1]
+                <= _EAGER_DISPATCH_MAX_ROWS
+            ):
+                mx.async_eval(hidden_states)
             if hidden_sink is not None and index in capture:
                 hidden_sink.append(
                     self.hyper_connection_mixer(
