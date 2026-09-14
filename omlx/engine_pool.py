@@ -18,6 +18,7 @@ import copy
 import gc
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -206,7 +207,7 @@ class EngineEntry:
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     actual_size: int | None = None  # Observed process-memory delta after load settles
     runtime_estimated_size: int | None = None  # Includes active load-time variants
-    runtime_settle_size: int | None = None  # Excludes K2 ANE admission headroom
+    runtime_settle_size: int | None = None  # Excludes K2 ANE storage
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
@@ -355,7 +356,7 @@ class EnginePool:
         base_size: int | None = None,
         include_ane_reservation: bool = True,
     ) -> int:
-        """Include runtime storage and optional K2 ANE admission headroom."""
+        """Include Engram runtime storage and optional K2 ANE reservations."""
 
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
@@ -363,8 +364,22 @@ class EnginePool:
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
             entry, runtime_settings
         )
-        if qwen4_offload and qwen4_estimate is not None:
-            base = min(base, qwen4_estimate.mmap_bytes)
+        if qwen4_estimate is not None:
+            base = min(
+                base,
+                qwen4_estimate.mmap_bytes
+                if qwen4_offload
+                else qwen4_estimate.resident_bytes,
+            )
+        v41_offload, _, v41_estimate = self._deepseek_v41_engram_offload_status(
+            entry, runtime_settings
+        )
+        if v41_estimate is not None:
+            base = (
+                v41_estimate.mmap_bytes
+                if v41_offload
+                else v41_estimate.resident_bytes
+            )
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -399,6 +414,26 @@ class EnginePool:
                 shared_fraction=runtime_settings.qwen35_ane_prefill_shared_fraction,
                 width=runtime_settings.qwen35_ane_prefill_sequence_length,
             )
+        if getattr(runtime_settings, "moe_expert_offload_enabled", False):
+            from .patches.moe_expert_offload import estimate_offload_admission_bytes
+
+            fraction = runtime_settings.moe_expert_offload_resident_fraction
+            if entry.config_model_type == "deepseek_v41":
+                if (
+                    v41_estimate is None
+                    and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+                ):
+                    from .patches.deepseek_v41.moe_offload import (
+                        estimate_expert_savings,
+                    )
+
+                    base = max(
+                        0, base - estimate_expert_savings(entry.model_path, fraction)
+                    )
+            elif qwen4_estimate is None:
+                base = estimate_offload_admission_bytes(
+                    entry.model_path, base, fraction
+                )
         return base + extra
 
     def _qwen4_ple_offload_status(
@@ -419,6 +454,23 @@ class EnginePool:
             )
 
             estimate = qwen4_exp_residency_estimate(entry.model_path)
+            if getattr(settings, "moe_expert_offload_enabled", False):
+                from .patches.moe_expert_offload import estimate_offload_admission_bytes
+
+                fraction = settings.moe_expert_offload_resident_fraction
+                # Price expert residency before deciding whether PLE must use SSD.
+                # The entry projection consumes these adjusted estimates once.
+                saved = estimate.checkpoint_bytes - estimate_offload_admission_bytes(
+                    entry.model_path, estimate.checkpoint_bytes, fraction
+                )
+                # PLE estimates include a 5% allowance on checkpoint bytes;
+                # offloaded expert bytes must release the same allowance.
+                saved = int(saved * 1.05)
+                estimate = replace(
+                    estimate,
+                    resident_bytes=max(0, estimate.resident_bytes - saved),
+                    mmap_bytes=max(0, estimate.mmap_bytes - saved),
+                )
         except (OSError, TypeError, ValueError):
             logger.debug(
                 "Could not inspect Qwen4-Exp PLE residency for %s",
@@ -469,6 +521,96 @@ class EnginePool:
             return settings
         effective = copy.copy(settings)
         setattr(effective, "qwen4_ple_ssd_offload", True)
+        return effective
+
+    def _deepseek_v41_engram_offload_status(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        *,
+        ceiling: int | None = None,
+    ) -> tuple[bool, bool, object | None]:
+        """Resolve requested/forced DeepSeek V4.1 Engram mmap mode for this process."""
+
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if model_type != "deepseek_v41":
+            return False, False, None
+        try:
+            from .patches.deepseek_v41.residency import (
+                deepseek_v41_residency_estimate,
+            )
+
+            estimate = deepseek_v41_residency_estimate(entry.model_path)
+            if not estimate.supported:
+                return False, False, None
+            if (
+                getattr(settings, "moe_expert_offload_enabled", False)
+                and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+            ):
+                from .patches.deepseek_v41.moe_offload import estimate_expert_savings
+
+                saved = estimate_expert_savings(
+                    entry.model_path, settings.moe_expert_offload_resident_fraction
+                )
+                estimate = replace(
+                    estimate,
+                    resident_bytes=max(0, estimate.resident_bytes - int(saved * 1.05)),
+                    mmap_bytes=max(0, estimate.mmap_bytes - int(saved * 1.05)),
+                )
+        except (KeyError, OSError, TypeError, ValueError):
+            logger.debug(
+                "Could not inspect DeepSeek V4.1 Engram residency for %s",
+                entry.model_id,
+                exc_info=True,
+            )
+            return False, False, None
+        # Normal residency calls use the stable ceiling so a post-unload
+        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
+        # pass its earlier live ceiling explicitly when only mmap fits.
+        if ceiling is None:
+            ceiling = self._residency_ceiling()
+            if ceiling <= 0:
+                ceiling = self._fallback_admission_ceiling()
+            if ceiling <= 0:
+                ceiling = self._current_ceiling()
+        forced = estimate.force_ssd_offload(ceiling)
+        if forced:
+            logger.warning(
+                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB exceeds the "
+                "%.1fGB memory ceiling (mmap needs %.1fGB).",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
+        requested = bool(
+            settings is not None
+            and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
+        )
+        return requested or forced, forced, estimate if estimate.supported else None
+
+    def _effective_deepseek_v41_model_settings(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        *,
+        ceiling: int | None = None,
+    ) -> object | None:
+        """Apply a forced mmap decision without mutating persisted settings."""
+
+        enabled, forced, _ = self._deepseek_v41_engram_offload_status(
+            entry,
+            settings,
+            ceiling=ceiling,
+        )
+        if not enabled or not forced:
+            return settings
+        if settings is None:
+            from .model_settings import ModelSettings
+
+            settings = ModelSettings()
+        effective = copy.copy(settings)
+        effective.deepseek_v41_engram_ssd_offload = True
         return effective
 
     @property
@@ -662,6 +804,14 @@ class EnginePool:
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
+            v41_offload, _, _ = self._deepseek_v41_engram_offload_status(
+                entry, settings
+            )
+            add("deepseek_v41_engram_ssd_offload", v41_offload)
+            add(
+                "deepseek_v41_ced_prefill_enabled",
+                getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
+            )
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
@@ -744,6 +894,14 @@ class EnginePool:
                     "qwen35_ane_prefill_cpu_shared_resource",
                     data.get("qwen35_ane_prefill_cpu_shared_resource", True),
                 )
+
+        moe_offload_active = bool(data.get("moe_expert_offload_enabled", False))
+        add("moe_expert_offload_enabled", moe_offload_active)
+        if moe_offload_active:
+            add(
+                "moe_expert_offload_resident_fraction",
+                data.get("moe_expert_offload_resident_fraction", 0.25),
+            )
 
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"
@@ -1586,16 +1744,16 @@ class EnginePool:
                 model_id,
                 runtime_settings,
             )
-            qwen4_admission_ceiling = None
-            if (
-                (entry.config_model_type or "").replace("-", "_").lower()
-                == "qwen4_exp"
-            ):
+            ngram_admission_ceiling = None
+            if (entry.config_model_type or "").replace("-", "_").lower() in {
+                "qwen4_exp",
+                "deepseek_v41",
+            }:
                 candidate = self._current_ceiling()
                 if candidate <= 0:
                     candidate = self._fallback_admission_ceiling()
                 if candidate > 0:
-                    qwen4_admission_ceiling = candidate
+                    ngram_admission_ceiling = candidate
             unloaded_for_admission = False
 
             # Already loaded - just update access time
@@ -1693,11 +1851,14 @@ class EnginePool:
             load_settings = self._effective_qwen4_model_settings(
                 entry,
                 admission_settings,
-                ceiling=qwen4_admission_ceiling,
+                ceiling=ngram_admission_ceiling,
             )
-            qwen4_admission_override = load_settings is not admission_settings
+            load_settings = self._effective_deepseek_v41_model_settings(
+                entry, load_settings, ceiling=ngram_admission_ceiling
+            )
+            ngram_admission_override = load_settings is not admission_settings
             runtime_load_settings = (
-                load_settings if qwen4_admission_override else runtime_settings
+                load_settings if ngram_admission_override else runtime_settings
             )
             admission_size = self._entry_runtime_resident_size(
                 entry,
@@ -1705,6 +1866,7 @@ class EnginePool:
                 base_size=admission_size,
             )
             admission_kind = "local shard" if deployment is not None else "model"
+
             ceiling = self._current_ceiling()
             best_effort = False
             if ceiling <= 0:
@@ -1849,7 +2011,7 @@ class EnginePool:
             )
 
             loaded = self._entries[model_id]
-            if qwen4_admission_override and expected_signature is not None:
+            if ngram_admission_override and expected_signature is not None:
                 # Automatic mmap is local to this admission attempt. Keep the
                 # user's requested variant as the reuse key so the next request
                 # does not reload the model merely because pressure recovered.
@@ -2447,6 +2609,7 @@ class EnginePool:
             else resident_size
         )
         pre_unload_active = 0 if distributed else mx.get_active_memory()
+        pre_unload_footprint = 0 if distributed else get_phys_footprint()
 
         try:
             await entry.engine.stop()
@@ -2542,6 +2705,8 @@ class EnginePool:
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
 
+        # RAM Engram tables share MLX buffers with CPU views, so their packed
+        # bytes are included in both admission and Metal unload settlement.
         # Memory settle barrier: poll actual freed memory instead of
         # trusting the cumulative _current_model_memory estimate.
         # Scale tolerance with model size: estimated_size includes a 5%
@@ -2558,7 +2723,15 @@ class EnginePool:
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
-            if actual_freed >= min_expected_freed:
+            # Metal can release arrays before macOS updates its footprint
+            # ledger. Admission reads both, so wait for that drop too when
+            # measurable; otherwise an immediate settings reload can fail 507.
+            footprint_pending = (
+                0 < min_expected_freed <= pre_unload_footprint
+                and get_phys_footprint()
+                > pre_unload_footprint - min_expected_freed
+            )
+            if actual_freed >= min_expected_freed and not footprint_pending:
                 settled = True
                 logger.debug(
                     f"Settle round {_settle_round + 1} for '{model_id}': "
@@ -2586,7 +2759,8 @@ class EnginePool:
             logger.debug(
                 f"Settle round {_settle_round + 1} for '{model_id}': "
                 f"freed={format_size(actual_freed)} "
-                f"(need>={format_size(min_expected_freed)}) - retry"
+                f"(need>={format_size(min_expected_freed)}), "
+                f"footprint_pending={footprint_pending} - retry"
             )
             await asyncio.sleep(0.5)
             gc.collect()
@@ -2748,6 +2922,9 @@ class EnginePool:
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
+            model_settings = self._effective_deepseek_v41_model_settings(
+                entry, model_settings
+            )
             if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 

@@ -239,6 +239,8 @@ class ModelSettingsRequest(BaseModel):
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    deepseek_v41_engram_ssd_offload: bool | None = None
+    deepseek_v41_ced_prefill_enabled: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -268,6 +270,9 @@ class ModelSettingsRequest(BaseModel):
     # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8)
     qwen35_oq_a8_enabled: bool | None = None
     qwen35_oq_a8_min_tokens: int | None = None
+    # MoE expert offload (stream non-resident experts from the checkpoint)
+    moe_expert_offload_enabled: bool | None = None
+    moe_expert_offload_resident_fraction: float | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -682,6 +687,8 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_kv_enabled"] = False
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
+    settings["moe_expert_offload_enabled"] = False
+    settings["moe_expert_offload_resident_fraction"] = 0.25
     settings["specprefill_enabled"] = False
     settings["dflash_enabled"] = False
     settings["dflash_in_memory_cache"] = True
@@ -757,6 +764,8 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_kv_enabled = False
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
+    settings.moe_expert_offload_enabled = False
+    settings.moe_expert_offload_resident_fraction = 0.25
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -1403,6 +1412,18 @@ def set_hf_uploader(uploader):
 # =============================================================================
 
 
+def _active_bind_host(global_settings) -> str:
+    """Return the bind address in use until the next server restart."""
+
+    server_state = _get_server_state() if _get_server_state is not None else None
+    active_host = (
+        getattr(server_state, "bind_host", None)
+        if getattr(server_state, "global_settings", None) is global_settings
+        else None
+    )
+    return active_host or global_settings.server.host
+
+
 def format_size(size_bytes: int) -> str:
     """
     Format a byte size as a human-readable string.
@@ -1561,9 +1582,12 @@ async def login_page(request: Request):
 
     global_settings = _get_global_settings()
 
-    # Skip login page when skip_api_key_verification is enabled
+    # Skip login only when no-auth mode is confined to loopback.
     if global_settings is not None and global_settings.auth.skip_api_key_verification:
-        return RedirectResponse(url="/admin/dashboard", status_code=302)
+        from ..utils.network import is_loopback_bind
+
+        if is_loopback_bind(_active_bind_host(global_settings)):
+            return RedirectResponse(url="/admin/dashboard", status_code=302)
 
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
@@ -1681,7 +1705,11 @@ async def login(request: LoginRequest, response: Response):
 
 
 @router.post("/api/setup-api-key")
-async def setup_api_key(request: SetupApiKeyRequest, response: Response):
+async def setup_api_key(
+    request: SetupApiKeyRequest,
+    response: Response,
+    http_request: Request,
+):
     """
     Set up the initial API key when none is configured.
 
@@ -1692,6 +1720,7 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
     Args:
         request: SetupApiKeyRequest with api_key and api_key_confirm.
         response: FastAPI response object for setting cookies.
+        http_request: Incoming request used to verify the peer address.
 
     Returns:
         JSON response with success status.
@@ -1703,6 +1732,20 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
     from ..server import _server_state
 
     global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    from ..utils.network import is_loopback_bind, is_loopback_bind_host
+
+    peer_host = getattr(getattr(http_request, "client", None), "host", None)
+    if (
+        not is_loopback_bind(_active_bind_host(global_settings))
+        or not is_loopback_bind_host(peer_host)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Initial API key setup is only available over loopback.",
+        )
 
     # Only allow setup if no API key is currently configured
     if global_settings and global_settings.auth.api_key:
@@ -2082,6 +2125,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        from ..patches.moe_offload_compat import moe_offload_compatibility
+
+        moe_offload_supported, _ = moe_offload_compatibility(
+            model_info.get("model_path") or ""
+        )
         qwen4_ple_ssd_offload_supported = False
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
@@ -2097,6 +2145,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 estimate = qwen4_exp_residency_estimate(
                     model_info.get("model_path", "")
                 )
+                if getattr(settings, "moe_expert_offload_enabled", False):
+                    entry = engine_pool.get_entry(model_id)
+                    if entry is not None:
+                        _, _, adjusted = engine_pool._qwen4_ple_offload_status(
+                            entry, settings, ceiling=residency_ceiling
+                        )
+                        if adjusted is not None:
+                            estimate = adjusted
                 qwen4_ple_ssd_offload_supported = estimate.supported
                 qwen4_ple_ssd_offload_forced = estimate.force_ssd_offload(
                     residency_ceiling
@@ -2106,6 +2162,42 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             except (OSError, TypeError, ValueError):
                 logger.debug(
                     "Could not inspect Qwen4-Exp PLE residency for %s",
+                    model_id,
+                    exc_info=True,
+                )
+
+        deepseek_v41_engram_ssd_offload_supported = False
+        deepseek_v41_engram_ssd_offload_forced = False
+        v41_resident_bytes = 0
+        v41_mmap_bytes = 0
+        if (model_info.get("config_model_type") or "").replace(
+            "-", "_"
+        ).lower() == "deepseek_v41":
+            try:
+                from ..patches.deepseek_v41.residency import (
+                    deepseek_v41_residency_estimate,
+                )
+
+                estimate = deepseek_v41_residency_estimate(
+                    model_info.get("model_path", "")
+                )
+                if getattr(settings, "moe_expert_offload_enabled", False):
+                    entry = engine_pool.get_entry(model_id)
+                    if entry is not None:
+                        _, _, adjusted = engine_pool._deepseek_v41_engram_offload_status(
+                            entry, settings, ceiling=residency_ceiling
+                        )
+                        if adjusted is not None:
+                            estimate = adjusted
+                deepseek_v41_engram_ssd_offload_supported = estimate.supported
+                deepseek_v41_engram_ssd_offload_forced = estimate.force_ssd_offload(
+                    residency_ceiling
+                )
+                v41_resident_bytes = estimate.resident_bytes
+                v41_mmap_bytes = estimate.mmap_bytes
+            except (KeyError, OSError, TypeError, ValueError):
+                logger.debug(
+                    "Could not inspect DeepSeek V4.1 Engram residency for %s",
                     model_id,
                     exc_info=True,
                 )
@@ -2161,10 +2253,15 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
+            "moe_expert_offload_supported": moe_offload_supported,
             "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
+            "deepseek_v41_engram_ssd_offload_supported": deepseek_v41_engram_ssd_offload_supported,
+            "deepseek_v41_engram_ssd_offload_forced": deepseek_v41_engram_ssd_offload_forced,
+            "deepseek_v41_engram_resident_bytes": v41_resident_bytes,
+            "deepseek_v41_engram_mmap_bytes": v41_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2259,9 +2356,12 @@ async def _require_admin_or_bearer(request: Request) -> bool:
     """Allow admin session OR a valid Bearer API key (for CLI use)."""
     gs = _get_global_settings() if _get_global_settings else None
 
-    # No-auth mode: always allow
+    # No-auth mode is restricted to loopback-only binds.
     if gs is not None and gs.auth.skip_api_key_verification:
-        return True
+        from ..utils.network import is_loopback_bind
+
+        if is_loopback_bind(_active_bind_host(gs)):
+            return True
 
     # Valid admin session cookie
     if verify_session(request):
@@ -2491,12 +2591,24 @@ async def update_model_settings(
         )
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
+    if "deepseek_v41_ced_prefill_enabled" in sent:
+        is_v41 = (entry.config_model_type or "").replace("-", "_").lower() == "deepseek_v41"
+        current_settings.deepseek_v41_ced_prefill_enabled = bool(
+            request.deepseek_v41_ced_prefill_enabled and is_v41
+        )
     if "qwen4_ple_ssd_offload" in sent:
         is_qwen4_exp = (entry.config_model_type or "").replace(
             "-", "_"
         ).lower() == "qwen4_exp"
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
+        )
+    if "deepseek_v41_engram_ssd_offload" in sent:
+        is_deepseek_v41 = (entry.config_model_type or "").replace(
+            "-", "_"
+        ).lower() == "deepseek_v41"
+        current_settings.deepseek_v41_engram_ssd_offload = bool(
+            request.deepseek_v41_engram_ssd_offload and is_deepseek_v41
         )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
@@ -2719,6 +2831,17 @@ async def update_model_settings(
         raise HTTPException(
             status_code=400,
             detail="GDN ANE and CPU fractions must total less than 1.0.",
+        )
+    # MoE expert offload settings
+    if "moe_expert_offload_enabled" in sent:
+        current_settings.moe_expert_offload_enabled = (
+            request.moe_expert_offload_enabled or False
+        )
+    if "moe_expert_offload_resident_fraction" in sent:
+        current_settings.moe_expert_offload_resident_fraction = (
+            0.25
+            if request.moe_expert_offload_resident_fraction is None
+            else request.moe_expert_offload_resident_fraction
         )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
@@ -3226,6 +3349,19 @@ def _raise_if_alias_conflicts_exposed_profiles(
 
 
 def _validate_model_settings(entry, settings):
+    from ..model_settings import validate_moe_expert_offload
+
+    try:
+        validate_moe_expert_offload(settings)
+        if settings.get("moe_expert_offload_enabled"):
+            from ..patches.moe_offload_compat import moe_offload_compatibility
+
+            supported, reason = moe_offload_compatibility(entry.model_path)
+            if not supported:
+                raise ValueError(reason)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
     if "qwen35_oq_a8_min_tokens" in settings:
         value = settings["qwen35_oq_a8_min_tokens"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -3943,6 +4079,60 @@ async def update_global_settings(
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
+    from ..utils.network import (
+        is_loopback_bind,
+        is_valid_bind_host,
+        network_auth_error,
+    )
+
+    candidate_host = (
+        request.host
+        if request.host is not None
+        else getattr(global_settings.server, "host", "127.0.0.1")
+    )
+    host_parts = [host.strip() for host in candidate_host.split(",") if host.strip()]
+    if not host_parts:
+        raise HTTPException(status_code=400, detail="Host cannot be empty")
+    for host in host_parts:
+        if not is_valid_bind_host(host):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid host: {host!r} (must be a hostname or IP address)",
+            )
+
+    if request.api_key is not None:
+        is_valid, error_msg = validate_api_key(request.api_key)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+    candidate_api_key = (
+        request.api_key
+        if request.api_key is not None
+        else global_settings.auth.api_key
+    )
+    candidate_skip_verification = (
+        request.skip_api_key_verification
+        if request.skip_api_key_verification is not None
+        else global_settings.auth.skip_api_key_verification
+    )
+    if auth_error := network_auth_error(
+        candidate_host,
+        candidate_api_key,
+        candidate_skip_verification,
+    ):
+        raise HTTPException(status_code=400, detail=auth_error)
+    if (
+        request.skip_api_key_verification is True
+        and not is_loopback_bind(_active_bind_host(global_settings))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "API key verification cannot be skipped while the running server "
+                "is bound to a non-loopback host. Save a loopback host and restart "
+                "the server first."
+            ),
+        )
+
     # Track which settings were applied at runtime
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
@@ -3950,17 +4140,6 @@ async def update_global_settings(
 
     # Apply server settings
     if request.host is not None:
-        from ..utils.network import is_valid_bind_host
-
-        parts = [h.strip() for h in request.host.split(",") if h.strip()]
-        if not parts:
-            raise HTTPException(status_code=400, detail="Host cannot be empty")
-        for part in parts:
-            if not is_valid_bind_host(part):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid host: {part!r} (must be a hostname or IP address)",
-                )
         global_settings.server.host = request.host
     if request.port is not None:
         global_settings.server.port = request.port
@@ -4797,10 +4976,6 @@ async def update_global_settings(
     if request.api_key is not None:
         from ..server import _server_state
 
-        is_valid, error_msg = validate_api_key(request.api_key)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=error_msg)
-
         global_settings.auth.api_key = request.api_key
         _server_state.api_key = request.api_key
         runtime_applied.append("api_key")
@@ -5483,13 +5658,14 @@ def _build_runtime_cache_observability(
         try:
             num_files = 0
             total_bytes = 0
-            for subdir in "0123456789abcdef":
-                subdir_path = cache_dir / subdir
-                if not subdir_path.exists():
-                    continue
-                for f in subdir_path.glob("*.safetensors"):
-                    num_files += 1
-                    total_bytes += f.stat().st_size
+            for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
+                for subdir in "0123456789abcdef":
+                    subdir_path = root / subdir
+                    if not subdir_path.exists():
+                        continue
+                    for f in subdir_path.glob("*.safetensors"):
+                        num_files += 1
+                        total_bytes += f.stat().st_size
             payload["total_num_files"] = num_files
             payload["total_size_bytes"] = total_bytes
         except Exception as exc:
@@ -6054,16 +6230,17 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
         )
         if cache_dir.exists():
             try:
-                for subdir in "0123456789abcdef":
-                    subdir_path = cache_dir / subdir
-                    if not subdir_path.exists():
-                        continue
-                    for f in subdir_path.glob("*.safetensors"):
-                        try:
-                            f.unlink()
-                            total_deleted += 1
-                        except OSError:
-                            pass
+                for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
+                    for subdir in "0123456789abcdef":
+                        subdir_path = root / subdir
+                        if not subdir_path.exists():
+                            continue
+                        for f in subdir_path.glob("*.safetensors"):
+                            try:
+                                f.unlink()
+                                total_deleted += 1
+                            except OSError:
+                                pass
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 

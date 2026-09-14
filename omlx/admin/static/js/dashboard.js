@@ -43,6 +43,8 @@
         'qwen35_ane_prefill_cpu_gdn_fraction',
         'qwen35_ane_prefill_cpu_threads',
         'qwen35_ane_prefill_cpu_shared_resource',
+        'moe_expert_offload_enabled',
+        'moe_expert_offload_resident_fraction',
         'qwen35_oq_a8_enabled',
         'qwen35_oq_a8_min_tokens',
         'specprefill_enabled',
@@ -242,6 +244,8 @@
                 qwen35_ane_prefill_cpu_gdn_fraction: 0,
                 qwen35_ane_prefill_cpu_threads: 8,
                 qwen35_ane_prefill_cpu_shared_resource: true,
+                moe_expert_offload_enabled: false,
+                moe_expert_offload_resident_fraction: 0.25,
                 qwen35_oq_a8_enabled: false,
                 qwen35_oq_a8_min_tokens: 128,
                 trust_remote_code: false,
@@ -677,6 +681,12 @@
                     this.handleMainTabChange(value);
                 });
 
+                this.$watch('globalSettings.server.host', (value) => {
+                    if (!this.isLoopbackBindHost(value)) {
+                        this.globalSettings.auth.skip_api_key_verification = false;
+                    }
+                });
+
                 // When the user returns to this browser tab after looking
                 // elsewhere, re-check whether a different bench just started
                 // in another tab. Fires the banner without requiring an
@@ -937,6 +947,35 @@
                 }
             },
 
+            isLoopbackBindHost(value) {
+                const hosts = String(value || '')
+                    .split(',')
+                    .map(host => host.trim().toLowerCase())
+                    .filter(Boolean);
+                if (hosts.length === 0) return false;
+                return hosts.every(host => {
+                    if (host.replace(/\.+$/, '') === 'localhost') return true;
+                    if (!host.includes(':')) {
+                        const parts = host.split('.');
+                        return parts.length === 4 && parts[0] === '127'
+                            && parts.every(part => /^(0|[1-9]\d{0,2})$/.test(part)
+                                && Number(part) <= 255);
+                    }
+                    // Normalize IPv6, including expanded and IPv4-mapped forms.
+                    // A scope ID does not change whether an address is loopback.
+                    const [address, scope, extra] = host.split('%');
+                    if (extra !== undefined || scope === '') return false;
+                    if (!/^[0-9a-f:.]+$/.test(address)) return false;
+                    try {
+                        const normalized = new URL(`http://[${address}]/`).hostname;
+                        return normalized === '[::1]'
+                            || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(normalized);
+                    } catch {
+                        return false;
+                    }
+                });
+            },
+
             async saveGlobalSettings() {
                 this.saving = true;
                 this.saveSuccess = false;
@@ -962,6 +1001,15 @@
                     this.saveError = window.t('js.error.required_fields').replace('{fields}', errors.join(', '));
                     this.saving = false;
                     return;
+                }
+
+                if (!this.isLoopbackBindHost(s.server.host)) {
+                    s.auth.skip_api_key_verification = false;
+                    if (!s.auth.api_key && !s.auth.api_key_set) {
+                        this.saveError = window.t('js.error.api_key_required_network');
+                        this.saving = false;
+                        return;
+                    }
                 }
 
                 // Validate API key if provided
@@ -1667,6 +1715,18 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    deepseek_v41_ced_prefill_enabled:
+                        s.deepseek_v41_ced_prefill_enabled === true,
+                    deepseek_v41_ced_prefill_supported:
+                        String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
+                    deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
+                        || s.deepseek_v41_engram_ssd_offload === true,
+                    deepseek_v41_engram_ssd_offload_requested:
+                        s.deepseek_v41_engram_ssd_offload === true,
+                    deepseek_v41_engram_ssd_offload_supported:
+                        model?.deepseek_v41_engram_ssd_offload_supported === true,
+                    deepseek_v41_engram_ssd_offload_forced:
+                        model?.deepseek_v41_engram_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
@@ -1679,6 +1739,8 @@
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
+                    moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
@@ -2606,6 +2668,12 @@
                                 enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
                                     !!this.modelSettings.qwen4_ple_ssd_offload,
+                                deepseek_v41_ced_prefill_enabled:
+                                    !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
+                                deepseek_v41_engram_ssd_offload:
+                                    this.modelSettings.deepseek_v41_engram_ssd_offload_forced
+                                        ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
+                                        : !!this.modelSettings.deepseek_v41_engram_ssd_offload,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
@@ -2625,6 +2693,8 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
+                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
                                 qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
                                 qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,

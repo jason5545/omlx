@@ -31,7 +31,7 @@ def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
     turboquant = _section(
         html,
         "<!-- TurboQuant KV Cache -->",
-        "<!-- IndexCache (DSA models only) -->",
+        "<!-- MoE Expert Offload -->",
     )
     lightning_mtp = _section(
         html,
@@ -370,3 +370,14 @@ def test_oq_a8_i18n_keys_exist_in_every_locale():
         catalog = json.loads(path.read_text())
         missing = keys - set(catalog)
         assert not missing, f"{path.name} is missing {sorted(missing)}"
+
+
+def test_moe_expert_offload_toggle_blocks_speculative_decoding():
+    """Offload is incompatible with speculative verification paths."""
+    html = _model_settings_template()
+    section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
+    assert "modelSettings.moe_expert_offload_enabled" in section
+    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert ":disabled" in section
+    for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled"):
+        assert f"modelSettings.{key}" in section

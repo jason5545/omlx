@@ -34,6 +34,24 @@ SETTINGS_VERSION = 1
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
 
+def validate_moe_expert_offload(settings: dict) -> None:
+    fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, (int, float))
+        or not 0 < fraction <= 1
+    ):
+        raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
+    if settings.get("moe_expert_offload_enabled") and any(
+        settings.get(key)
+        for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled")
+    ):
+        raise ValueError(
+            "MoE expert offload cannot be combined with Lightning MTP, "
+            "VLM MTP, or DFlash; disable speculative decoding first."
+        )
+
+
 def ane_prefill_backend(model_type: str | None) -> str | None:
     """Select the ANE implementation from model metadata."""
     model_type = (model_type or "").lower().replace("-", "_")
@@ -218,6 +236,11 @@ class ModelSettings:
             unaffected. Changes numerics: activations are quantized to INT8.
             Mutually exclusive with qwen35_ane_prefill_enabled.
         qwen35_oq_a8_min_tokens: Shortest sequence routed to the kernels.
+        moe_expert_offload_enabled: Stream MoE expert weights from the
+            checkpoint on demand instead of keeping them all resident (fits
+            models larger than memory; costs decode speed). Requires reload.
+        moe_expert_offload_resident_fraction: Fraction of each layer's experts
+            kept resident (0 < f <= 1, default 0.25).
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -296,6 +319,11 @@ class ModelSettings:
     # through mmap. The runtime may force this on when resident loading cannot
     # fit under the configured model-memory ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
+    deepseek_v41_engram_ssd_offload: bool = False
+    # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
+    # last window-size tokens; decoder global KV is the encoder-final
+    # projection already produced by the midpoint CSA2 layer.
+    deepseek_v41_ced_prefill_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
@@ -353,6 +381,10 @@ class ModelSettings:
     # readable by the decode path.
     qwen35_oq_a8_enabled: bool = False
     qwen35_oq_a8_min_tokens: int = 128
+
+    # MoE expert offload (stream non-resident experts from the checkpoint)
+    moe_expert_offload_enabled: bool = False
+    moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
@@ -488,6 +520,7 @@ class ModelSettings:
                     "require per-request logits processors, which the "
                     "vlm_mtp decode path does not apply"
                 )
+        validate_moe_expert_offload(self.to_dict())
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
@@ -1541,7 +1574,7 @@ def merge_chat_template_kwargs(
       1. ``settings.chat_template_kwargs``
       2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
       3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
-      4. thinking budget activation when ``enable_thinking`` is still unset
+      4. positive thinking budget activation when ``enable_thinking`` is still unset
       5. the model's preserve-thinking default when it is supported and unset
     """
     merged = merge_chat_template_request_kwargs(settings, request_ct_kwargs)
@@ -1553,7 +1586,11 @@ def merge_chat_template_kwargs(
         and settings.thinking_budget_tokens
     ):
         thinking_budget = settings.thinking_budget_tokens
-    if thinking_budget is not None and "enable_thinking" not in merged:
+    if (
+        thinking_budget is not None
+        and thinking_budget > 0
+        and "enable_thinking" not in merged
+    ):
         merged["enable_thinking"] = True
 
     if (

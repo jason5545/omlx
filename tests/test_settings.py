@@ -1108,6 +1108,53 @@ class TestGlobalSettings:
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
 
+    @pytest.mark.parametrize(
+        "host",
+        ["127.0.0.1", "127.12.34.56", "localhost", "LOCALHOST.", "::1"],
+    )
+    def test_loopback_bind_does_not_require_api_key(self, host):
+        settings = GlobalSettings()
+        settings.server.host = host
+
+        assert not any("API key is required" in error for error in settings.validate())
+
+    @pytest.mark.parametrize(
+        "host",
+        ["0.0.0.0", "::", "192.168.1.10", "my-mac.local", "127.0.0.1,0.0.0.0"],
+    )
+    def test_network_bind_requires_api_key(self, host):
+        settings = GlobalSettings()
+        settings.server.host = host
+
+        assert any("API key is required" in error for error in settings.validate())
+
+    def test_network_bind_with_api_key_is_valid(self):
+        settings = GlobalSettings()
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "secret-key"
+
+        assert settings.validate() == []
+
+    def test_network_bind_rejects_api_key_bypass(self):
+        settings = GlobalSettings()
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "secret-key"
+        settings.auth.skip_api_key_verification = True
+
+        errors = settings.validate()
+
+        assert any("cannot be skipped" in error for error in errors)
+
+    @pytest.mark.parametrize("host", ["", "   ", "999.999.999.999"])
+    def test_invalid_bind_host_is_reported(self, host):
+        settings = GlobalSettings()
+        settings.server.host = host
+
+        errors = settings.validate()
+
+        assert any("host" in error.lower() for error in errors)
+        assert not any("API key is required" in error for error in errors)
+
     def test_get_effective_model_dirs_includes_hf_cache_between_dirs(
         self, tmp_path, monkeypatch
     ):

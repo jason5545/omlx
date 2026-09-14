@@ -1534,6 +1534,37 @@ class GlobalSettings:
         if not 1 <= self.server.port <= 65535:
             errors.append(f"Invalid port: {self.server.port} (must be 1-65535)")
 
+        from .utils.network import is_valid_bind_host, network_auth_error
+
+        host_parts = (
+            [
+                host.strip()
+                for host in self.server.host.split(",")
+                if host.strip()
+            ]
+            if isinstance(self.server.host, str)
+            else []
+        )
+        hosts_valid = bool(host_parts)
+        if not host_parts:
+            errors.append("Server host cannot be empty")
+        else:
+            for host in host_parts:
+                if not is_valid_bind_host(host):
+                    hosts_valid = False
+                    errors.append(
+                        f"Invalid host: {host!r} (must be a hostname or IP address)"
+                    )
+
+        if hosts_valid and (
+            auth_error := network_auth_error(
+                self.server.host,
+                self.auth.api_key,
+                self.auth.skip_api_key_verification,
+            )
+        ):
+            errors.append(auth_error)
+
         valid_log_levels = {"trace", "debug", "info", "warning", "error", "critical"}
         if self.server.log_level.lower() not in valid_log_levels:
             errors.append(
