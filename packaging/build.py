@@ -99,6 +99,47 @@ def run_cmd(cmd: list, cwd: Path = None, check: bool = True):
     return result
 
 
+# The python.org macOS installer ships OpenSSL without a populated default
+# trust store, so plain urllib downloads fail with CERTIFICATE_VERIFY_FAILED
+# unless SSL_CERT_FILE happens to be exported. Resolve a CA bundle explicitly
+# instead of trusting the interpreter default.
+_CA_BUNDLE_CANDIDATES = (
+    "/etc/ssl/cert.pem",  # macOS system roots
+    "/opt/homebrew/etc/ca-certificates/cert.pem",
+    "/opt/homebrew/etc/openssl@3/cert.pem",
+    "/usr/local/etc/ca-certificates/cert.pem",
+)
+
+
+def _ssl_context():
+    """SSL context backed by a CA bundle the build can actually verify against."""
+    import ssl
+
+    candidates: list[str] = []
+    env_bundle = os.environ.get("SSL_CERT_FILE")
+    if env_bundle:
+        candidates.append(env_bundle)
+    try:
+        import certifi
+
+        candidates.append(certifi.where())
+    except ImportError:
+        pass
+    candidates.extend(_CA_BUNDLE_CANDIDATES)
+
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return ssl.create_default_context(cafile=candidate)
+    return ssl.create_default_context()
+
+
+def _urlopen(url: str, timeout: float | None = None):
+    """urlopen that still verifies certificates without a default trust store."""
+    import urllib.request
+
+    return urllib.request.urlopen(url, context=_ssl_context(), timeout=timeout)
+
+
 def _resolve_mlx_version(toml_path: Path) -> str:
     """Resolve the mlx version that venvstacks locked.
 
@@ -121,11 +162,8 @@ def _resolve_mlx_version(toml_path: Path) -> str:
 
     # No lock file yet — query PyPI for the latest version
     import json
-    import urllib.request
 
-    data = json.loads(
-        urllib.request.urlopen("https://pypi.org/pypi/mlx/json").read()
-    )
+    data = json.loads(_urlopen("https://pypi.org/pypi/mlx/json").read())
     return data["info"]["version"]
 
 
@@ -927,7 +965,6 @@ _SPACY_MODEL_URL = (
 
 def _install_spacy_model(export_dir: Path):
     """Download and install spacy en_core_web_sm into exported framework."""
-    import urllib.request
     import zipfile
 
     fw_site = (
@@ -950,7 +987,9 @@ def _install_spacy_model(export_dir: Path):
     whl_path = SCRIPT_DIR / f"{_SPACY_MODEL}-{_SPACY_MODEL_VERSION}.whl"
 
     try:
-        urllib.request.urlretrieve(_SPACY_MODEL_URL, whl_path)
+        with _urlopen(_SPACY_MODEL_URL, timeout=120) as response:
+            with whl_path.open("wb") as fh:
+                shutil.copyfileobj(response, fh)
         with zipfile.ZipFile(whl_path) as zf:
             zf.extractall(fw_site)
         print(f"  ✓ {_SPACY_MODEL} installed")
