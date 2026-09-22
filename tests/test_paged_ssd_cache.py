@@ -1784,6 +1784,38 @@ class TestAsyncWriteAndTimeoutLoad:
         # Block should be removed from index (corrupted entry cleanup)
         assert not ssd_cache.has_block(block_hash)
 
+    @pytest.mark.parametrize(
+        "method, expected",
+        [("load_block", None), ("load_block_with_metadata", (None, None))],
+    )
+    @pytest.mark.parametrize("unlink_fails", [False, True])
+    def test_corrupt_block_cleanup_logging(
+        self, ssd_cache, mx, caplog, method, expected, unlink_fails
+    ):
+        block_hash = b"corrupt_cleanup"
+        file_path = ssd_cache._cache_dir / "corrupted.safetensors"
+        file_path.write_bytes(b"corrupted")
+        ssd_cache._index.add(
+            PagedSSDBlockMetadata(block_hash, file_path, 9, 1, 0, 0, 1)
+        )
+        original_unlink = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if unlink_fails and path == file_path:
+                raise OSError("unlink denied")
+            return original_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", unlink):
+            assert getattr(ssd_cache, method)(block_hash) == expected
+
+        assert not ssd_cache.has_block(block_hash)
+        assert file_path.exists() == unlink_fails
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == int(unlink_fails)
+        if unlink_fails:
+            assert str(file_path) in warnings[0].getMessage()
+            assert "unlink denied" in warnings[0].getMessage()
+
     def test_load_no_executor_deadlock(self, ssd_cache, mx):
         """Regression test: _load_executor must not exist (prevents deadlock)."""
         # The old implementation used ThreadPoolExecutor(max_workers=1) which
@@ -2457,6 +2489,30 @@ class TestEffectiveMaxSize:
 
         assert effective == 50 * 1024**3
         assert "Failed to check disk usage" in caplog.text
+
+    def test_hot_cache_only_missing_dir_no_warning(
+        self, tmp_path: Path, caplog
+    ):
+        """Hot-cache-only mode skips directory init, so the SSD dir legitimately
+        does not exist; disk-usage polling must not warn or even query it
+        (regression: repeated "Failed to check disk usage" warnings for the
+        deepseek_v41_ced_v1 subdirectory under hot_cache_only)."""
+        missing_dir = tmp_path / "deepseek_v41_ced_v1"
+        manager = PagedSSDCacheManager(
+            cache_dir=missing_dir,
+            max_size_bytes=200 * 1024**3,
+            hot_cache_max_bytes=1024**2,
+            hot_cache_only=True,
+        )
+        assert not missing_dir.exists()
+        with (
+            patch("shutil.disk_usage") as disk_usage,
+            caplog.at_level(logging.WARNING),
+        ):
+            effective = manager._get_effective_max_size()
+        disk_usage.assert_not_called()
+        assert effective == 200 * 1024**3
+        assert "Failed to check disk usage" not in caplog.text
 
     def test_disk_pressure_warning(self, tmp_path: Path, caplog):
         """Warn when effective max drops below 10% of configured max."""

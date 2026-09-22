@@ -14,6 +14,8 @@ Note: Uses pytest-asyncio for async tests.
 
 import asyncio
 import concurrent.futures
+import weakref
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,6 +30,12 @@ from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededErro
 from omlx.output_collector import RequestOutputCollector
 from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
+
+
+@pytest.fixture(autouse=True)
+def _mock_explicit_gc(monkeypatch):
+    # These engines use mock models. Real reclamation is covered in test_engine_teardown.
+    monkeypatch.setattr("gc.collect", lambda: 0)
 
 
 class TestEngineConfig:
@@ -629,6 +637,38 @@ class TestEngineCoreGetStats:
 class TestEngineCoreClose:
     """Tests for EngineCore.close()."""
 
+    def test_close_releases_vlm_drafter_target_with_retained_scheduler(
+        self, mock_model, mock_tokenizer
+    ):
+        from omlx.speculative.vlm_mtp import VLMMTPDrafter
+
+        class Target:
+            def project(self, hidden):
+                return hidden
+
+        engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler = engine.scheduler
+        target = Target()
+        target_ref = weakref.ref(target)
+        drafter = VLMMTPDrafter(
+            SimpleNamespace(_greedy_argmax_fn=target.project), "mtp", "/draft"
+        )
+        drafter_ref = weakref.ref(drafter)
+        scheduler.set_vlm_mtp_drafter(drafter)
+        del target, drafter
+
+        try:
+            scheduler.reset()
+            assert target_ref() is not None
+            assert drafter_ref() is not None
+            engine.close()
+            assert engine.scheduler is None
+            assert target_ref() is None
+            assert drafter_ref() is None
+        finally:
+            scheduler.set_vlm_mtp_drafter(None)
+            engine.close()
+
     def test_close_releases_model(self, mock_model, mock_tokenizer):
         """Test close() releases model ownership."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
@@ -793,6 +833,47 @@ class TestEngineCoreGenerateCancellation:
 
 class TestEngineCoreErrorPropagation:
     """Tests for error propagation from engine loop to requests."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message, terminal",
+        [
+            ("kIOGPUCommandBufferCallbackErrorSubmissionsIgnored", True),
+            ("kIOGPUCommandBufferCallbackErrorTimeout", False),
+            ("Memory limit exceeded during prefill", False),
+        ],
+    )
+    async def test_engine_loop_gpu_error_policy(
+        self, mock_model, mock_tokenizer, message, terminal
+    ):
+        engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+        engine._running = True
+
+        def recover():
+            engine._running = False
+            return []
+
+        try:
+            with (
+                patch.object(engine.scheduler, "has_requests", return_value=True),
+                patch.object(engine, "_step_burst", side_effect=RuntimeError(message)),
+                patch.object(
+                    engine.scheduler, "fail_all_requests", side_effect=recover
+                ) as recovery,
+                patch("omlx.utils.fatal.fatal_exit", side_effect=SystemExit) as fatal,
+            ):
+                if terminal:
+                    with pytest.raises(SystemExit):
+                        await engine._engine_loop()
+                    fatal.assert_called_once()
+                    recovery.assert_not_called()
+                else:
+                    await engine._engine_loop()
+                    fatal.assert_not_called()
+                    recovery.assert_called_once()
+        finally:
+            engine._running = False
+            engine.close()
 
     @pytest.mark.asyncio
     async def test_error_output_propagates_to_collector(
