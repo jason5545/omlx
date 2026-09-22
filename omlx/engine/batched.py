@@ -278,6 +278,7 @@ class BatchedEngine(BaseEngine):
             maybe_apply_pre_load_patches,
             maybe_load_custom_quantization,
             maybe_load_jang,
+            maybe_load_jangq_prism,
         )
 
         # Build tokenizer config with model-specific fixes
@@ -299,6 +300,14 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_model_sync():
+            jangq_prism_loaded = maybe_load_jangq_prism(
+                self._model_name,
+                is_vlm=False,
+                trust_remote_code=self._trust_remote_code,
+            )
+            if jangq_prism_loaded is not None:
+                return jangq_prism_loaded
+
             jang_loaded = maybe_load_jang(
                 self._model_name,
                 is_vlm=False,

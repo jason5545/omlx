@@ -1133,15 +1133,8 @@ def _is_adapter_dir(path: Path) -> bool:
 
 
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model.
-
-    A directory qualifies when it has config.json, or a JANG sidecar for
-    bundles that ship their own config.
-    """
-    has_config = (path / "config.json").exists() or any(
-        (path / name).exists() for name in JANG_CONFIG_FILES
-    )
-    return has_config and not _is_adapter_dir(path)
+    """Check if a directory contains a valid model (has config.json)."""
+    return (path / "config.json").exists() and not _is_adapter_dir(path)
 
 
 _SHARD_FILE_RE = re.compile(r"-(\d+)-of-(\d+)\.safetensors$")

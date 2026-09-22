@@ -131,7 +131,7 @@ class Omlx < Formula
 
     # jang-tools serves JANG mixed-precision bundles; omlx routes them via
     # omlx.patches.jang_load. Installed here rather than through omlx's own
-    # dependency list because the release predates the DMG layer's
+    # dependency list because the release postdates the DMG layer's
     # exclude-newer cutoff in packaging/venvstacks.toml. Every requirement
     # (mlx, mlx-lm, safetensors, numpy, tqdm, huggingface_hub, jinja2) is
     # already pinned above, so resolution only adds the pure-Python package.

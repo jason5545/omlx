@@ -11,6 +11,7 @@ from unittest import mock
 
 import pytest
 
+from omlx.engine.batched import BatchedEngine
 from omlx.exceptions import JANGDependencyError
 from omlx.model_discovery import _is_model_dir, detect_model_type
 from omlx.patches.jang_load import (
@@ -21,7 +22,7 @@ from omlx.patches.jang_load import (
     load_jang,
     read_jang_config,
 )
-from omlx.utils.model_loading import maybe_load_jang
+from omlx.utils.model_loading import maybe_load_jang, maybe_load_jangq_prism
 
 
 def _write(directory: Path, name: str, payload: dict) -> Path:
@@ -169,10 +170,10 @@ class TestDetection:
         _write(directory, "preprocessor_config.json", {"patch_size": 16})
         assert detect_model_type(directory) == "llm"
 
-    def test_jang_sidecar_alone_is_a_model_dir(self, tmp_path):
+    def test_jang_sidecar_without_config_is_not_a_model_dir(self, tmp_path):
         directory = tmp_path / "bundle"
         _write(directory, "jang_config.json", {"format": "jang", "format_version": "2.0"})
-        assert _is_model_dir(directory) is True
+        assert _is_model_dir(directory) is False
 
     def test_adapter_dir_with_jang_sidecar_is_not_a_model_dir(self, tmp_path):
         directory = tmp_path / "adapter"
@@ -238,6 +239,51 @@ class TestMaybeLoadJang:
     def test_returns_none_for_prism_repack(self, tmp_path):
         directory = _jangq_prism_dir(tmp_path / "jangq")
         assert maybe_load_jang(str(directory), is_vlm=True) is None
+
+    def test_jangq_prism_refuses_text_only_load(self, tmp_path):
+        directory = _jangq_prism_dir(tmp_path / "jangq")
+        with pytest.raises(ValueError, match="cannot be served text-only"):
+            maybe_load_jangq_prism(str(directory), is_vlm=False)
+
+    def test_jangq_prism_loader_returns_none_for_plain_model(self, tmp_path):
+        directory = tmp_path / "plain"
+        _write(directory, "config.json", {"model_type": "llama"})
+        assert maybe_load_jangq_prism(str(directory), is_vlm=False) is None
+
+    @pytest.mark.asyncio
+    async def test_batched_engine_refuses_jangq_before_other_loaders(
+        self, tmp_path, monkeypatch
+    ):
+        from omlx.engine import batched as batched_module
+        from omlx.utils import model_loading
+
+        directory = _jangq_prism_dir(tmp_path / "jangq")
+        calls: list[str] = []
+
+        def record_call(name):
+            def recorder(*args, **kwargs):
+                calls.append(name)
+                return None
+
+            return recorder
+
+        monkeypatch.setattr(
+            batched_module, "get_tokenizer_config", lambda *args, **kwargs: {}
+        )
+        monkeypatch.setattr(
+            model_loading, "maybe_apply_pre_load_patches", lambda *args, **kwargs: None
+        )
+        for name in (
+            "maybe_load_jang",
+            "maybe_load_custom_quantization",
+            "lm_load_compat",
+        ):
+            monkeypatch.setattr(model_loading, name, record_call(name))
+
+        with pytest.raises(ValueError, match="cannot be served text-only"):
+            await BatchedEngine(model_name=str(directory)).start()
+
+        assert calls == []
 
     def test_refuses_text_only_load_of_vision_bundle(self, tmp_path):
         directory = _jang_dir(tmp_path / "bundle", has_vision=True)
