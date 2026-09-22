@@ -1970,6 +1970,7 @@ class VLMBatchedEngine(BaseEngine):
         from ..scheduler import SchedulerConfig
         from ..utils.model_loading import (
             maybe_load_custom_quantization,
+            maybe_load_jang,
             maybe_load_jangq_prism,
         )
 
@@ -2015,6 +2016,14 @@ class VLMBatchedEngine(BaseEngine):
                 )
                 if jangq_loaded is not None:
                     return jangq_loaded
+
+                jang_loaded = maybe_load_jang(
+                    self._model_name,
+                    is_vlm=True,
+                    trust_remote_code=self._trust_remote_code,
+                )
+                if jang_loaded is not None:
+                    return jang_loaded
 
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,

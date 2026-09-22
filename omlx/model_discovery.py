@@ -28,6 +28,15 @@ logger = logging.getLogger(__name__)
 ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
 EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
 
+# JANG bundles keep their quantization and modality metadata in one of these
+# sidecars; see omlx.patches.jang_load.
+JANG_CONFIG_FILES = (
+    "jang_config.json",
+    "jjqf_config.json",
+    "jang_cfg.json",
+    "mxq_config.json",
+)
+
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
     "deepseek_v41",
@@ -593,6 +602,31 @@ def _architecture_indicates_causal_lm(architectures: list[str]) -> bool:
     return any("causallm" in arch.lower() for arch in architectures)
 
 
+def _is_jang_model(model_path: Path) -> bool:
+    """Check whether a directory carries a JANG quantization sidecar."""
+    return any((model_path / name).exists() for name in JANG_CONFIG_FILES)
+
+
+def _jang_has_vision(model_path: Path) -> bool | None:
+    """Read architecture.has_vision from a JANG sidecar when it declares one."""
+    for name in JANG_CONFIG_FILES:
+        config_path = model_path / name
+        if not config_path.exists():
+            continue
+        try:
+            with open(config_path) as f:
+                architecture = json.load(f).get("architecture", {})
+        except (json.JSONDecodeError, IOError):
+            return None
+        has_vision = (
+            architecture.get("has_vision")
+            if isinstance(architecture, dict)
+            else None
+        )
+        return has_vision if isinstance(has_vision, bool) else None
+    return None
+
+
 def detect_model_type(model_path: Path) -> ModelType:
     """
     Detect model type from config.json.
@@ -698,6 +732,15 @@ def detect_model_type(model_path: Path) -> ModelType:
         logger.info(
             f"{model_type} detected as mlx-vlm native text model"
         )
+        return "vlm"
+
+    # JANG bundles declare their modality in the sidecar, which outranks the
+    # config.json heuristics below: text-only JANG packs keep VLM architecture
+    # names, and vision packs can ship a config.json with no vision sub-config.
+    jang_vision = _jang_has_vision(model_path)
+    if jang_vision is not None:
+        return "vlm" if jang_vision else "llm"
+    if _is_jang_model(model_path) and (model_path / "preprocessor_config.json").exists():
         return "vlm"
 
     # Check for VLM: architectures field
@@ -1090,8 +1133,15 @@ def _is_adapter_dir(path: Path) -> bool:
 
 
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    """Check if a directory contains a valid model.
+
+    A directory qualifies when it has config.json, or a JANG sidecar for
+    bundles that ship their own config.
+    """
+    has_config = (path / "config.json").exists() or any(
+        (path / name).exists() for name in JANG_CONFIG_FILES
+    )
+    return has_config and not _is_adapter_dir(path)
 
 
 _SHARD_FILE_RE = re.compile(r"-(\d+)-of-(\d+)\.safetensors$")

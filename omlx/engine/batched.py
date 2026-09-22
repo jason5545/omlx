@@ -277,6 +277,7 @@ class BatchedEngine(BaseEngine):
             lm_load_compat,
             maybe_apply_pre_load_patches,
             maybe_load_custom_quantization,
+            maybe_load_jang,
         )
 
         # Build tokenizer config with model-specific fixes
@@ -298,6 +299,14 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_model_sync():
+            jang_loaded = maybe_load_jang(
+                self._model_name,
+                is_vlm=False,
+                trust_remote_code=self._trust_remote_code,
+            )
+            if jang_loaded is not None:
+                return jang_loaded
+
             custom_loaded = maybe_load_custom_quantization(
                 self._model_name,
                 is_vlm=False,

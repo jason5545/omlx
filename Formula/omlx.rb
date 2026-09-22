@@ -129,6 +129,14 @@ class Omlx < Formula
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
     system(*pip_install, "python-multipart>=0.0.5")
 
+    # jang-tools serves JANG mixed-precision bundles; omlx routes them via
+    # omlx.patches.jang_load. Installed here rather than through omlx's own
+    # dependency list because the release predates the DMG layer's
+    # exclude-newer cutoff in packaging/venvstacks.toml. Every requirement
+    # (mlx, mlx-lm, safetensors, numpy, tqdm, huggingface_hub, jinja2) is
+    # already pinned above, so resolution only adds the pure-Python package.
+    system(*pip_install, "jang[mlx]>=2.5.47")
+
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
 

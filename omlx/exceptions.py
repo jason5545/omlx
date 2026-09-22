@@ -344,6 +344,18 @@ class TokenizerError(ModelError):
     pass
 
 
+class JANGDependencyError(ModelLoadError):
+    """The jang runtime a JANG bundle needs is not installed."""
+
+    pass
+
+
+class JANGLoadError(ModelLoadError):
+    """A JANG bundle failed to load through the jang runtime."""
+
+    pass
+
+
 # =============================================================================
 # API-related Exceptions
 # =============================================================================

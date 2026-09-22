@@ -143,6 +143,16 @@ grammar = [
 mcp = [
     "mcp>=2.0.0,<3",
 ]
+jang = [
+    # jang-tools loads JANG mixed-precision bundles (attention 6-8 bit,
+    # routed experts 2-4 bit) whose per-tensor bit widths live in
+    # jang_config.json; omlx routes those directories through
+    # omlx.patches.jang_load. Declared as an extra rather than a core
+    # dependency because the runtime postdates the DMG layer's
+    # exclude-newer cutoff in packaging/venvstacks.toml; Formula/omlx.rb
+    # installs it for the Homebrew service.
+    "jang[mlx]>=2.5.47",
+]
 cluster = [
     # mDNS advertise/browse for cluster v2 peer discovery (_omlx._tcp.local.).
     # Pure-Python; works in launchd agents. Absence disables mDNS only — the

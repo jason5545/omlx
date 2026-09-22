@@ -1338,6 +1338,37 @@ def maybe_load_jangq_prism(
     return load(model_name, trust_remote_code=trust_remote_code)
 
 
+def maybe_load_jang(
+    model_name: str,
+    *,
+    is_vlm: bool,
+    trust_remote_code: bool = False,
+) -> tuple[Any, Any] | None:
+    """Load a JANG mixed-precision bundle through the jang-tools runtime.
+
+    JANG bundles keep per-tensor bit widths in a jang_config.json sidecar that
+    the stock mlx-lm / mlx-vlm loaders ignore, so they either fail to load or
+    load at a single precision. See omlx.patches.jang_load.
+
+    Returns None for every other checkpoint, including PrismML's ternary packs,
+    which are handled by maybe_load_jangq_prism.
+    """
+    from ..patches.jang_load import is_jang_pack, jang_has_vision, load_jang
+
+    if not is_jang_pack(model_name):
+        return None
+    if not is_vlm and jang_has_vision(model_name):
+        raise ValueError(
+            f"{model_name} is a JANG vision bundle; it needs the VLM engine "
+            "and cannot be served text-only"
+        )
+    return load_jang(
+        model_name,
+        is_vlm=is_vlm,
+        trust_remote_code=trust_remote_code,
+    )
+
+
 def maybe_load_custom_quantization(
     model_name: str,
     *,
