@@ -1968,7 +1968,10 @@ class VLMBatchedEngine(BaseEngine):
 
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
-        from ..utils.model_loading import maybe_load_custom_quantization
+        from ..utils.model_loading import (
+            maybe_load_custom_quantization,
+            maybe_load_jangq_prism,
+        )
 
         # Apply pre-load patches (MTP runtime patch, etc.) before the model
         # is instantiated, so the patched ``__init__`` runs. ``maybe_apply``
@@ -2005,6 +2008,14 @@ class VLMBatchedEngine(BaseEngine):
                     Path(self._model_name)
                 ),
             ):
+                jangq_loaded = maybe_load_jangq_prism(
+                    self._model_name,
+                    is_vlm=True,
+                    trust_remote_code=self._trust_remote_code,
+                )
+                if jangq_loaded is not None:
+                    return jangq_loaded
+
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
                     is_vlm=True,

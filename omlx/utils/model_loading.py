@@ -1309,6 +1309,35 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     return model
 
 
+def maybe_load_jangq_prism(
+    model_name: str,
+    *,
+    is_vlm: bool,
+    trust_remote_code: bool = False,
+) -> tuple[Any, Any] | None:
+    """Load JANGQ affine-ternary prism packs through mlx-vlm's prism runtime.
+
+    dealignai's Bonsai-2-27B *-Ternary-JANG bundles keep PrismML's ternary
+    weights but rename the model type to qwen3_5 and add storage_bits keys, so
+    the stock mlx-vlm path aborts in nn.quantize -- and would emit garbage even
+    if it did not. See omlx.patches.prism_jangq_compat.
+
+    Returns None for every other checkpoint. The text-only engine is refused:
+    these bundles are VLMs and the mlx_lm fallback cannot run the Hadamard
+    rotation, so it would serve garbage instead of failing.
+    """
+    from ..patches.prism_jangq_compat import is_supported_config, load
+
+    if not is_supported_config(model_name):
+        return None
+    if not is_vlm:
+        raise ValueError(
+            f"{model_name} is a JANGQ affine-ternary prism pack; it needs the "
+            "VLM engine and cannot be served text-only"
+        )
+    return load(model_name, trust_remote_code=trust_remote_code)
+
+
 def maybe_load_custom_quantization(
     model_name: str,
     *,
