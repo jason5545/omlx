@@ -132,12 +132,12 @@ class Omlx < Formula
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
 
-  # Both fixups below must run in post_install rather than install because
+  # Both fixups below must run in post_install_steps rather than install because
   # Homebrew's post-install "Cleaning" step rewrites Mach-O install names
   # and deletes every dist-info/RECORD file in the keg as part of its
   # relocation pass. Anything patched inside `def install` is either wiped
   # or invalidated before the user sees it.
-  def post_install
+  def post_install_steps
     return if build.without?("grammar") && build.without?("custom-kernel")
 
     python = libexec/"bin/python"
