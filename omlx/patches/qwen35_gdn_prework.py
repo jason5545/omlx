@@ -26,6 +26,7 @@ stock path.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import sys
 
@@ -41,6 +42,47 @@ _QWEN4_DECODE_KERNEL = None
 _QWEN4_NORM_GATE_KERNEL = None
 _QWEN4_DECODE_ENGAGED_LOGGED = False
 _VERIFY_REJECT_DIAG = 0
+_DTYPE_TRACE_EMBED_LOGGED = False
+_DTYPE_TRACE_LAYER0_NORM_LOGGED = False
+_DTYPE_TRACE_LAYER0_GDN_LOGGED = False
+_DTYPE_TRACE_LAYER0_GDN_ID = None
+_DTYPE_TRACE_LAYER0_NORM_WEIGHT_DTYPE = None
+_EMBED_DTYPE_CAPTURE = contextvars.ContextVar(
+    "gdn_prework_embed_dtype_capture", default=None
+)
+_MIXED_QKV_DTYPE_CAPTURE = contextvars.ContextVar(
+    "gdn_prework_mixed_qkv_dtype_capture", default=None
+)
+
+
+def _dtype_name(value):
+    if value is None:
+        return "None"
+    dtype = getattr(value, "dtype", None)
+    return str(dtype) if dtype is not None else type(value).__name__
+
+
+def _weight_dtype(module):
+    return _dtype_name(getattr(module, "weight", None))
+
+
+def _gdn_weight_dtypes(layer):
+    names = (
+        ("in_proj_qkv", layer.in_proj_qkv),
+        ("in_proj_z", layer.in_proj_z),
+        ("in_proj_b", layer.in_proj_b),
+        ("in_proj_a", layer.in_proj_a),
+        ("conv1d", layer.conv1d),
+        ("norm", layer.norm),
+        ("out_proj", layer.out_proj),
+    )
+    modules = " ".join(
+        f"{name}.weight={_weight_dtype(module)}" for name, module in names
+    )
+    return (
+        f"{modules} A_log={_dtype_name(layer.A_log)} "
+        f"dt_bias={_dtype_name(layer.dt_bias)}"
+    )
 
 _SOURCE = """
     uint lane = thread_position_in_threadgroup.x;
@@ -629,6 +671,82 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     cls = q35.Qwen3_5GatedDeltaNet
     original = cls.__call__
     original_verify = Qwen3_5BatchInvariantForward._gated_delta
+    original_model = Qwen3_5BatchInvariantForward._model
+    original_linears = Qwen3_5BatchInvariantForward._linears
+    original_embedding_call = nn.Embedding.__call__
+
+    def trace_embedding(embedding, *args, **kwargs):
+        global _DTYPE_TRACE_EMBED_LOGGED
+        result = original_embedding_call(embedding, *args, **kwargs)
+        if (
+            _EMBED_DTYPE_CAPTURE.get() is embedding
+            and not _DTYPE_TRACE_EMBED_LOGGED
+        ):
+            _DTYPE_TRACE_EMBED_LOGGED = True
+            logger.info(
+                "[gdn-prework] dtype trace embed_tokens output=%s weight=%s",
+                _dtype_name(result),
+                _weight_dtype(embedding),
+            )
+        return result
+
+    def trace_linears(verifier, linears, values):
+        result = original_linears(verifier, linears, values)
+        capture = _MIXED_QKV_DTYPE_CAPTURE.get()
+        if capture is not None and linears and linears[0] is capture["module"]:
+            capture["dtype"] = _dtype_name(result[0])
+        return result
+
+    def trace_model(
+        verifier,
+        model,
+        inputs,
+        cache,
+        inputs_embeds,
+        position_ids,
+        capture_layer_ids,
+        hidden_sink,
+    ):
+        global _DTYPE_TRACE_LAYER0_GDN_ID
+        global _DTYPE_TRACE_LAYER0_NORM_WEIGHT_DTYPE
+
+        first_layer = model.layers[0] if model.layers else None
+        first_gdn = getattr(first_layer, "linear_attn", None)
+        trace_layer0 = (
+            first_gdn is not None
+            and type(first_gdn).__name__ == "Qwen3_5GatedDeltaNet"
+        )
+        if trace_layer0 and _DTYPE_TRACE_LAYER0_GDN_ID is None:
+            _DTYPE_TRACE_LAYER0_GDN_ID = id(first_gdn)
+            _DTYPE_TRACE_LAYER0_NORM_WEIGHT_DTYPE = _weight_dtype(
+                first_layer.input_layernorm
+            )
+
+        if trace_layer0 and not _DTYPE_TRACE_EMBED_LOGGED:
+            capture_token = _EMBED_DTYPE_CAPTURE.set(model.embed_tokens)
+            try:
+                return original_model(
+                    verifier,
+                    model,
+                    inputs,
+                    cache,
+                    inputs_embeds,
+                    position_ids,
+                    capture_layer_ids,
+                    hidden_sink,
+                )
+            finally:
+                _EMBED_DTYPE_CAPTURE.reset(capture_token)
+        return original_model(
+            verifier,
+            model,
+            inputs,
+            cache,
+            inputs_embeds,
+            position_ids,
+            capture_layer_ids,
+            hidden_sink,
+        )
 
     def decode(self, inputs, mask=None, cache=None):
         if not _qwen4_decode_dynamic_eligible(self, inputs, mask, cache, None, False):
@@ -675,6 +793,28 @@ def apply_qwen35_gdn_prework_patch() -> bool:
 
     def verify(verifier, layer, inputs, mask, cache):
         length = inputs.shape[1]
+        global _DTYPE_TRACE_LAYER0_NORM_LOGGED
+        global _DTYPE_TRACE_LAYER0_GDN_LOGGED
+        if (
+            id(layer) == _DTYPE_TRACE_LAYER0_GDN_ID
+            and not _DTYPE_TRACE_LAYER0_NORM_LOGGED
+        ):
+            _DTYPE_TRACE_LAYER0_NORM_LOGGED = True
+            logger.info(
+                "[gdn-prework] dtype trace layer0 input_layernorm output=%s weight=%s",
+                _dtype_name(inputs),
+                _DTYPE_TRACE_LAYER0_NORM_WEIGHT_DTYPE or "not observed",
+            )
+        if (
+            id(layer) == _DTYPE_TRACE_LAYER0_GDN_ID
+            and not _DTYPE_TRACE_LAYER0_GDN_LOGGED
+        ):
+            _DTYPE_TRACE_LAYER0_GDN_LOGGED = True
+            logger.info(
+                "[gdn-prework] dtype trace layer0 GDN inputs=%s weights[%s]",
+                _dtype_name(inputs),
+                _gdn_weight_dtypes(layer),
+            )
         # The fused prework emits either the stock Qwen3.5 RMS scaling or
         # the stock Qwen4 L2 scaling (L2 kernel variant), bit-exact to the
         # normalize implementation each verifier class installs.
@@ -739,13 +879,26 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                     )
                     if not ok
                 ]
-                logger.info(
-                    "[gdn-prework] verify gate reject: %s (verifier=%s S=%d l2=%s)",
-                    failed,
-                    type(verifier).__name__,
-                    length,
-                    l2_norm,
-                )
+                mixed_qkv_dtype = {
+                    "module": layer.in_proj_qkv,
+                    "dtype": "not observed",
+                }
+                capture_token = _MIXED_QKV_DTYPE_CAPTURE.set(mixed_qkv_dtype)
+                try:
+                    return original_verify(verifier, layer, inputs, mask, cache)
+                finally:
+                    _MIXED_QKV_DTYPE_CAPTURE.reset(capture_token)
+                    logger.info(
+                        "[gdn-prework] verify gate reject: %s (verifier=%s S=%d l2=%s) dtypes[inputs=%s cache[0]=%s conv1d.weight=%s mixed_qkv=%s]",
+                        failed,
+                        type(verifier).__name__,
+                        length,
+                        l2_norm,
+                        _dtype_name(inputs),
+                        _dtype_name(cache[0]),
+                        _weight_dtype(layer.conv1d),
+                        mixed_qkv_dtype["dtype"],
+                    )
             return original_verify(verifier, layer, inputs, mask, cache)
         mixed_qkv, z, b, a = verifier._linears(
             (layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a),
@@ -807,6 +960,9 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     cls.__call__ = decode
     cls._omlx_gdn_prework_patched = True
     Qwen3_5BatchInvariantForward._gated_delta = verify
+    Qwen3_5BatchInvariantForward._model = trace_model
+    Qwen3_5BatchInvariantForward._linears = trace_linears
+    nn.Embedding.__call__ = trace_embedding
     _PATCHED = True
     logger.info("Qwen fused GDN prework patch applied")
     return True
