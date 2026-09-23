@@ -47,6 +47,7 @@ _DTYPE_TRACE_LAYER0_NORM_LOGGED = False
 _DTYPE_TRACE_LAYER0_GDN_LOGGED = False
 _DTYPE_TRACE_LAYER0_GDN_ID = None
 _DTYPE_TRACE_LAYER0_NORM_WEIGHT_DTYPE = None
+_EMBED_DTYPE_TRACE_CLASSES = set()
 _EMBED_DTYPE_CAPTURE = contextvars.ContextVar(
     "gdn_prework_embed_dtype_capture", default=None
 )
@@ -64,6 +65,35 @@ def _dtype_name(value):
 
 def _weight_dtype(module):
     return _dtype_name(getattr(module, "weight", None))
+
+
+def _log_embed_dtype(embedding, output, source):
+    global _DTYPE_TRACE_EMBED_LOGGED
+    if _DTYPE_TRACE_EMBED_LOGGED:
+        return
+    _DTYPE_TRACE_EMBED_LOGGED = True
+    logger.info(
+        "[gdn-prework] dtype trace embed_tokens output=%s weight=%s source=%s",
+        _dtype_name(output),
+        _weight_dtype(embedding),
+        source,
+    )
+
+
+def _install_embedding_dtype_trace(embedding):
+    embedding_type = type(embedding)
+    if embedding_type in _EMBED_DTYPE_TRACE_CLASSES:
+        return
+    original_call = embedding_type.__call__
+
+    def trace_embedding(module, *args, **kwargs):
+        output = original_call(module, *args, **kwargs)
+        if _EMBED_DTYPE_CAPTURE.get() is module:
+            _log_embed_dtype(module, output, "embed_tokens call")
+        return output
+
+    embedding_type.__call__ = trace_embedding
+    _EMBED_DTYPE_TRACE_CLASSES.add(embedding_type)
 
 
 def _gdn_weight_dtypes(layer):
@@ -673,22 +703,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     original_verify = Qwen3_5BatchInvariantForward._gated_delta
     original_model = Qwen3_5BatchInvariantForward._model
     original_linears = Qwen3_5BatchInvariantForward._linears
-    original_embedding_call = nn.Embedding.__call__
-
-    def trace_embedding(embedding, *args, **kwargs):
-        global _DTYPE_TRACE_EMBED_LOGGED
-        result = original_embedding_call(embedding, *args, **kwargs)
-        if (
-            _EMBED_DTYPE_CAPTURE.get() is embedding
-            and not _DTYPE_TRACE_EMBED_LOGGED
-        ):
-            _DTYPE_TRACE_EMBED_LOGGED = True
-            logger.info(
-                "[gdn-prework] dtype trace embed_tokens output=%s weight=%s",
-                _dtype_name(result),
-                _weight_dtype(embedding),
-            )
-        return result
 
     def trace_linears(verifier, linears, values):
         result = original_linears(verifier, linears, values)
@@ -728,15 +742,10 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             and not _DTYPE_TRACE_EMBED_LOGGED
             and inputs_embeds is not None
         ):
-            _DTYPE_TRACE_EMBED_LOGGED = True
-            logger.info(
-                "[gdn-prework] dtype trace embed_tokens output=%s "
-                "weight=%s source=inputs_embeds",
-                _dtype_name(inputs_embeds),
-                _weight_dtype(model.embed_tokens),
-            )
+            _log_embed_dtype(model.embed_tokens, inputs_embeds, "inputs_embeds")
 
         if trace_layer0 and not _DTYPE_TRACE_EMBED_LOGGED:
+            _install_embedding_dtype_trace(model.embed_tokens)
             capture_token = _EMBED_DTYPE_CAPTURE.set(model.embed_tokens)
             try:
                 return original_model(
@@ -976,7 +985,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     Qwen3_5BatchInvariantForward._gated_delta = verify
     Qwen3_5BatchInvariantForward._model = trace_model
     Qwen3_5BatchInvariantForward._linears = trace_linears
-    nn.Embedding.__call__ = trace_embedding
     _PATCHED = True
     logger.info("Qwen fused GDN prework patch applied")
     return True
