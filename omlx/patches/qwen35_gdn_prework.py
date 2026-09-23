@@ -13,9 +13,10 @@ remaining verify-cycle cost after the attention split.
 
 One Metal launch replaces the whole chain. Numerics notes carried from the
 donor kernel: the in-kernel sigmoid uses MLX's own unary formula
-(exp-of-abs), which the challenge swept bit-exact over all finite bf16
-inputs; the RMS applies the ones-weight rounding then the separate scalar
-multiply's rounding — the composed chain's two casts.
+(exp-of-abs), bit-exact over all finite bf16 inputs in the donor sweep and
+all finite fp16 inputs in the local sweep; the RMS applies the ones-weight
+rounding then the separate scalar multiply's rounding — the composed
+chain's two casts.
 
 For S=2, the next conv state retains one row from the old conv state.
 Longer verify windows fill the entire next state from the new qkv rows.
@@ -690,21 +691,22 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 and sites[1] is not None
                 and getattr(type(layer), "_normalize_qk", None) is sites[1]
             )
+        input_dtype_supported = inputs.dtype in (mx.bfloat16, mx.float16)
         if not (
             (compatible_norm or l2_norm)
             and cache is not None
             and cache.is_speculating
             and 2 <= length <= 9
             and mask is None
-            and inputs.dtype == mx.bfloat16
+            and input_dtype_supported
             and layer.conv_kernel_size == 4
             and layer.head_k_dim == 128
             and layer.head_v_dim == 128
             and cache.lengths is None
             and cache[0] is not None
             and cache[0].shape[0] == inputs.shape[0]
-            and cache[0].dtype == mx.bfloat16
-            and layer.conv1d.weight.dtype == mx.bfloat16
+            and cache[0].dtype == inputs.dtype
+            and layer.conv1d.weight.dtype == inputs.dtype
             and getattr(layer.conv1d, "bias", None) is None
         ):
             global _VERIFY_REJECT_DIAG
@@ -718,7 +720,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                         ("speculating", cache.is_speculating),
                         ("length", 2 <= length <= 9),
                         ("mask", mask is None),
-                        ("inputs_bf16", inputs.dtype == mx.bfloat16),
+                        ("inputs_dtype_supported", input_dtype_supported),
                         ("conv_kernel", layer.conv_kernel_size == 4),
                         ("dk128", layer.head_k_dim == 128),
                         ("dv128", layer.head_v_dim == 128),
@@ -727,11 +729,11 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                             "c0",
                             cache[0] is not None
                             and cache[0].shape[0] == inputs.shape[0]
-                            and cache[0].dtype == mx.bfloat16,
+                            and cache[0].dtype == inputs.dtype,
                         ),
                         (
                             "conv_w",
-                            layer.conv1d.weight.dtype == mx.bfloat16
+                            layer.conv1d.weight.dtype == inputs.dtype
                             and getattr(layer.conv1d, "bias", None) is None,
                         ),
                     )
@@ -749,13 +751,15 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             (layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a),
             inputs,
         )
+        if mixed_qkv.dtype != inputs.dtype:
+            return original_verify(verifier, layer, inputs, mask, cache)
         inv = layer.head_k_dim**-0.5
         if l2_norm:
-            q_scale = mx.array(inv, dtype=mx.bfloat16)
-            k_scale = mx.array(1.0, dtype=mx.bfloat16)
+            q_scale = mx.array(inv, dtype=inputs.dtype)
+            k_scale = mx.array(1.0, dtype=inputs.dtype)
         else:
-            q_scale = mx.array(inv * inv, dtype=mx.bfloat16)
-            k_scale = mx.array(inv, dtype=mx.bfloat16)
+            q_scale = mx.array(inv * inv, dtype=inputs.dtype)
+            k_scale = mx.array(inv, dtype=inputs.dtype)
         q, k, v, conv_state = gdn_prework_fused(
             mixed_qkv,
             cache[0],

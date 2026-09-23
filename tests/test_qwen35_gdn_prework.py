@@ -8,10 +8,14 @@ next conv-state slice) at every verify width it claims (S in 3..9).
 
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 from mlx_vlm.models.qwen3_5 import language
 from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
@@ -38,6 +42,54 @@ from omlx.patches.qwen35_q4_mlp import _VLMQuantizedPrefillLinear
 HK, HV, DK, DV = 16, 48, 128, 128
 C = 2 * HK * DK + HV * DV
 KEY_DIM = HK * DK
+
+ORNITH_MODEL = Path(
+    "/Users/jianruicheng/.lmstudio/models/dealignai/Ornith-1.5-35B-A3B-MXFP8-UNCENSORED-CRACK"
+)
+ORNITH_HK, ORNITH_HV, ORNITH_DK, ORNITH_DV = 16, 32, 128, 128
+ORNITH_C = 2 * ORNITH_HK * ORNITH_DK + ORNITH_HV * ORNITH_DV
+ORNITH_KEY_DIM = ORNITH_HK * ORNITH_DK
+
+
+def _uint16_bits(value):
+    if value.dtype == mx.bfloat16:
+        f32 = np.asarray(value.astype(mx.float32), dtype=np.float32)
+        return np.ascontiguousarray((f32.view(np.uint32) >> 16).astype(np.uint16))
+    return np.ascontiguousarray(np.asarray(value, dtype=np.float16)).view(np.uint16)
+
+
+def _ornith_checkpoint_conv(layer_no):
+    index_path = ORNITH_MODEL / "model.safetensors.index.json"
+    if not index_path.is_file():
+        return None
+    index = json.loads(index_path.read_text())
+    key = f"language_model.model.layers.{layer_no}.linear_attn.conv1d.weight"
+    shard = index.get("weight_map", {}).get(key)
+    if not shard or not (ORNITH_MODEL / shard).is_file():
+        return None
+
+    from safetensors import safe_open
+
+    with safe_open(str(ORNITH_MODEL / shard), framework="numpy") as tensors:
+        checkpoint_weight = tensors.get_tensor(key)
+    assert checkpoint_weight.dtype == np.float16
+    assert checkpoint_weight.shape == (ORNITH_C, 1, 4)
+    # mlx-vlm sanitize() moves checkpoint [C,1,K] to native [C,K,1].
+    native_weight = np.ascontiguousarray(np.moveaxis(checkpoint_weight, 2, 1))
+    return mx.array(native_weight)
+
+
+def _ornith_composed_prework(qkv, conv_state, layer):
+    batch, length, _ = qkv.shape
+    conv_input = mx.concatenate([conv_state, qkv], axis=1)
+    next_state = mx.contiguous(conv_input[:, -3:, :])
+    conv_output = nn.silu(layer.conv1d(conv_input))
+    q, k, v = mx.split(conv_output, [ORNITH_KEY_DIM, 2 * ORNITH_KEY_DIM], axis=-1)
+    q = q.reshape(batch, length, ORNITH_HK, ORNITH_DK)
+    k = k.reshape(batch, length, ORNITH_HK, ORNITH_DK)
+    v = v.reshape(batch, length, ORNITH_HV, ORNITH_DV)
+    q, k = layer._normalize_qk(q, k)
+    return q, k, v, next_state
 
 
 def _composed(qkv, conv_state, conv1d):
@@ -694,3 +746,139 @@ def test_batched_verify_preserves_output_and_all_rollback_states(
     assert all(
         mx.array_equal(a, b).item() for a, b in zip(cache.state, reference_cache.state)
     )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_ornith_fp16_prework_bit_exact_s2_to_s9():
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5GatedDeltaNet
+
+    args = SimpleNamespace(
+        hidden_size=2048,
+        linear_num_value_heads=ORNITH_HV,
+        linear_num_key_heads=ORNITH_HK,
+        linear_key_head_dim=ORNITH_DK,
+        linear_value_head_dim=ORNITH_DV,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = Qwen3_5GatedDeltaNet(args)
+    layer.set_dtype(mx.float16)
+    layer.eval()
+
+    synthetic_layers = []
+    for layer_no in (0, 14, 29):
+        conv_w = _ornith_checkpoint_conv(layer_no)
+        if conv_w is None:
+            synthetic_layers.append(layer_no)
+            mx.random.seed(72000 + layer_no)
+            conv_w = (mx.random.normal((ORNITH_C, 4, 1)) * 0.2).astype(mx.float16)
+        assert conv_w.dtype == mx.float16
+        layer.conv1d.weight = conv_w
+
+        for length in range(2, 10):
+            mx.random.seed(92000 + layer_no * 100 + length)
+            qkv = mx.random.normal((1, length, ORNITH_C)).astype(mx.float16)
+            conv_state = mx.random.normal((1, 3, ORNITH_C)).astype(mx.float16)
+            inv = ORNITH_DK**-0.5
+            q_scale = mx.array(inv * inv, dtype=mx.float16)
+            k_scale = mx.array(inv, dtype=mx.float16)
+
+            expected = _ornith_composed_prework(qkv, conv_state, layer)
+            actual = gdn_prework_fused(
+                qkv,
+                conv_state,
+                conv_w,
+                q_scale,
+                k_scale,
+                ORNITH_HK,
+                ORNITH_HV,
+                ORNITH_DK,
+                ORNITH_DV,
+            )
+            mx.eval(*expected, *actual)
+            for name, ref, got in zip(("q", "k", "v", "conv_state"), expected, actual):
+                assert np.array_equal(_uint16_bits(ref), _uint16_bits(got)), (
+                    f"{name} differs bitwise for layer={layer_no}, S={length}"
+                )
+
+    if synthetic_layers:
+        pytest.skip(
+            "synthetic fp16 weights were exercised for missing Ornith layers "
+            f"{synthetic_layers}; real checkpoint parity is unavailable"
+        )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_fp16_sigmoid_matches_mx_sigmoid_over_all_finite_values():
+    source = r"""
+        uint i = thread_position_in_grid.x;
+        if (i < uint(N)) {
+            T x = input[i];
+            T sy = T(1) / (T(1) + metal::exp(metal::abs(x)));
+            output[i] = (x < T(0)) ? sy : T(1) - sy;
+        }
+    """
+    kernel = mx.fast.metal_kernel(
+        name="omlx_gdn_fp16_sigmoid_exhaustive_test",
+        input_names=["input"],
+        output_names=["output"],
+        source=source,
+    )
+    bit_patterns = np.arange(65536, dtype=np.uint16)
+    finite = ((bit_patterns >> 10) & 0x1F) != 0x1F
+    values = mx.array(bit_patterns[finite].view(np.float16))
+    actual = kernel(
+        inputs=[values],
+        template=[("T", values.dtype), ("N", int(values.size))],
+        grid=(int(values.size), 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[values.shape],
+        output_dtypes=[values.dtype],
+    )[0]
+    expected = mx.sigmoid(values)
+    mx.eval(actual, expected)
+    assert int(values.size) == 63488
+    assert np.array_equal(_uint16_bits(expected), _uint16_bits(actual))
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_bf16_prework_matches_pre_fp16_change_reference():
+    # Raw uint16 arrays captured before the fp16 change by
+    # /tmp/omlx-gdn-prework-step0/verify_step0.py (seed 20260923).
+    expected_hashes = {
+        "q": "051823627b9a50ca580ae84cbb5da49b89828c39effc80428d8de73655667569",
+        "k": "c0640182a8b00cec6c45884e4f030e04439ef5e769a5ff1e174e61465167cd11",
+        "v": "f1d5a142d7128eeb0fa83a4fbf4727e2055290e62d94b44187454c7c8f61a237",
+        "conv_state": "2adedd345751f0eef499bf070dcbe779ca2e0eaaeb759311b13dc7b41abb50e4",
+    }
+    mx.random.seed(20260923)
+    conv_w = (mx.random.normal((ORNITH_C, 4, 1)) * 0.2).astype(mx.bfloat16)
+    qkv = (mx.random.normal((1, 4, ORNITH_C)) * 0.5).astype(mx.bfloat16)
+    conv_state = (mx.random.normal((1, 3, ORNITH_C)) * 0.5).astype(mx.bfloat16)
+    inv = ORNITH_DK**-0.5
+    actual = gdn_prework_fused(
+        qkv,
+        conv_state,
+        conv_w,
+        mx.array(inv * inv, dtype=mx.bfloat16),
+        mx.array(inv, dtype=mx.bfloat16),
+        ORNITH_HK,
+        ORNITH_HV,
+        ORNITH_DK,
+        ORNITH_DV,
+    )
+    mx.eval(*actual)
+
+    snapshot_path = Path(
+        "/tmp/omlx-gdn-prework-step0/bf16_fused_reference_seed_20260923.npz"
+    )
+    snapshot = np.load(snapshot_path) if snapshot_path.is_file() else None
+    for name, value in zip(("q", "k", "v", "conv_state"), actual):
+        actual_bits = _uint16_bits(value)
+        assert hashlib.sha256(actual_bits.tobytes(order="C")).hexdigest() == (
+            expected_hashes[name]
+        ), f"bf16 {name} changed from the pre-change reference"
+        if snapshot is not None:
+            assert np.array_equal(actual_bits, snapshot[name]), (
+                f"bf16 {name} differs from the saved step-0 output"
+            )

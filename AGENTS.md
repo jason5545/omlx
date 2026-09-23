@@ -20,7 +20,7 @@ upstream https://github.com/jundot/omlx.git
 
 ## 目前本地改動
 
-自 0.6.3rc1 merge 起，這個 fork 盡量貼齊 upstream，只保留八個本地功能；其他一律 follow upstream（舊的 VLM/MTP、MTPLX、thinking-budget patch stack 已整批丟棄，存在 `backup/pre-upstream-merge` 分支僅供查閱，不要回移植）：
+自 0.6.3rc1 merge 起，這個 fork 盡量貼齊 upstream，只保留九個本地功能；其他一律 follow upstream（舊的 VLM/MTP、MTPLX、thinking-budget patch stack 已整批丟棄，存在 `backup/pre-upstream-merge` 分支僅供查閱，不要回移植）：
 
 - API sub-key 可以套 request policy（`identify_api_key` → `DEFAULT_SUB_KEY_POLICIES`）。`voco` 預設是 `max_context_window<=16384` 且 `enable_thinking=false`。相關檔案：`omlx/server.py`、`omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`。
 - Mac app attach mode：`8000` 上已有健康 oMLX server 時 app 直接 attach，不顯示 port conflict；細節見下面 Mac app 章節。相關檔案：`apps/omlx-mac/Sources/Server/ServerProcess.swift` 等 6 個 Swift 檔。
@@ -30,6 +30,7 @@ upstream https://github.com/jundot/omlx.git
 - `packaging/build.py` 下載一律走 `_urlopen`／`_ssl_context`，不直接用 `urllib.request.urlretrieve`：python.org 的 macOS 直譯器（build driver 預設用 PATH 上的 `python3`）附的 OpenSSL 沒有預設信任庫，spacy 模型下載會以 `CERTIFICATE_VERIFY_FAILED` 失敗，donor 重建中斷在 `_install_spacy_model`。helper 依序找 `SSL_CERT_FILE`、certifi、`/etc/ssl/cert.pem` 等系統 bundle。相關檔案：`packaging/build.py`。
 - JANGQ affine-ternary prism 轉接：dealignai 的 Bonsai-2-27B-*-Ternary-JANG 沿用 PrismML 的 ternary 權重，但把 `model_type` 改成 `qwen3_5`、又加 `storage_bits`，所以走不到 upstream #3782 已支援的 `prism_hadamard_qwen35`；載入時把 config 正規化成 schema-2、重建 modules manifest、拿掉 `storage_bits`、放寬 prism 的量化檢查、補 161 個 zero-centered norm 的 +1.0，全部在一次載入內 patch 並還原。相關檔案：`omlx/patches/prism_jangq_compat.py`、`omlx/utils/model_loading.py` 的 `maybe_load_jangq_prism`、`omlx/engine/vlm.py` 與 `omlx/engine/batched.py` 的呼叫點（batched 端只負責擋純文字載入）、`tests/test_prism_jangq_compat.py`。
 - JANG mixed-precision bundle 轉接：逐張量 bit width 記在 sidecar（`jang_config.json` 等），stock mlx-lm／mlx-vlm 讀不到，所以交給 `jang_tools.loader` 載入後再進正常的 BatchedEngine／VLMBatchedEngine——不要改成新增 engine 類別，server 有一批 `isinstance(engine, VLMBatchedEngine)` 的圖片、prefix cache、tool calling 判定會斷。閘門要求 sidecar 的 `format` 是 `jang`／`jjqf`／`mxq`：只有 vMLX sidecar、`format` 未設的 MXFP8 包（如 Ornith-1.5 MXFP8）要留給原路徑，不要搶過來。`omlx/patches/jang_load.py` 另外補 jang runtime 兩個洞：Nemotron-H gate 的後綴比對（上游 PR #364 那段是死碼，從沒解量化過任何 gate）與 6-bit + `--hadamard` 的 sign 寬度（它用 `packed_cols * (32 // bits)`，6-bit 會算成 60）。相關檔案：`omlx/patches/jang_load.py`、`omlx/utils/model_loading.py` 的 `maybe_load_jang`、`omlx/engine/batched.py` 與 `omlx/engine/vlm.py` 的載入插入點、`omlx/model_discovery.py` 的 `JANG_CONFIG_FILES`／`_jang_has_vision`、`omlx/exceptions.py` 的 `JANGDependencyError`／`JANGLoadError`、`tests/test_jang_engine.py`。依賴是 `pyproject.toml` 的 `jang` extra 加 `Formula/omlx.rb` 一行 `system(*pip_install, "jang[mlx]>=2.5.47")`（必須共用 `pip_install` flags，`tests/test_homebrew_formula.py` 會數裸 pip 呼叫）；上游 PR #364 合併後可整批換成 upstream 版。
+- GDN MTP verify prework 的 upstream kernel 擴充為同時支援 fp16／bf16：輸入、conv state、conv1d 權重 dtype 必須相同，scale 也用該 dtype；fp16 和既有 bf16 組合路徑要求逐位元一致。追 upstream 時守住。相關檔案：`omlx/patches/qwen35_gdn_prework.py`、`tests/test_qwen35_gdn_prework.py`。
 
 追 upstream 時，conflict 只要守住上面幾塊，其餘一律取 upstream 版本。不要留下手動改 site-packages 的最終狀態。
 
