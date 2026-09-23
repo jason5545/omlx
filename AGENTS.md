@@ -71,6 +71,74 @@ brew info --json=v2 jason5545/omlx/omlx | jq '.formulae[0] | {full_name,tap,tap_
 https://github.com/jason5545/omlx.git
 ```
 
+## 快速部署（只改 omlx/ 的 Python）
+
+上面的整套重裝 2026-09-23 實測約 64 分鐘：主套件那步 pip 47 分鐘、mlx-audio 16 分鐘。Formula 帶 `--no-cache-dir`，每次都重建 venv、重新下載全部 wheel 和 git 依賴；Rust 套件（tokenizers、pydantic-core 等）的原始碼編譯只佔一兩分鐘。omlx 本身是純 Python wheel（`py3-none-any`；沒帶 `--with-custom-kernel` 時沒有 native extension），只改 omlx 程式時不必重建 venv，把 omlx 套件從 commit 重裝進現有 venv，再重啟 service 就好。
+
+可以走快速路徑：
+
+- 要上線的改動只在 `omlx/` 底下（Python，以及 admin templates、static、i18n 這類套件內的檔案）。同一段 commit 裡 `tests/`、文件、`apps/`、`packaging/` 的改動不進 server，可以一起帶。`packaging/` 只影響 DMG／Mac app 的建置，brew venv 不使用它。
+
+一定要整套重裝：
+
+- 改到 `pyproject.toml`（依賴、extras、版本 pin、build-system）、`setup.py`、`Formula/omlx.rb`。
+- 要升級或新增依賴、有需要編譯的東西（custom kernel），或這份安裝帶 `--with-custom-kernel`：重裝純 Python wheel 會把編譯好的 kernel 蓋掉。
+- 快速路徑失敗、`/health` 回不到 `healthy`，或模型載入失敗。
+
+判斷依賴有沒有變，是跟「venv 依賴基準」比：brew 整套安裝時的 commit（`INSTALL_RECEIPT.json` 的 `source.scm_revision`），不是上一次快速部署的 commit。腳本會自動比對，上面列的檔案有變就拒絕。
+
+先 commit 並 push 到 `origin/main`，再執行：
+
+```bash
+scripts/deploy_fast.sh              # 部署 origin/main
+scripts/deploy_fast.sh <commit>     # 部署指定 commit（回滾也用這個）
+scripts/deploy_fast.sh --status     # 只看目前部署的 commit
+```
+
+腳本做的事，也就是手動操作的等價指令：
+
+```bash
+cd /Users/jianruicheng/GitHub/omlx
+git fetch origin
+SHA=$(git rev-parse origin/main)                    # 或要部署的 commit；必須在 origin/main 上
+PIP=$(readlink -f /opt/homebrew/opt/omlx)/libexec/bin/pip
+BASE=$(jq -r .source.scm_revision /opt/homebrew/opt/omlx/INSTALL_RECEIPT.json)
+git diff --name-only "$BASE" "$SHA" -- pyproject.toml setup.py Formula             # 有輸出就改走整套重裝
+"$PIP" wheel --no-deps -w "$(mktemp -d)" "git+file://$PWD@$SHA"                   # 預先建置，不動正式 venv
+# 確認沒有進行中的請求（見下面），再換檔案重啟
+brew services stop jason5545/omlx/omlx
+"$PIP" install --no-deps --force-reinstall "git+file://$PWD@$SHA"
+brew services start jason5545/omlx/omlx
+curl -sS http://127.0.0.1:8000/health                                              # 等到 "status":"healthy"
+```
+
+細節：
+
+- 用 venv 自己的 `pip`（shebang 是 Cellar 的 `python3.11`），重新產生的 `bin/omlx` 才會跟 brew 裝的一樣。
+- 預先建置確認 wheel 建得起來，也把建置依賴（`pyproject.toml` build-system 的 mlx 0.32.2、cmake、nanobind）抓進 pip 快取。第一次要下載，這台實測 224 秒；之後約 6 秒。
+- 2026-09-23 實測部署 0a34f284：整支腳本 18.6 秒，其中 install 7 秒，停 service 到 `/health` healthy 11 秒。healthy 時模型還沒載入（`loaded_count: 0`），第一個請求才載入 Ornith（`model_load_duration` 5.83 秒）。所以部署後要送一題短請求，確認模型真的載得起來。
+- 先停 service 再換檔案：pip 會先移除舊檔再放新檔，舊程序在這段時間 lazy import 會拿到新舊混雜的模組，甚至找不到模組。停掉之後任何一步失敗，腳本都會把 service 開回來；pip 安裝失敗會自動還原舊版。
+- 從 commit 安裝，不用 editable install（`pip install -e`）。`git+file` 會 clone repo 再建 wheel，只看 commit 內容：working tree 沒 commit 的改動和沒追蹤的檔案（例如本地建出的 `.so`，package-data 會收）都不會帶上線。editable install 會讓正式 server 跟著 working tree 變，查不到跑的是哪個 commit。
+
+確認部署的是哪個 commit：以 omlx `direct_url.json` 的 `vcs_info.commit_id` 為準，`scripts/deploy_fast.sh --status` 會印出來。手動查：
+
+```bash
+$(readlink -f /opt/homebrew/opt/omlx)/libexec/bin/python -I -c \
+  'from importlib.metadata import distribution as d; print(d("omlx").read_text("direct_url.json"))'
+```
+
+快速部署不經過 brew，所以 Cellar 目錄名稱（`HEAD-xxxxxxx`）、`brew info`、`brew list --versions`、`INSTALL_RECEIPT.json` 都還是上次整套安裝的 commit，只代表 venv 依賴基準，不代表正在跑的程式。`direct_url.json` 沒有 `vcs_info`、只有 `dir_info` 暫存路徑，表示最後一次是 brew 整套安裝，這時才看 `INSTALL_RECEIPT.json` 的 `source.scm_revision`。
+
+回滾：用同一條路徑裝回前一個 commit。腳本開始時會印「目前部署」的 commit，結束時印回滾指令：
+
+```bash
+scripts/deploy_fast.sh <前一個 commit>
+```
+
+前一個 commit 跟依賴基準比有動到依賴檔的話，腳本會拒絕，這時只能整套重裝。
+
+重啟前確認沒有進行中的請求：先看 `~/.omlx/logs/server.log` 最近 5 分鐘。server.log 只在請求結束時寫一行（`Chat completion: ... tokens in ...s`），看不到還在跑的請求，所以真正的判斷看 `/api/status` 的 `active_requests`、`waiting_requests`（要帶 `~/.omlx/settings.json` 的 API key，不要印出來）。腳本會印 log 摘要（行數、完成的請求數、最後三行），兩個數字都是 0、最後一行 log 也超過 30 秒才重啟；否則每 15 秒再查，15 分鐘還沒空就停下，不重啟。
+
 ## Mac app 操作
 
 主要路徑：
@@ -211,5 +279,5 @@ Request policy active: client=voco source=api-sub-key ... max_context_window<=16
 - 不要把 API key 印到 log 或回覆裡。
 - 不要把 `jundot/omlx` tap 裝回來，除非 Jason 明確要求。
 - 不要把 Homebrew cache 裡的 checkout 當主要 repo 修改。
-- 做完實質變更後，commit 並 push 到 `origin/main`，再視需要重裝 tap。
+- 做完實質變更後，commit 並 push 到 `origin/main`。要上線時先看「快速部署」的判斷：只改 `omlx/` 的 Python 用 `scripts/deploy_fast.sh`；改到依賴、`Formula/omlx.rb` 或需要編譯的東西，才照「Homebrew 操作」整套重裝。
 - 回覆 Jason 時用自然、簡短的繁體中文，少模板感。
