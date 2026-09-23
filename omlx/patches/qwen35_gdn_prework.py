@@ -707,6 +707,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         capture_layer_ids,
         hidden_sink,
     ):
+        global _DTYPE_TRACE_EMBED_LOGGED
         global _DTYPE_TRACE_LAYER0_GDN_ID
         global _DTYPE_TRACE_LAYER0_NORM_WEIGHT_DTYPE
 
@@ -720,6 +721,19 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             _DTYPE_TRACE_LAYER0_GDN_ID = id(first_gdn)
             _DTYPE_TRACE_LAYER0_NORM_WEIGHT_DTYPE = _weight_dtype(
                 first_layer.input_layernorm
+            )
+
+        if (
+            trace_layer0
+            and not _DTYPE_TRACE_EMBED_LOGGED
+            and inputs_embeds is not None
+        ):
+            _DTYPE_TRACE_EMBED_LOGGED = True
+            logger.info(
+                "[gdn-prework] dtype trace embed_tokens output=%s "
+                "weight=%s source=inputs_embeds",
+                _dtype_name(inputs_embeds),
+                _weight_dtype(model.embed_tokens),
             )
 
         if trace_layer0 and not _DTYPE_TRACE_EMBED_LOGGED:
