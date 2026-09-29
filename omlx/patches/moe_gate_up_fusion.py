@@ -35,6 +35,10 @@ from typing import Any
 
 import mlx.core as mx
 
+from ..scheduler import _sync_and_clear_cache
+from . import qwen35_moe_gate_up
+from .deepseek_v4.switch_layers import has_native_block_kernels
+
 logger = logging.getLogger(__name__)
 
 _GLM_DSA_MODULE = "omlx.patches.glm_moe_dsa.switch_layers"
@@ -92,12 +96,8 @@ def can_fuse(switch_mlp: Any) -> bool:
             return False
         if g is not None and (tuple(g.shape) != tuple(u.shape) or g.dtype != u.dtype):
             return False
-    if family == "deepseek_v4":
-        from .deepseek_v4.switch_layers import has_native_block_kernels
-
-        if has_native_block_kernels(gate):
-            return False
-    return True
+    # DeepSeek V4 formats with native pair kernels keep their tuned path.
+    return not (family == "deepseek_v4" and has_native_block_kernels(gate))
 
 
 def _fuse_one(switch_mlp: Any) -> None:
@@ -136,8 +136,6 @@ def apply_switch_glu_gate_up_fusion(model: Any) -> int:
     targets = [m for _, m in named_modules() if can_fuse(m)]
     if not targets:
         return 0
-    from ..scheduler import _sync_and_clear_cache
-
     for switch_mlp in targets:
         _fuse_one(switch_mlp)
         # Freed gate/up buffers land in the MLX buffer pool; drain per layer
@@ -147,4 +145,15 @@ def apply_switch_glu_gate_up_fusion(model: Any) -> int:
     return len(targets)
 
 
-__all__ = ["apply_switch_glu_gate_up_fusion", "can_fuse"]
+def apply_moe_gate_up_fusion(model: Any) -> int:
+    """Run the Qwen/Laguna regroup and the oMLX SwitchGLU fusion.
+
+    The two passes match disjoint model families. Returns the total number
+    of fused layers.
+    """
+    return qwen35_moe_gate_up.apply_qwen35_moe_gate_up_fusion(
+        model
+    ) + apply_switch_glu_gate_up_fusion(model)
+
+
+__all__ = ["apply_moe_gate_up_fusion", "apply_switch_glu_gate_up_fusion", "can_fuse"]

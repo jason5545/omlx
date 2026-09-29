@@ -18,7 +18,8 @@ from typing import Any
 
 import mlx.core as mx
 
-from .m5_gather_qmm import fused_gate_up_activation, sort_routes
+from .m5_gather_qmm import fused_gate_up_activation
+from .moe_routes import sort_routes
 
 logger = logging.getLogger(__name__)
 

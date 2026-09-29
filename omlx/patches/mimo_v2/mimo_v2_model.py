@@ -15,11 +15,7 @@ from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
-
-try:  # fused expert combine (oMLX GLM kernels); falls back to mlx-lm's SwitchGLU
-    from omlx.patches.glm_moe_dsa.switch_layers import SwitchGLU as _FusedSwitchGLU
-except Exception:  # noqa: BLE001
-    _FusedSwitchGLU = None
+from omlx.patches.glm_moe_dsa.switch_layers import SwitchGLU as _FusedSwitchGLU
 from omlx.patches.mimo_v2.fused_qkv_layout import (
     FUSED_QKV_BLOCK_SIZE,
     detect_fused_qkv_tp,
@@ -238,9 +234,7 @@ class MoE(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         # The fused combine kernel handles top-6/top-8 routing (MiMo: top-8).
-        self._fused_combine = _FusedSwitchGLU is not None and (
-            config.num_experts_per_tok in (6, 8)
-        )
+        self._fused_combine = config.num_experts_per_tok in (6, 8)
         switch_cls = _FusedSwitchGLU if self._fused_combine else SwitchGLU
         self.switch_mlp = switch_cls(
             config.hidden_size,
@@ -701,22 +695,12 @@ class Model(nn.Module):
                 )
             else:
                 layer.mlp.sharding_group = group
-                if "gate_up_proj" in layer.mlp.switch_mlp:
-                    # [gate; up] rows: shard each half so every rank keeps
-                    # its own [gate_r; up_r] and the split stays aligned.
-                    shard_inplace(
-                        layer.mlp.switch_mlp.gate_up_proj,
-                        "all-to-sharded",
-                        segments=2,
-                        group=group,
-                    )
-                else:
-                    shard_inplace(
-                        layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
-                    )
-                    shard_inplace(
-                        layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
-                    )
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
                 shard_inplace(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )

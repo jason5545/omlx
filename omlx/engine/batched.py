@@ -421,31 +421,15 @@ class BatchedEngine(BaseEngine):
             is not False
         ):
             try:
-                from ..patches.qwen35_moe_gate_up import (
-                    apply_qwen35_moe_gate_up_fusion,
-                )
+                from ..patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
 
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    apply_qwen35_moe_gate_up_fusion,
+                    apply_moe_gate_up_fusion,
                     self._model,
                 )
             except Exception:
                 logger.debug("MoE gate+up fusion not applied", exc_info=True)
-            # oMLX's own SwitchGLU variants (MiMo V2's GLM DSA experts):
-            # one gather_qmm over [gate; up], bit-exact.
-            try:
-                from ..patches.moe_gate_up_fusion import (
-                    apply_switch_glu_gate_up_fusion,
-                )
-
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    apply_switch_glu_gate_up_fusion,
-                    self._model,
-                )
-            except Exception:
-                logger.debug("SwitchGLU gate+up fusion not applied", exc_info=True)
 
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
         # into one launch (the composed argpartition chain is ~2 ms/token on

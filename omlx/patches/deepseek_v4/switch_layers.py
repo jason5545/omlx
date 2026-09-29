@@ -15,7 +15,8 @@ import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 from omlx.custom_kernels.nax import is_nax_available
-from omlx.patches.m5_gather_qmm import fused_gate_up_activation, sort_routes
+from omlx.patches.m5_gather_qmm import fused_gate_up_activation
+from omlx.patches.moe_routes import sort_routes
 
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
@@ -83,14 +84,8 @@ def has_native_block_kernels(projection) -> bool:
     )
 
 
-def _sort_rows(x, indices):
-    """``_gather_sort`` without the gather: the token rows, the sorted row ->
-    token row map, the sorted indices and the inverse order (same ops)."""
-    return sort_routes(x, indices)
-
-
 def _gather_sort(x, indices):
-    x, row_map, indices, inv_order = _sort_rows(x, indices)
+    x, row_map, indices, inv_order = sort_routes(x, indices)
     return x[row_map], indices, inv_order
 
 
@@ -470,7 +465,7 @@ class SwitchGLU(nn.Module):
         if do_sort:
             # The replicated rows x_tok[row_map] stay lazy: never computed
             # when the fused gate/up kernel reads the token rows in place.
-            x_tok, row_map, idx, inv_order = _sort_rows(x, indices)
+            x_tok, row_map, idx, inv_order = sort_routes(x, indices)
             x = x_tok[row_map]
             token_rows = (x_tok, row_map)
         if self.training:
@@ -543,7 +538,6 @@ class SwitchGLU(nn.Module):
                 and block_plan is None
                 and not self.training
                 and isinstance(self.gate_up_proj, QuantizedSwitchLinear)
-                and self.gate_up_proj._native_block_kind(x, do_sort) is None
             ):
                 # Sorted prefill on M5 (stock gather_qmm route): the
                 # activation in the [gate; up] matmul's epilogue

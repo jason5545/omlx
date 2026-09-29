@@ -72,18 +72,23 @@ the sorted row -> token row map instead; each lane addresses its four
 activation rows through the map (offsets computed once per tile), so every
 fragment holds the values it would read from the copy and the tensor ops
 are unchanged: bit-identical, and the copy is never computed (callers keep
-it lazy, see ``m5_gather_qmm.sort_routes``).
+it lazy, see ``moe_routes.sort_routes``).
 
 Supported: ``transpose=True``, rhs-indices only, ``x`` of shape
 ``[M, 1, K]`` with a flat sorted ``uint32`` index of length ``M``, bf16/fp16
-activations, affine 4/8-bit with group 32/64/128 (scales and biases in the
-activation dtype) and MXFP4 (group 32); the epilogue additionally needs
-``2 * n % 64 == 0``, the row map a uint32 ``[M]`` map and fewer than 2**32
-token-row elements. Anything else returns None and the caller keeps the
-stock path. ``OMLX_M5_GATHER_QMM_NAX=0`` disables the module,
-``OMLX_M5_GATHER_QMM_NAX_SWIGLU=0`` only the epilogue (and the row map),
-``OMLX_M5_GATHER_QMM_NAX_ROW_MAP=0`` only the row map;
-``OMLX_M5_GATHER_QMM_NAX_PLAN=sched,bm,bk,gx,pad`` (e.g.
+activations, N a multiple of 32, affine 4/8-bit with group 32/64/128
+(scales and biases in the activation dtype) and MXFP4 (group 32); the
+epilogue additionally needs ``2 * n % 64 == 0``, the row map a uint32
+``[M]`` map and fewer than 2**32 token-row elements. Anything else returns
+None and the caller keeps the stock path.
+
+The index must hold each expert's rows as one contiguous run. mlx treats
+``sorted_indices`` only as a hint, but the tile pre-pass relies on it: an
+expert split over two runs leaves rows unwritten. Every caller sorts the
+routes globally first.
+
+``OMLX_M5_GATHER_QMM_NAX=0`` disables the module (plain gather, epilogue
+and row map); ``OMLX_M5_GATHER_QMM_NAX_PLAN=sched,bm,bk,gx,pad`` (e.g.
 ``seg,128,128,32,8192``) pins a configuration (testing).
 """
 
@@ -104,8 +109,6 @@ logger = logging.getLogger(__name__)
 
 _ENV_ENABLE = "OMLX_M5_GATHER_QMM_NAX"
 _ENV_PLAN = "OMLX_M5_GATHER_QMM_NAX_PLAN"
-_ENV_SWIGLU = "OMLX_M5_GATHER_QMM_NAX_SWIGLU"
-_ENV_ROW_MAP = "OMLX_M5_GATHER_QMM_NAX_ROW_MAP"
 
 # Output tile width and column simdgroups (fixed; the Metal source assumes
 # them). Tile heights are multiples of 32 rows (one row simdgroup each).
@@ -1195,23 +1198,6 @@ def enabled() -> bool:
     }
 
 
-def swiglu_enabled() -> bool:
-    """False when ``OMLX_M5_GATHER_QMM_NAX_SWIGLU`` (or the module) is off."""
-    return enabled() and os.environ.get(_ENV_SWIGLU, "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-    }
-
-
-def row_map_enabled() -> bool:
-    """False when ``OMLX_M5_GATHER_QMM_NAX_ROW_MAP`` (or the epilogue) is off:
-    gate/up callers then materialise the sorted rows as before."""
-    return swiglu_enabled() and os.environ.get(
-        _ENV_ROW_MAP, "1"
-    ).strip().lower() not in {"0", "false", "off"}
-
-
 def _get_act_kernel(kind: str):
     """Build (once) the ``affine_act`` or ``fp_act`` kernel object, or its
     row-mapped variant (``*_act_map``: sorted rows read through ``rmap``)."""
@@ -1404,7 +1390,8 @@ def supports(
     if w.ndim != 3 or w.dtype != mx.uint32:
         return False
     E, N = int(w.shape[0]), int(w.shape[1])
-    if E == 0 or E > _MAX_EXPERTS or N == 0 or K % 32:
+    # Ragged N is canaried at N % 64 == 32 only.
+    if E == 0 or E > _MAX_EXPERTS or N == 0 or N % 32 or K % 32:
         return False
     if mode == "affine":
         if bits not in (4, 8) or group_size not in (32, 64, 128):
@@ -1603,7 +1590,7 @@ def _self_test(key: tuple) -> Optional[bool]:
         )
         return False
     if ok:
-        logger.info("NAX sorted gather_qmm armed for %s", _describe(key))
+        logger.debug("NAX sorted gather_qmm armed for %s", _describe(key))
     else:
         logger.warning(
             "NAX sorted gather_qmm disabled for %s: canary %s",
@@ -1694,7 +1681,7 @@ def _self_test_act(key: tuple) -> Optional[bool]:
         )
         return False
     if ok:
-        logger.info("NAX gate/up activation epilogue armed for %s", _describe(key))
+        logger.debug("NAX gate/up activation epilogue armed for %s", _describe(key))
     else:
         logger.warning(
             "NAX gate/up activation epilogue disabled for %s: canary not "
@@ -1742,7 +1729,7 @@ def _self_test_act_map(key: tuple) -> Optional[bool]:
         )
         return False
     if ok:
-        logger.info("NAX gate/up activation epilogue armed for %s", _describe(key))
+        logger.debug("NAX gate/up activation epilogue armed for %s", _describe(key))
     else:
         logger.warning(
             "NAX gate/up row map disabled for %s: canary not bit-identical to "
@@ -1781,11 +1768,12 @@ def sorted_gather_qmm(
 ) -> Optional[mx.array]:
     """``x @ w[indices].T`` for sorted rows on the tensor units.
 
-    ``plan`` pins a configuration (testing); by default ``_plan`` picks
-    one. Returns None when the module is disabled, the call is not
-    supported (see ``supports``), the kernels cannot be built or the
-    instantiation failed its one-time self-test; the caller then keeps the
-    stock path.
+    ``indices`` must group each expert's rows in one contiguous run (see
+    the module docstring). ``plan`` pins a configuration (testing); by
+    default ``_plan`` picks one. Returns None when the module is disabled,
+    the call is not supported (see ``supports``), the kernels cannot be
+    built or the instantiation failed its one-time self-test; the caller
+    then keeps the stock path.
     """
     if not enabled() or not supports(
         x, w, scales, biases, indices, group_size, bits, mode
@@ -1840,17 +1828,13 @@ def sorted_gather_qmm_swiglu(
     (``x`` holds the token rows, ``[T, 1, K]``), read in place instead of
     from a replicated ``[M, 1, K]`` copy: the same tiles, values and tensor
     ops, so the output is bit-identical to passing ``x[row_map]`` (checked
-    per instantiation on a scrambled canary map). Needs
-    ``row_map_enabled()``.
+    per instantiation on a scrambled canary map).
 
-    Returns None when disabled (``OMLX_M5_GATHER_QMM_NAX_SWIGLU=0`` or the
-    module switch; with ``row_map`` also ``OMLX_M5_GATHER_QMM_NAX_ROW_MAP=0``),
-    unsupported (``supports``, or ``2 * n % 64 != 0``), or not verified;
-    the caller then keeps the unfused path (materialising ``x[row_map]``).
+    Returns None when disabled (``OMLX_M5_GATHER_QMM_NAX=0``), unsupported
+    (``supports``, or ``2 * n % 64 != 0``), or not verified; the caller then
+    keeps the unfused path (materialising ``x[row_map]``).
     """
-    if row_map is not None and not row_map_enabled():
-        return None
-    if not swiglu_enabled() or not supports(
+    if not enabled() or not supports(
         x, w, scales, biases, indices, group_size, bits, mode, row_map
     ):
         return None
