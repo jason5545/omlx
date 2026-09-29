@@ -176,31 +176,80 @@ apps/omlx-mac/Scripts/build.sh release
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ```
 
-`build.sh` 會 ad-hoc sign。要部署給 Jason 用時，必須再用 Jason 的 Apple Development cert 重簽 staged app：
+donor 只在 `pyproject.toml`、`packaging/venvstacks.toml`、`uv.lock` 三個檔的指紋變了時才重建。合併 upstream 或走快速部署後，只要這三個沒動，`build.sh release` 會直接沿用 `packaging/_export`，只重貼 `framework-mlx-base`（約 1 GB）和 worktree 裡的 omlx，幾分鐘內完成。輸出看到 `Copying framework-mlx-base from donor` 就是走這條路。
+
+`build.sh` 每次都會把 staged app 重新 ad-hoc sign，所以每次 build 之後都要重做下面的 dev 重簽。`build.sh swift` 只重編 Swift 外殼、不碰 Python layers，簽章仍在，可以跳過重簽。
+
+要部署給 Jason 用時，必須再用 Jason 的 Apple Development cert 重簽 staged app：
 
 ```text
 Apple Development: Jui Chen Chien (4L22S63983)
 TeamIdentifier=MW4GWYGX56
+SHA-1=F309AB3C905A91376F00359AEF88CE3650E8E18C
 ```
 
-憑證通常只有 escalated shell 看得到；sandbox 內 `security find-identity` 可能會顯示 0 identities。
-
-重簽原則：
-
-- 先清掉 staged bundle 裡的 broken symlink（常見於 stripped dynlib links），否則 `codesign --strict` 可能回 `No such file or directory`。
-- 先簽 `Contents/Resources/Python` 裡的 embedded Mach-O（`.so`/`.dylib`/`.bundle`/可執行檔）。
-- 最後用 `--options runtime --entitlements apps/omlx-mac/Resources/oMLX.entitlements` 簽外層 `oMLX.app`。
-- 用 `codesign --verify --deep --strict --verbose=4` 驗 staged app 與 `/Applications/oMLX.app`。
-- Apple Development cert 未 notarize，`spctl --assess` 可能 rejected；這不等於 `codesign --verify` 失敗。
-
-部署：
+憑證能不能讀到取決於該工具的 sandbox，不要預設。先量：
 
 ```bash
+security find-identity -v -p codesigning
+```
+
+看到 `1 valid identities found` 就直接簽，sandbox 不會擋。顯示 0 identities 只是這個 shell 看不到 Keychain（Codex sandbox 內的 `gh` 是同款問題），換成有憑證的 shell，不要據此判定憑證不見、也不要要求重新登入。SHA-1 固定不變，`--sign F309AB3C…` 可以當身分選擇器，避開引號。
+
+重簽順序：
+
+1. 先確認 broken symlink。`codesign --strict` 回 `No such file or directory` 就是它造成的（常見於 stripped dynlib links），2026-09-29 那次 build 是 0 個，所以不要無條件先清：
+
+   ```bash
+   cd apps/omlx-mac/build/Stage/oMLX.app
+   find . -type l ! -exec test -e {} \; -print
+   ```
+
+2. 簽 `Contents/Resources/Python` 裡的 embedded Mach-O（`.so`/`.dylib`/可執行檔），2026-09-29 這批是 526 個。簽完檢查有沒有真的失敗：
+
+   ```bash
+   for f in $(find Contents/Resources/Python -type f \( -name '*.so' -o -name '*.dylib' -o -perm -u+x \)); do
+     codesign --force --sign "Apple Development: Jui Chen Chien (4L22S63983)" --timestamp=none --options runtime "$f"
+   done
+   ```
+
+3. 最後簽外層 bundle，帶 entitlements：
+
+   ```bash
+   codesign --force --sign "Apple Development: Jui Chen Chien (4L22S63983)" --timestamp=none \
+     --options runtime --entitlements ../../Resources/oMLX.entitlements oMLX.app
+   codesign -dvvv oMLX.app   # Authority 要出現 Jui Chen Chien，TeamIdentifier=MW4GWYGX56
+   ```
+
+4. 驗 staged app：
+
+   ```bash
+   codesign --verify --deep --strict --verbose=4 apps/omlx-mac/build/Stage/oMLX.app
+   ```
+
+   看到 `valid on disk` 加 `satisfies its Designated Requirement` 就算過。Jason 講的「macho sign fault」指的就是過程中的 `No such file or directory`；那只是簽名器對某個檔案路徑的抱怨，verify 過了就不擋部署，但要在回報裡講明有沒有出現。Apple Development cert 未 notarize，`spctl --assess` 會 rejected，那不等於簽章失效。
+
+部署（先關 app，否則 `rm -rf` 會留下跑著「已刪檔案」的程序）：
+
+```bash
+osascript -e 'tell application "oMLX" to quit'
+pkill -x oMLX   # 沒關掉的話
 rm -rf /Applications/oMLX.app
 ditto apps/omlx-mac/build/Stage/oMLX.app /Applications/oMLX.app
 xattr -dr com.apple.quarantine /Applications/oMLX.app
-codesign --verify --deep --strict --verbose=4 /Applications/oMLX.app
+codesign --verify --deep --strict --verbose=2 /Applications/oMLX.app
+open /Applications/oMLX.app
 ```
+
+部署後確認 attach 真的成立：8000 的 owner 必須還是 Homebrew 的 server（command 是 `omlx-server`、PPID 是 1 表示 launchd 撐的 service，不是 app 自己起的子程序）：
+
+```bash
+lsof -nP -iTCP:8000 -sTCP:LISTEN
+ps -o pid,ppid,command -p "$(lsof -tiTCP:8000 -sTCP:LISTEN | head -1)"
+curl -sS http://127.0.0.1:8000/health | jq -c '{status, loaded: .engine_pool.loaded_count}'
+```
+
+`pgrep -x oMLX` 有 pid、`/health` 回 healthy、8000 owner 沒變，三個都對才算部署完成。
 
 ## 追 upstream
 
