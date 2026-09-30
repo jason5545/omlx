@@ -20,7 +20,7 @@ upstream https://github.com/jundot/omlx.git
 
 ## 目前本地改動
 
-自 0.6.3rc1 merge 起，這個 fork 盡量貼齊 upstream，只保留九個本地功能；其他一律 follow upstream（舊的 VLM/MTP、MTPLX、thinking-budget patch stack 已整批丟棄，存在 `backup/pre-upstream-merge` 分支僅供查閱，不要回移植）：
+自 0.6.3rc1 merge 起，這個 fork 盡量貼齊 upstream，只保留十個本地功能；其他一律 follow upstream（舊的 VLM/MTP、MTPLX、thinking-budget patch stack 已整批丟棄，存在 `backup/pre-upstream-merge` 分支僅供查閱，不要回移植）：
 
 - API sub-key 可以套 request policy（`identify_api_key` → `DEFAULT_SUB_KEY_POLICIES`）。`voco` 預設是 `max_context_window<=16384` 且 `enable_thinking=false`。相關檔案：`omlx/server.py`、`omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`。
 - Mac app attach mode：`8000` 上已有健康 oMLX server 時 app 直接 attach，不顯示 port conflict；細節見下面 Mac app 章節。相關檔案：`apps/omlx-mac/Sources/Server/ServerProcess.swift` 等 6 個 Swift 檔。
@@ -31,6 +31,7 @@ upstream https://github.com/jundot/omlx.git
 - JANGQ affine-ternary prism 轉接：dealignai 的 Bonsai-2-27B-*-Ternary-JANG 沿用 PrismML 的 ternary 權重，但把 `model_type` 改成 `qwen3_5`、又加 `storage_bits`，所以走不到 upstream #3782 已支援的 `prism_hadamard_qwen35`；載入時把 config 正規化成 schema-2、重建 modules manifest、拿掉 `storage_bits`、放寬 prism 的量化檢查、補 161 個 zero-centered norm 的 +1.0，全部在一次載入內 patch 並還原。相關檔案：`omlx/patches/prism_jangq_compat.py`、`omlx/utils/model_loading.py` 的 `maybe_load_jangq_prism`、`omlx/engine/vlm.py` 與 `omlx/engine/batched.py` 的呼叫點（batched 端只負責擋純文字載入）、`tests/test_prism_jangq_compat.py`。
 - JANG mixed-precision bundle 轉接：逐張量 bit width 記在 sidecar（`jang_config.json` 等），stock mlx-lm／mlx-vlm 讀不到，所以交給 `jang_tools.loader` 載入後再進正常的 BatchedEngine／VLMBatchedEngine——不要改成新增 engine 類別，server 有一批 `isinstance(engine, VLMBatchedEngine)` 的圖片、prefix cache、tool calling 判定會斷。閘門要求 sidecar 的 `format` 是 `jang`／`jjqf`／`mxq`：只有 vMLX sidecar、`format` 未設的 MXFP8 包（如 Ornith-1.5 MXFP8）要留給原路徑，不要搶過來。`omlx/patches/jang_load.py` 另外補 jang runtime 兩個洞：Nemotron-H gate 的後綴比對（上游 PR #364 那段是死碼，從沒解量化過任何 gate）與 6-bit + `--hadamard` 的 sign 寬度（它用 `packed_cols * (32 // bits)`，6-bit 會算成 60）。相關檔案：`omlx/patches/jang_load.py`、`omlx/utils/model_loading.py` 的 `maybe_load_jang`、`omlx/engine/batched.py` 與 `omlx/engine/vlm.py` 的載入插入點、`omlx/model_discovery.py` 的 `JANG_CONFIG_FILES`／`_jang_has_vision`、`omlx/exceptions.py` 的 `JANGDependencyError`／`JANGLoadError`、`tests/test_jang_engine.py`。依賴是 `pyproject.toml` 的 `jang` extra 加 `Formula/omlx.rb` 一行 `system(*pip_install, "jang[mlx]>=2.5.47")`（必須共用 `pip_install` flags，`tests/test_homebrew_formula.py` 會數裸 pip 呼叫）；上游 PR #364 合併後可整批換成 upstream 版。
 - GDN MTP verify prework 的 upstream kernel 擴充為同時支援 fp16／bf16：輸入、conv state、conv1d 權重 dtype 必須相同，scale 也用該 dtype；fp16 和既有 bf16 組合路徑要求逐位元一致。追 upstream 時守住。相關檔案：`omlx/patches/qwen35_gdn_prework.py`、`tests/test_qwen35_gdn_prework.py`。
+- MTP depth controller 的校準階段（修長 context park/probe 震盪，2026-09-30）：warmup sweep 量完各深度成本後，acceptance EMA（ALPHA=0.08）只有 ≤max_depth 次更新，而 seed 必然來自剛 park 的 controller（p 鎖在 dip 值）——4 個 warmup 投機 cycle 爬不回 16-cycle 的 streak budget，probe 於是鎖死 depth 0、23 cycle 再 park（server.log 的 `finish=parked cycles=23 d0=18`），冷卻還倍增。修法是 sweep 後進入 `CAL_LEN=24` 校準：鎖定當時最佳投機深度、exit gate 與 staleness probe 暫停，EMA 收斂後才裁決；`_maybe_finish_mtp_reentry_probe` 也必須等校準結束才算成功（提早成功會洗掉該倍增的冷卻）。相關檔案：`omlx/patches/mlx_lm_mtp/batch_generator.py`（`CAL_LEN`、`observe()` 校準分支、`_speculation_losing` 的 cal guard、`_best_speculative()`、probe 成功的 cal 條件）、`tests/test_mtp_depth_controller.py`、`tests/test_mlx_lm_mtp_patch.py` 的 `test_calibrating_reentry_probe_is_not_a_win_yet`。追 upstream 時守住；如果 upstream 對同一震盪出了更好的修法（不同的 probe 成功條件、seed 策略或估計器），換 upstream 版前先確認 dipped-seed 測試（`test_probe_with_dipped_seed_recovers_at_long_context`、`test_genuine_regression_still_parks_after_calibration`）仍通過或等價改寫，行為底線是「校準完成前 exit gate 不裁決、真衰退仍會 park」。
 
 追 upstream 時，conflict 只要守住上面幾塊，其餘一律取 upstream 版本。不要留下手動改 site-packages 的最終狀態。
 
@@ -282,6 +283,7 @@ brew services restart jason5545/omlx/omlx
 - `packaging/build.py`（`_ssl_context`／`_urlopen`；不要退回裸 `urllib.request.urlretrieve`）
 - `omlx/patches/prism_jangq_compat.py`、`omlx/utils/model_loading.py`（`maybe_load_jangq_prism`、`maybe_load_jang`）、`omlx/engine/vlm.py` 與 `omlx/engine/batched.py` 的載入插入點（兩個 JANG 轉接；插入點在 custom quantization 之前，prism 要先於 JANG，順序不要顛倒）
 - `omlx/model_discovery.py`（`JANG_CONFIG_FILES`／`_jang_has_vision`；JANG 包的 modality 判定）
+- `omlx/patches/mlx_lm_mtp/batch_generator.py`（depth controller 校準階段：`CAL_LEN`、`observe()` 校準分支、`_speculation_losing` cal guard、`_best_speculative()`、`_maybe_finish_mtp_reentry_probe` 的 cal 條件；行為底線見「目前本地改動」該條）
 - `pyproject.toml`（`jang` extra 留在 optional-dependencies，不要搬進 `dependencies` 或 `bundle`——它晚於 packaging/venvstacks.toml 的 exclude-newer cutoff，搬進去 DMG layer 解析不到）
 
 ## 最小驗證
