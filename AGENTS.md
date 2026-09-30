@@ -43,6 +43,7 @@ brew services stop jason5545/omlx/omlx
 brew uninstall jason5545/omlx/omlx
 brew install --HEAD --with-grammar jason5545/omlx/omlx
 brew services start jason5545/omlx/omlx
+scripts/deploy_app.sh      # Mac app 同步部署（brew 裝的是 origin/main，repo 要先在同一個 commit）
 ```
 
 Homebrew 5.1 的 `brew reinstall` 不接受 `--HEAD`，所以需要明確 uninstall/install 時，用上面的方式最穩。
@@ -75,13 +76,18 @@ https://github.com/jason5545/omlx.git
 
 判斷依賴有沒有變，是跟「venv 依賴基準」比：brew 整套安裝時的 commit（`INSTALL_RECEIPT.json` 的 `source.scm_revision`），不是上一次快速部署的 commit。腳本會自動比對，上面列的檔案有變就拒絕。
 
+brew service 和 Mac app 一律同步部署（Jason 2026-09-30 定）：`deploy_fast.sh` 部署完 brew service 後，預設接著跑 `scripts/deploy_app.sh`（見「Mac app 操作」）。只有 Jason 明說只部署一邊時才加 `--no-app`。app 的 build 加重簽要幾分鐘，但 brew service 的停機時間不變；app 只是介面，換 app 時 attach 的 server 照跑。
+
 先 commit 並 push 到 `origin/main`，再執行：
 
 ```bash
-scripts/deploy_fast.sh              # 部署 origin/main
+scripts/deploy_fast.sh              # 部署 origin/main，再部署 Mac app
 scripts/deploy_fast.sh <commit>     # 部署指定 commit（回滾也用這個）
-scripts/deploy_fast.sh --status     # 只看目前部署的 commit
+scripts/deploy_fast.sh --no-app     # 只部署 brew service
+scripts/deploy_fast.sh --status     # 看目前部署的 commit，以及 Mac app 是否同步
 ```
+
+app 內建的 omlx 是從 working tree 複製的，所以 app 那一步要求 HEAD 的 `omlx/` 跟剛部署的 commit 相同、`omlx/`、`apps/`、`packaging/` 沒有未 commit 的改動；不符合時 brew service 照樣部署完成，腳本停下來說明兩邊不同步。回滾到舊 commit 時，先 checkout 那個 commit 再跑，app 才會一起退回。
 
 腳本做的事，也就是手動操作的等價指令：
 
@@ -98,6 +104,7 @@ brew services stop jason5545/omlx/omlx
 "$PIP" install --no-deps --force-reinstall "git+file://$PWD@$SHA"
 brew services start jason5545/omlx/omlx
 curl -sS http://127.0.0.1:8000/health                                              # 等到 "status":"healthy"
+scripts/deploy_app.sh                                                              # Mac app 同步部署
 ```
 
 細節：
@@ -168,6 +175,8 @@ donor 只在 `pyproject.toml`、`packaging/venvstacks.toml`、`uv.lock` 三個�
 
 `build.sh` 每次都會把 staged app 重新 ad-hoc sign，所以每次 build 之後都要重做下面的 dev 重簽。`build.sh swift` 只重編 Swift 外殼、不碰 Python layers，簽章仍在，可以跳過重簽。
 
+部署 app 用 `scripts/deploy_app.sh`：build release、清 broken symlink（有才清）、重簽、驗證、關 app、替換 `/Applications/oMLX.app`、重開，最後確認 attach 成立，並在 `Contents/Resources/omlx-source-commit` 記下來源 commit（`deploy_fast.sh --status` 用它判斷兩邊是否同步）。`deploy_fast.sh` 會自動接著跑它；brew 整套重裝之後要手動跑。下面各段是它做的事，也是手動時的等價步驟。
+
 要部署給 Jason 用時，必須再用 Jason 的 Apple Development cert 重簽 staged app：
 
 ```text
@@ -193,7 +202,7 @@ security find-identity -v -p codesigning
    find . -type l ! -exec test -e {} \; -print
    ```
 
-2. 簽 `Contents/Resources/Python` 裡的 embedded Mach-O（`.so`/`.dylib`/可執行檔），2026-09-29 這批是 526 個。簽完檢查有沒有真的失敗：
+2. 簽 `Contents/Resources/Python` 裡的 embedded Mach-O（`.so`/`.dylib`/可執行檔），2026-09-29 這批是 526 個、2026-09-30 是 493 個，數量會跟著 donor 內容變，看失敗數就好。簽完檢查有沒有真的失敗：
 
    ```bash
    for f in $(find Contents/Resources/Python -type f \( -name '*.so' -o -name '*.dylib' -o -perm -u+x \)); do
@@ -217,7 +226,7 @@ security find-identity -v -p codesigning
 
    看到 `valid on disk` 加 `satisfies its Designated Requirement` 就算過。Jason 講的「macho sign fault」指的就是過程中的 `No such file or directory`；那只是簽名器對某個檔案路徑的抱怨，verify 過了就不擋部署，但要在回報裡講明有沒有出現。Apple Development cert 未 notarize，`spctl --assess` 會 rejected，那不等於簽章失效。
 
-部署（先關 app，否則 `rm -rf` 會留下跑著「已刪檔案」的程序）：
+部署（先關 app，否則 `rm -rf` 會留下跑著「已刪檔案」的程序；`osascript` 的 quit 可能被 app 的確認框擋下、回「使用者取消操作」，等不到就 `pkill`，attach 的 brew service 不受影響）：
 
 ```bash
 osascript -e 'tell application "oMLX" to quit'
@@ -258,6 +267,7 @@ brew update
 brew uninstall jason5545/omlx/omlx
 brew install --HEAD --with-grammar jason5545/omlx/omlx
 brew services restart jason5545/omlx/omlx
+scripts/deploy_app.sh      # Mac app 同步部署
 ```
 
 衝突落在本地保留的功能時，照 [`PATCHES.md`](PATCHES.md) 的「合併衝突檢查」逐項確認，其餘一律取 upstream 版本。
@@ -307,4 +317,5 @@ Request policy active: client=voco source=api-sub-key ... max_context_window<=16
 - 不要把 `jundot/omlx` tap 裝回來，除非 Jason 明確要求。
 - 不要把 Homebrew cache 裡的 checkout 當主要 repo 修改。
 - 做完實質變更後，commit 並 push 到 `origin/main`。要上線時先看「快速部署」的判斷：只改 `omlx/` 的 Python 用 `scripts/deploy_fast.sh`；改到依賴、`Formula/omlx.rb` 或需要編譯的東西，才照「Homebrew 操作」整套重裝。
+- brew service 和 Mac app 一律同步部署，同一份 `omlx/`：`deploy_fast.sh` 預設會接著部署 app，整套重裝之後手動跑 `scripts/deploy_app.sh`。只有 Jason 明說只部署一邊時才分開（Jason 2026-09-30 定）。部署完用 `scripts/deploy_fast.sh --status` 確認兩邊同步。
 - 回覆 Jason 時用自然、簡短的繁體中文，少模板感。

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # 快速部署：只改 omlx/ 的 Python 時，把指定 commit 的 omlx 套件重裝進 Homebrew venv，
 # 不動依賴，再重啟 brew service。什麼時候能用、什麼時候要整套重裝，見 AGENTS.md「快速部署」。
+# brew service 和 Mac app 一律同步部署：成功後接著跑 scripts/deploy_app.sh。
 #
-#   scripts/deploy_fast.sh             部署 origin/main
+#   scripts/deploy_fast.sh             部署 origin/main（再部署 Mac app）
 #   scripts/deploy_fast.sh <commit>    部署指定 commit（回滾也用這個）
-#   scripts/deploy_fast.sh --status    只印目前部署的 commit
+#   scripts/deploy_fast.sh --no-app    只部署 brew service（Jason 明說才用）
+#   scripts/deploy_fast.sh --status    只印目前部署的 commit，以及 Mac app 是否同步
+#   scripts/deploy_fast.sh --commit    只印目前部署的 commit（給 deploy_app.sh 用）
 #
 # macOS 內建 bash 3.2 在 C locale 會把緊貼在變數後面的全形字元當成變數名稱
 # （"$SHA（" 會變成 unbound variable），所以變數一律寫成 ${VAR}。
@@ -44,10 +47,33 @@ else:
 PY
 }
 
+WITH_APP=1
+ARGS=()
+for arg in "$@"; do
+  case ${arg} in
+    --no-app) WITH_APP=0 ;;
+    *) ARGS+=("${arg}") ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+if [[ ${1:-} == --commit ]]; then
+  deployed_commit | cut -f1
+  exit 0
+fi
+
 if [[ ${1:-} == --status ]]; then
   IFS=$'\t' read -r sha source version < <(deployed_commit)
   echo "部署中：${sha}  來源：${source}  版本：${version}"
   echo "venv 依賴基準（brew 整套安裝時的 commit）：$(jq -r .source.scm_revision "${RECEIPT}")"
+  APP_SHA=$(cat /Applications/oMLX.app/Contents/Resources/omlx-source-commit 2>/dev/null || true)
+  if [[ -z ${APP_SHA} ]]; then
+    echo "Mac app：沒有來源 commit 記錄（不是 scripts/deploy_app.sh 部署的），無法確認是否同步"
+  elif git -C "${REPO}" diff --quiet "${APP_SHA}" "${sha}" -- omlx 2>/dev/null; then
+    echo "Mac app：${APP_SHA}，omlx/ 與 brew 同步"
+  else
+    echo "Mac app：${APP_SHA}，omlx/ 與 brew 不同步，跑 scripts/deploy_app.sh"
+  fi
   exit 0
 fi
 
@@ -194,3 +220,12 @@ IFS=$'\t' read -r NOW_SHA NOW_SOURCE _ < <(deployed_commit)
 [[ ${NOW_SHA} == "${SHA}" ]] || die "部署後 commit 是 ${NOW_SHA}，不是 ${SHA}"
 say "完成：部署 ${NOW_SHA}（${NOW_SOURCE}），停 service 到 healthy $(($(date +%s) - T_STOP)) 秒"
 say "回滾：scripts/deploy_fast.sh ${PREV}"
+
+# 7. Mac app 同步部署。app 從 working tree 建，所以 HEAD 的 omlx/ 要跟剛部署的 commit 相同。
+if ((WITH_APP)); then
+  say "接著部署 Mac app（scripts/deploy_app.sh）"
+  "${REPO}/scripts/deploy_app.sh" \
+    || die "brew service 已部署 ${SHA:0:8}，但 Mac app 沒部署成功，兩邊不同步。照上面的原因處理後單獨跑 scripts/deploy_app.sh"
+else
+  say "--no-app：沒有部署 Mac app，兩邊可能不同步（scripts/deploy_fast.sh --status 可查）"
+fi
