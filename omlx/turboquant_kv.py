@@ -220,6 +220,47 @@ def _concat_state_batch(states):
     raise TypeError(f"Unsupported state type: {type(first)!r}")
 
 
+def _roll_state_tokens(state, shifts):
+    """Roll every per-token array of a state along the token axis (axis 2).
+
+    ``shifts`` is (B, 1): one right-shift per batch row, like the
+    ``dynamic_roll`` BatchKVCache.finalize applies to dense keys.
+    """
+    if state is None:
+        return None
+
+    def roll(array):
+        return dynamic_roll(array, shifts, axis=2)
+
+    if isinstance(state, TurboQuantMSEState):
+        return TurboQuantMSEState(roll(state.norms), roll(state.indices))
+    if isinstance(state, TurboQuantProdState):
+        return TurboQuantProdState(
+            roll(state.norms),
+            roll(state.mse_indices),
+            roll(state.residual_norms),
+            roll(state.qjl_signs),
+        )
+    if isinstance(state, TurboQuantPolarState):
+        return TurboQuantPolarState(
+            roll(state.radii),
+            tuple(roll(level) for level in state.level_indices),
+        )
+    if isinstance(state, TurboQuantPolarProdState):
+        return TurboQuantPolarProdState(
+            roll(state.norms),
+            _roll_state_tokens(state.polar_state, shifts),
+            roll(state.residual_norms),
+            roll(state.qjl_signs),
+        )
+    if isinstance(state, TurboQuantSplitState):
+        return TurboQuantSplitState(
+            _roll_state_tokens(state.low, shifts),
+            _roll_state_tokens(state.high, shifts),
+        )
+    raise TypeError(f"Unsupported state type: {type(state)!r}")
+
+
 def _pad_state_left(state, pad_length: int):
     """Prepend zeros along the token dimension (axis 2) of a state."""
     if state is None or pad_length <= 0:
@@ -394,12 +435,16 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             return
         padding = self._right_padding
         if self.keys is not None:
-            k_fp16, v_fp16 = self.dequantize()
-            k_rolled = dynamic_roll(k_fp16, padding[:, None], axis=2)
-            v_rolled = dynamic_roll(v_fp16, padding[:, None], axis=2)
-            self.keys = self.key_codec.quantize(k_rolled)
-            self.values = self.value_codec.quantize(v_rolled)
-            mx.eval(self.keys, self.values)
+            # Quantized states are per token, so rolling them equals the
+            # dequantize -> roll -> requantize round trip without a second
+            # quantization pass. Batched MTP rollback lands here on every
+            # ragged commit (mlx-vlm _trim_append_caches), where the round
+            # trip materialized the whole batch cache as float32 per layer.
+            ks, vs = self._attention_states()
+            self.keys = _roll_state_tokens(self._unwrap(ks), padding[:, None])
+            self.values = _roll_state_tokens(self._unwrap(vs), padding[:, None])
+            self._cached_state = None
+            self._cached_state_offset = -1
         self.offset -= (
             padding if isinstance(self.offset, mx.array) else padding[0].item()
         )

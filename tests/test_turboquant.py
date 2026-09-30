@@ -846,6 +846,223 @@ def test_vlm_target_verify_attention_handles_tq_proxies():
     )
 
 
+# Qwen3.5 27B full-attention layout: 24 query heads over 4 KV heads, hd 256.
+_LP_N_Q, _LP_N_KV, _LP_D = 24, 4, 256
+
+
+def _left_padded_tq_call(lengths, q_len, mask_kind, bits=4.0, seed=0):
+    """Build the B>1 left-padded call mlx-vlm's qwen3_5 attention makes.
+
+    ``left_padded_decode`` (L=1) passes mask=None and stashes the pads on
+    the cache; verify (L>1) passes the cache's make_mask() array.
+    """
+    mx.random.seed(seed)
+    singles = []
+    for length in lengths:
+        single = TurboQuantKVCache(bits=bits)
+        single.update_and_fetch(
+            mx.random.normal((1, _LP_N_KV, length, _LP_D)).astype(mx.float16),
+            mx.random.normal((1, _LP_N_KV, length, _LP_D)).astype(mx.float16),
+        )
+        singles.append(single)
+    batch = BatchTurboQuantKVCache.merge(singles)
+    pads = [int(p) for p in batch.left_padding.tolist()]
+    mask = batch.make_mask(q_len) if mask_kind == "array" else None
+    batch.update_and_fetch(
+        mx.random.normal((len(lengths), _LP_N_KV, q_len, _LP_D)).astype(mx.float16),
+        mx.random.normal((len(lengths), _LP_N_KV, q_len, _LP_D)).astype(mx.float16),
+    )
+    # Padding columns are not always zero: a ragged speculative commit rolls
+    # rejected tail tokens into them. Fill them with large-norm codes so a
+    # single leaked column dominates the row's output.
+    for state in (batch.keys, batch.values):
+        for b, pad in enumerate(pads):
+            if pad:
+                state.norms[b, :, :pad] = 1000.0
+                state.indices[b, :, :pad, :] = mx.random.randint(
+                    0, 2**31, (state.indices.shape[1], pad, state.indices.shape[3])
+                ).astype(state.indices.dtype)
+    ks, vs = batch.state
+    if mask_kind == "left_padded_decode":
+        batch._qwen3_5_decode_left_padding = pads
+    queries = mx.random.normal(
+        (len(lengths), _LP_N_Q, q_len, _LP_D)
+    ).astype(mx.float16)
+    return batch, pads, mask, ks, vs, queries
+
+
+def _pad_aware_reference(batch, ks, vs, queries, pads, scale):
+    """mlx-vlm's original helper on dequantized states: slice each row from
+    its pad, per-row causal tail (float32)."""
+    dk, dv = batch.dequantize(keys_state=ks, values_state=vs)
+    q_len = queries.shape[2]
+    rows = []
+    for b, pad in enumerate(pads):
+        k = dk[b : b + 1, :, pad:, :]
+        v = dv[b : b + 1, :, pad:, :]
+        prefix = k.shape[2] - q_len
+        rows.append(
+            mx.concatenate(
+                [
+                    mx.fast.scaled_dot_product_attention(
+                        queries[b : b + 1, :, i : i + 1, :].astype(mx.float32),
+                        k[:, :, : prefix + i + 1, :],
+                        v[:, :, : prefix + i + 1, :],
+                        scale=scale,
+                    )
+                    for i in range(q_len)
+                ],
+                axis=2,
+            )
+        )
+    return mx.concatenate(rows, axis=0)
+
+
+@pytest.mark.parametrize(
+    "lengths,q_len,mask_kind,bits,route",
+    [
+        # Above the fused token floor: padded fused kernel.
+        ((3000, 400), 1, "left_padded_decode", 4.0, "fused"),
+        ((400, 3000), 1, "left_padded_decode", 4.0, "fused"),
+        # 41 visible tokens < 64 blocks: whole blocks see nothing for row 1.
+        ((3000, 40), 1, "left_padded_decode", 4.0, "fused"),
+        ((3000, 40), 4, "array", 4.0, "fused"),
+        ((3000, 400), 3, "array", 3.5, "fused"),
+        # Past 8192 tokens the kernel splits into 128 blocks.
+        ((9000, 131), 1, "left_padded_decode", 4.0, "fused"),
+        # Wider than the fused row cap / fold knee: one-shot quantized.
+        ((3000, 400), 5, "array", 4.0, "oneshot"),
+        # Below the token floor: masked fold path.
+        ((600, 100), 1, "left_padded_decode", 4.0, "fold"),
+        ((600, 100), 4, "array", 4.0, "fold"),
+        ((600, 100), 5, "array", 4.0, "oneshot"),
+    ],
+)
+def test_vlm_left_padded_attention_matches_pad_aware_reference(
+    monkeypatch, lengths, q_len, mask_kind, bits, route
+):
+    """B>1 decode / verify on a left-padded TurboQuant batch must honor each
+    row's padding and causal tail straight from the quantized states.
+
+    The first TurboQuant version of this helper (a915729b, #2139) dequantized
+    the whole batch cache per layer per step, and with ``left_padded_decode``
+    (mask=None) it let short rows attend to their zeroed padding columns.
+    """
+    pytest.importorskip("mlx_vlm.models.qwen3_5.language")
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    tq_attention._patch_vlm_target_verify_attention()
+
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+    helper = q35_lang._omlx_tq_target_verify_attention
+    scale = _LP_D**-0.5
+    batch, pads, mask, ks, vs, queries = _left_padded_tq_call(
+        lengths, q_len, mask_kind, bits=bits
+    )
+    ref = _pad_aware_reference(batch, ks, vs, queries, pads, scale)
+    one_leaked = _pad_aware_reference(
+        batch, ks, vs, queries, [max(p - 1, 0) for p in pads], scale
+    )
+    mx.eval(ref, one_leaked)
+
+    routes = []
+    fused = tq_attention._fused_multirow_mse_attention
+    oneshot = tq_attention._decode_multirow_quantized_attention
+
+    def spy_fused(*args, **kwargs):
+        result = fused(*args, **kwargs)
+        if result is not None:
+            routes.append("fused")
+        return result
+
+    def spy_oneshot(*args, **kwargs):
+        routes.append("oneshot")
+        return oneshot(*args, **kwargs)
+
+    def fail_dequantize(self, *args, **kwargs):
+        raise AssertionError("left-padded attention must not dequantize")
+
+    monkeypatch.setattr(tq_attention, "_fused_multirow_mse_attention", spy_fused)
+    monkeypatch.setattr(
+        tq_attention, "_decode_multirow_quantized_attention", spy_oneshot
+    )
+    monkeypatch.setattr(BatchTurboQuantKVCache, "dequantize", fail_dequantize)
+
+    out = helper(queries, ks, vs, cache=batch, scale=scale, mask=mask)
+    mx.eval(out)
+
+    assert out.shape == queries.shape
+    assert not mx.isnan(out).any().item()
+    assert (routes or ["fold"]) == [route]
+    for b in range(len(lengths)):
+        err = mx.abs(out[b].astype(mx.float32) - ref[b]).max().item()
+        assert err < 5e-3, f"row {b} (pad {pads[b]}): {err:.3e}"
+    # Leaking even one padding column must be far outside the tolerance, or
+    # this test would not catch an off-by-one at the pad boundary.
+    padded_row = max(range(len(pads)), key=lambda b: pads[b])
+    assert mx.abs(one_leaked[padded_row] - ref[padded_row]).max().item() > 1.0
+
+
+def test_vlm_left_padded_dequantize_fallback_honors_padding(monkeypatch):
+    """Calls outside the quantized envelope keep the dequantize fallback;
+    with ``left_padded_decode`` (mask=None) it must rebuild the padding mask
+    from the cache metadata instead of attending to the padding."""
+    pytest.importorskip("mlx_vlm.models.qwen3_5.language")
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    tq_attention._patch_vlm_target_verify_attention()
+
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+    helper = q35_lang._omlx_tq_target_verify_attention
+    scale = _LP_D**-0.5
+    batch, pads, mask, ks, vs, queries = _left_padded_tq_call(
+        (600, 100), 1, "left_padded_decode"
+    )
+    ref = _pad_aware_reference(batch, ks, vs, queries, pads, scale)
+    monkeypatch.setattr(
+        tq_attention, "_left_padded_quantized_attention", lambda *a, **k: None
+    )
+    out = helper(queries, ks, vs, cache=batch, scale=scale, mask=mask)
+    mx.eval(out, ref)
+    assert mx.abs(out.astype(mx.float32) - ref).max().item() < 5e-2
+
+
+def test_padded_fused_kernel_without_padding_matches_unpadded_kernel():
+    """The padded kernel variant with zero padding and no mask must
+    reproduce the unpadded kernel bit for bit (same loop, finite max floor
+    only matters for empty blocks)."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(0)
+    B, T = 2, tq_attention._FUSED_MULTIROW_MIN_TOKENS + 512
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, _LP_N_KV, T, _LP_D)).astype(mx.float16),
+        mx.random.normal((B, _LP_N_KV, T, _LP_D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    ks, vs = tq._unwrap(ks), tq._unwrap(vs)
+    queries = mx.random.normal((B, _LP_N_Q, 3, _LP_D)).astype(mx.float16)
+    scale = _LP_D**-0.5
+
+    plain = tq_attention._fused_multirow_mse_attention(
+        tq, queries, ks, vs, scale, T
+    )
+    padded = tq_attention._fused_multirow_mse_attention(
+        tq, queries, ks, vs, scale, T, pads=mx.zeros((B,), dtype=mx.int32)
+    )
+    assert plain is not None and padded is not None
+    diff = mx.abs(plain.astype(mx.float32) - padded.astype(mx.float32))
+    assert diff.max().item() == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Codec rebuild tests (SSD cache reconstruction, issue #577)
 # ---------------------------------------------------------------------------
@@ -1398,6 +1615,46 @@ def test_batch_tq_speculative_commit_matches_dense(retained):
         expected = dense.extract(i).state[0]
         assert got.shape == expected.shape
         assert mx.abs(got - expected).mean().item() < 0.2
+
+
+@pytest.mark.parametrize("bits", [4.0, 3.5])
+def test_batch_tq_ragged_commit_rolls_quantized_state(monkeypatch, bits):
+    """Batched MTP rollback calls finalize() on every ragged commit (rows
+    accepting different draft counts). It must roll the quantized state in
+    place of the dequantize -> roll -> requantize round trip: that one
+    materialized the whole batch cache as float32 per layer per commit, and
+    each requantization shrank every cached vector's norm (~0.5% per trip
+    at 4 bits), compounding across commits."""
+    from mlx_lm.models.cache import dynamic_roll
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    tq = BatchTurboQuantKVCache([0, 1, 2], bits=bits)
+    mx.random.seed(3767)
+    k = mx.random.normal((3, 2, 64, 64)).astype(mx.float16)
+    tq.update_and_fetch(k, k * 0.5)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("ragged commit must not dequantize/requantize")
+
+    retained = [1, 2, 3]
+    right_padding = mx.array([3 - r for r in retained])[:, None]
+    for _ in range(20):
+        transaction = start_speculative_cache([tq], 3)
+        new = mx.random.normal((3, 2, 3, 64)).astype(mx.float16)
+        tq.update_and_fetch(new, new * 0.5)
+        before_k, before_v = tq.dequantize()
+        offset, left_padding = tq.offset.tolist(), tq.left_padding.tolist()
+        with monkeypatch.context() as patch:
+            patch.setattr(BatchTurboQuantKVCache, "dequantize", fail)
+            patch.setattr(type(tq.key_codec), "quantize", fail)
+            transaction.commit(retained)
+        got_k, got_v = tq.dequantize()
+        assert mx.array_equal(got_k, dynamic_roll(before_k, right_padding, axis=2))
+        assert mx.array_equal(got_v, dynamic_roll(before_v, right_padding, axis=2))
+        assert tq.offset.tolist() == [o - (3 - r) for o, r in zip(offset, retained)]
+        assert tq.left_padding.tolist() == [
+            p + (3 - r) for p, r in zip(left_padding, retained)
+        ]
 
 
 @pytest.mark.parametrize("advance", [0, 3])

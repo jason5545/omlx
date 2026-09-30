@@ -11,10 +11,14 @@ When TurboQuantKVCache is detected, routes attention to:
     value weighted sum — one lazy pass over the KV, no dequantize
   - Prefill (L>1): tiled quantized attention first for long contexts;
     cache.prefill_attention() first for short contexts; then dequantized SDPA
+
+mlx-vlm's qwen3_5 left-padded helper (B>1 decode and MTP verify) is patched
+separately onto the same multi-row routes, with each row's left padding
+applied (``_patch_vlm_target_verify_attention``).
 """
 
 import logging
-from functools import cache
+from functools import cache, lru_cache
 from typing import Optional
 
 import mlx.core as mx
@@ -43,7 +47,9 @@ _FUSED_MULTIROW_MIN_TOKENS = 2048
 
 
 @cache
-def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
+def _fused_mse_multirow_2pass1_kernel(
+    key_bits: int, val_bits: int, dim: int, padded: bool = False
+):
     """Pass 1 of the fused multi-row MSE verify attention.
 
     Derived from turboquant's ``_fused_mse_decode_2pass_1_kernel`` with one
@@ -52,6 +58,14 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
     stats, causal tail applied inline). The upstream decode kernels re-unpack
     the KV per query row, so MTP verify paid the unpack ALU L times over
     (issue #2215).
+
+    ``padded`` builds the left-padded batch variant (a separate kernel; the
+    unpadded source is unchanged). Each batch row starts its KV loop at its
+    ``pads`` entry, so padding columns are never unpacked, and an optional
+    bool ``mask`` (HasMask; shape (MaskB, 1, MaskT, token_count)) further
+    hides columns per row. The running max starts at a finite floor: a block
+    that sees no token for a row (short rows leave whole blocks empty) must
+    hand pass 2 a finite max, or pass 2 computes exp(-inf - -inf) = NaN.
     """
     from mlx_vlm import turboquant as _tq
 
@@ -77,6 +91,52 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
         f"v_el[{i}] = {expr};" for i, expr in enumerate(v_exprs)
     )
 
+    if padded:
+        pad_setup = """
+
+        // Left-padded batch row: jump to this block's first column >= pad
+        int pad = pads[batch_idx];
+        int t_start = block_idx;
+        if (pad > t_start)
+            t_start += ((pad - t_start + Blocks - 1) / Blocks) * Blocks;"""
+        max_init = "-3.402823466e+38f"
+        t_start = "t_start"
+        row_visibility = """
+            // Row r sits at global position token_count - QRows + r; token
+            // t is invisible to rows r < t - (token_count - QRows) and to
+            // rows the caller's mask hides. Skip the unpack if none sees t.
+            int first_row = t - (int)token_count + QRows;
+            bool vis[QRows];
+            bool any_vis = false;
+            for (int r = 0; r < QRows; r++) {
+                vis[r] = r >= first_row;
+                if constexpr (HasMask)
+                    vis[r] = vis[r] && mask[
+                        ((MaskB == 1 ? 0 : (int)batch_idx) * MaskT
+                         + (MaskT == 1 ? 0 : r)) * (int)token_count + t];
+                any_vis = any_vis || vis[r];
+            }
+            if (!any_vis)
+                continue;
+"""
+        first_row_block = "\n"
+        row_visible = "vis[r]"
+        name = f"omlx_tq_mse_multirow_padded_2pass1_k{key_bits}_v{val_bits}_d{dim}"
+        extra_inputs = ["pads", "mask"]
+    else:
+        pad_setup = ""
+        max_init = "-INFINITY"
+        t_start = "block_idx"
+        row_visibility = ""
+        first_row_block = """
+            // Row r sits at global position token_count - QRows + r; token
+            // t is invisible to rows r < t - (token_count - QRows).
+            int first_row = t - (int)token_count + QRows;
+"""
+        row_visible = "r >= first_row"
+        name = f"omlx_tq_mse_multirow_2pass1_k{key_bits}_v{val_bits}_d{dim}"
+        extra_inputs = []
+
     source = f"""
         constexpr int BD = 32;
         constexpr int qk_per_thread = Dim / BD;
@@ -99,7 +159,7 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
         auto k_nm = key_norms + bh * token_count;
         auto k_pk = key_packed + bh * token_count * KPackedWidth;
         auto v_nm = val_norms + bh * token_count;
-        auto v_pk = val_packed + bh * token_count * VPackedWidth;
+        auto v_pk = val_packed + bh * token_count * VPackedWidth;{pad_setup}
 
         // All QRows pre-rotated queries for this (kv_head, repeat) pair
         thread U q[QRows][qk_per_thread];
@@ -114,7 +174,7 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
         U max_score[QRows];
         U sum_exp_score[QRows];
         for (int r = 0; r < QRows; r++) {{
-            max_score[r] = -INFINITY;
+            max_score[r] = {max_init};
             sum_exp_score[r] = 0;
         }}
 
@@ -127,7 +187,7 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
         {"int v_bit_off = v_bit_start & 7;" if v_misaligned else ""}
 
         // KV loop: unpack each token once, score all QRows rows against it
-        for (int t = block_idx; t < (int)token_count; t += Blocks) {{
+        for (int t = {t_start}; t < (int)token_count; t += Blocks) {{{row_visibility}
             U kn = static_cast<U>(k_nm[t]);
             auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth)
                 + k_byte_base;
@@ -139,16 +199,12 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
             U vn = static_cast<U>(v_nm[t]);
             U v_el[v_per_thread];
             {v_lines}
-
-            // Row r sits at global position token_count - QRows + r; token
-            // t is invisible to rows r < t - (token_count - QRows).
-            int first_row = t - (int)token_count + QRows;
-            for (int r = 0; r < QRows; r++) {{
+{first_row_block}            for (int r = 0; r < QRows; r++) {{
                 U dot = 0;
                 for (int i = 0; i < qk_per_thread; i++)
                     dot += q[r][i] * k_el[i];
                 U score = simd_sum(dot) * kn;
-                if (r >= first_row) {{
+                if ({row_visible}) {{
                     U new_max = max(max_score[r], score);
                     U factor = fast::exp(max_score[r] - new_max);
                     U exp_score = fast::exp(score - new_max);
@@ -174,7 +230,7 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
     """
 
     return mx.fast.metal_kernel(
-        name=f"omlx_tq_mse_multirow_2pass1_k{key_bits}_v{val_bits}_d{dim}",
+        name=name,
         input_names=[
             "queries",
             "key_norms",
@@ -183,6 +239,7 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
             "val_norms",
             "val_packed",
             "val_codebook",
+            *extra_inputs,
         ],
         output_names=["out_acc", "out_sums", "out_maxs"],
         source=source,
@@ -190,9 +247,13 @@ def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
 
 
 def _fused_multirow_mse_attention(
-    real_cache, queries, keys_state, values_state, scale, total
+    real_cache, queries, keys_state, values_state, scale, total, pads=None, mask=None
 ):
     """Run MTP verify attention through the fused multi-row kernel.
+
+    ``pads`` (int32, one entry per batch row) and ``mask`` (bool,
+    (1|B, 1, 1|L, total)) select the left-padded kernel variant; with both
+    None the unpadded kernel runs exactly as before.
 
     Returns None when the states/codecs are outside the kernel envelope
     (non-MSE codecs, fractional bits, mismatched dims); the caller falls
@@ -225,8 +286,9 @@ def _fused_multirow_mse_attention(
     n_kv_heads = keys_state.norms.shape[1]
     n_repeats = n_q_heads // n_kv_heads
 
+    padded = pads is not None or mask is not None
     pass1 = _fused_mse_multirow_2pass1_kernel(
-        int(key_codec.bits), int(value_codec.bits), D
+        int(key_codec.bits), int(value_codec.bits), D, padded
     )
     pass2 = _tq._fused_mse_decode_2pass_2_kernel()
     if pass1 is None or pass2 is None:
@@ -246,25 +308,38 @@ def _fused_multirow_mse_attention(
     else:
         num_blocks = 512
 
+    inputs = [
+        q_rot_flat,
+        keys_state.norms,
+        keys_state.indices,
+        key_codec.codebook,
+        values_state.norms,
+        values_state.indices,
+        value_codec.codebook,
+    ]
+    template = [
+        ("Dim", D),
+        ("RepeatCount", n_repeats),
+        ("QRows", L),
+        ("Blocks", num_blocks),
+        ("KPackedWidth", keys_state.indices.shape[-1]),
+        ("VPackedWidth", values_state.indices.shape[-1]),
+    ]
+    if padded:
+        if pads is None:
+            pads = mx.zeros((B,), dtype=mx.int32)
+        has_mask = mask is not None
+        inputs += [pads, mask if has_mask else mx.array([True])]
+        template += [
+            ("HasMask", has_mask),
+            ("MaskB", mask.shape[0] if has_mask else 1),
+            ("MaskT", mask.shape[2] if has_mask else 1),
+        ]
+
     n_rows = B * n_q_heads * L
     out_acc, out_sums, out_maxs = pass1(
-        inputs=[
-            q_rot_flat,
-            keys_state.norms,
-            keys_state.indices,
-            key_codec.codebook,
-            values_state.norms,
-            values_state.indices,
-            value_codec.codebook,
-        ],
-        template=[
-            ("Dim", D),
-            ("RepeatCount", n_repeats),
-            ("QRows", L),
-            ("Blocks", num_blocks),
-            ("KPackedWidth", keys_state.indices.shape[-1]),
-            ("VPackedWidth", values_state.indices.shape[-1]),
-        ],
+        inputs=inputs,
+        template=template,
         grid=(n_kv_heads * 32, B * n_repeats, num_blocks),
         threadgroup=(32, n_repeats, 1),
         output_shapes=[
@@ -288,7 +363,9 @@ def _fused_multirow_mse_attention(
     return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
 
 
-def _decode_multirow_quantized_attention(real_cache, queries, keys, values, scale):
+def _decode_multirow_quantized_attention(
+    real_cache, queries, keys, values, scale, mask="causal"
+):
     """Wider verify rows: one-shot quantized_attention over the whole KV.
 
     A single query block and a single key chunk turn quantized_attention's
@@ -308,7 +385,7 @@ def _decode_multirow_quantized_attention(real_cache, queries, keys, values, scal
             keys_state=keys,
             values_state=values,
             scale=scale,
-            mask="causal",
+            mask=mask,
         )
     finally:
         if old_query_block_size is not None:
@@ -317,7 +394,23 @@ def _decode_multirow_quantized_attention(real_cache, queries, keys, values, scal
             real_cache.prefill_key_chunk_size = old_key_chunk_size
 
 
-def _decode_multirow_attention(real_cache, queries, keys, values, scale):
+def _padded_causal_visibility(pads, mask, total, q_len):
+    """Bool (1|B, 1, q_len, total): row i of batch b sees key t iff
+    pads[b] <= t <= total - q_len + i, and ``mask`` (if any) allows it."""
+    cols = mx.arange(total)
+    visible = (cols[None, :] <= mx.arange(total - q_len, total)[:, None])[
+        None, None
+    ]
+    if pads is not None:
+        visible = visible & (cols[None, None, None, :] >= pads[:, None, None, None])
+    if mask is not None:
+        visible = visible & mask
+    return visible
+
+
+def _decode_multirow_attention(
+    real_cache, queries, keys, values, scale, pads=None, mask=None
+):
     """Causal multi-row attention over TurboQuant states in one lazy pass.
 
     MTP verify would otherwise fall into the prefill fallbacks, which
@@ -329,6 +422,11 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
     parameter), with the causal tail mask applied on the raw scores before
     the value weighted sum. Returns None when the states don't fit; the
     caller falls back to the generic paths.
+
+    ``pads`` (int32 per batch row) and ``mask`` (bool, (1|B, 1, 1|L,
+    total)) add left-padded batch visibility on top of the causal tail;
+    each path honors them (padded fused kernel, masked fold, masked
+    one-shot). With both None the behavior is the plain causal one.
     """
     from mlx_vlm.turboquant import TurboQuantSplitState
 
@@ -346,10 +444,18 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
     total = _state_length(keys_state)
     if total < L:
         return None
+    padded = pads is not None or mask is not None
     if L <= _FUSED_MULTIROW_MAX_Q_ROWS and total > _FUSED_MULTIROW_MIN_TOKENS:
         try:
             result = _fused_multirow_mse_attention(
-                real_cache, queries, keys_state, values_state, scale, total
+                real_cache,
+                queries,
+                keys_state,
+                values_state,
+                scale,
+                total,
+                pads=pads,
+                mask=mask,
             )
         except Exception:
             logger.debug(
@@ -359,9 +465,15 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
             result = None
         if result is not None:
             return result
+    visible = _padded_causal_visibility(pads, mask, total, L) if padded else None
     if n_repeats * L > _MAX_FOLDED_REPEATS:
         return _decode_multirow_quantized_attention(
-            real_cache, queries, keys, values, scale
+            real_cache,
+            queries,
+            keys,
+            values,
+            scale,
+            mask="causal" if visible is None else visible,
         )
 
     folded = (queries * scale).reshape(B, n_kv_heads, n_repeats * L, 1, D)
@@ -369,10 +481,14 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
     scores = real_cache.key_codec.score_prepared(prepared, keys_state)
 
     # (B, H, R*L, 1, T): fold index r*L + i is the row at global position
-    # total - L + i; mask the keys after it.
+    # total - L + i; mask the keys after it (and, for left-padded batches,
+    # the row's padding columns).
     scores = scores.reshape(B, n_kv_heads, n_repeats, L, total)
-    q_pos = mx.arange(total - L, total)
-    causal = mx.arange(total)[None, :] <= q_pos[:, None]
+    if visible is None:
+        q_pos = mx.arange(total - L, total)
+        causal = mx.arange(total)[None, :] <= q_pos[:, None]
+    else:
+        causal = visible[:, :, None]
     scores = mx.where(causal, scores, mx.finfo(scores.dtype).min)
     scores = scores.reshape(B, n_kv_heads, n_repeats * L, 1, total)
 
@@ -443,6 +559,92 @@ def _patch_update_eval_policy() -> None:
     cls._omlx_multirow_eval_patched = True
 
 
+@lru_cache(maxsize=128)
+def _pads_array(pads: tuple) -> mx.array:
+    return mx.array(pads, dtype=mx.int32)
+
+
+def _qwen35_row_pads(q35_lang, cache, real_cache, batch_size):
+    """Per-row left padding, read the way mlx-vlm's helper reads it.
+
+    ``left_padded_decode`` forwards stash the host-side pads on each
+    full-attention cache; other forwards derive them from ``left_padding``.
+    Returns None when the metadata does not describe this batch.
+    """
+    pads = getattr(cache, "_qwen3_5_decode_left_padding", None)
+    if pads is None:
+        info_fn = getattr(q35_lang, "_qwen3_5_left_padding_info", None)
+        for source in (cache, real_cache):
+            info = info_fn(source) if info_fn is not None else None
+            if info is not None:
+                pads = info[0]
+                break
+    if pads is None:
+        return (0,) * batch_size
+    pads = tuple(int(p) for p in pads)
+    return pads if len(pads) == batch_size else None
+
+
+def _bool_visibility_mask(mask, batch_size, q_len, total):
+    """Normalize the caller's mask to (1|B, 1, 1|L, total) bool.
+
+    Returns (ok, mask): mask is None for "no extra mask" (None / "causal");
+    ok is False for masks the quantized paths do not take (additive, per
+    head, other widths) — the caller then uses the dequantize fallback.
+    """
+    if mask is None or (isinstance(mask, str) and mask == "causal"):
+        return True, None
+    if not isinstance(mask, mx.array) or mask.dtype != mx.bool_:
+        return False, None
+    if not 2 <= mask.ndim <= 4:
+        return False, None
+    mask = mask.reshape((1,) * (4 - mask.ndim) + tuple(mask.shape))
+    mask_b, mask_h, mask_t, mask_s = mask.shape
+    if (
+        mask_b not in (1, batch_size)
+        or mask_h != 1
+        or mask_t not in (1, q_len)
+        or mask_s != total
+    ):
+        return False, None
+    return True, mask
+
+
+def _left_padded_quantized_attention(
+    real_cache, queries, keys, values, scale, pads, mask
+):
+    """Left-padded batch attention straight from the TurboQuant states.
+
+    Replaces the dequantize-everything fallback for B>1 decode (L=1,
+    ``left_padded_decode``) and MTP verify (L>1, array mask): those
+    materialized the whole batch cache as float32 in every TurboQuant
+    layer on every step, and the growing sizes defeated MLX's buffer
+    reuse. Returns None when the call is outside what the quantized paths
+    take; the caller keeps the dequantize fallback for those.
+    """
+    from ..turboquant_kv import _state_length
+
+    B, _, L, _ = queries.shape
+    if pads is None or L > _DECODE_MULTIROW_MAX_Q_LEN:
+        return None
+    total = _state_length(real_cache._unwrap(keys))
+    if any(p < 0 or p > total - L for p in pads):
+        return None
+    ok, bool_mask = _bool_visibility_mask(mask, B, L, total)
+    if not ok:
+        return None
+    pads_arr = _pads_array(pads) if any(pads) else None
+    return _decode_multirow_attention(
+        real_cache,
+        queries,
+        keys,
+        values,
+        scale,
+        pads=pads_arr,
+        mask=bool_mask,
+    )
+
+
 def _patch_vlm_target_verify_attention() -> None:
     """Make mlx-vlm's qwen3_5 MTP verify attention TurboQuant-safe.
 
@@ -453,6 +655,14 @@ def _patch_vlm_target_verify_attention() -> None:
     through one causal SDPA call instead — the TurboQuant-patched dispatcher
     handles decode-shaped multi-row natively with identical semantics (row i
     attends the first ``prefix + i + 1`` positions).
+
+    Left-padded batches (B>1 decode with ``mask=None`` from
+    ``left_padded_decode``, and B>1 verify with an array mask) run on the
+    quantized states with each row's padding and causal tail applied
+    (``_left_padded_quantized_attention``). The first version of this patch
+    (a915729b) dequantized the whole batch cache per layer per step there,
+    and for ``left_padded_decode`` it also let short rows attend to their
+    padding columns (mask=None carried no padding).
     """
     try:
         from mlx_vlm.models.qwen3_5 import language as q35_lang
@@ -482,13 +692,32 @@ def _patch_vlm_target_verify_attention() -> None:
             return sdpa(
                 queries, keys, values, cache=cache, scale=scale, mask="causal"
             )
-        # Left-padded batches / explicit array masks: dequantize once and
-        # replicate the caller's per-row causal slicing on dense arrays.
+        pads = _qwen35_row_pads(q35_lang, cache, real_cache, queries.shape[0])
+        try:
+            result = _left_padded_quantized_attention(
+                real_cache, queries, keys, values, scale, pads, mask
+            )
+        except Exception:
+            logger.debug(
+                "TurboQuant left-padded attention failed; using dequantize",
+                exc_info=True,
+            )
+            result = None
+        if result is not None:
+            return result
+        # Outside the quantized envelope: dequantize once and replicate the
+        # caller's per-row causal slicing on dense arrays.
         dk, dv = real_cache.dequantize(keys_state=keys, values_state=values)
         dk = dk.astype(queries.dtype)
         dv = dv.astype(queries.dtype)
         L = queries.shape[2]
         prefix_len = dk.shape[-2] - L
+        if not isinstance(mask, mx.array) and pads is not None and any(pads):
+            # left_padded_decode passes mask=None; the padding lives only in
+            # the cache metadata, so rebuild it or short rows see padding.
+            mask = _padded_causal_visibility(
+                _pads_array(pads), None, dk.shape[-2], L
+            )
         return mx.concatenate(
             [
                 sdpa(
@@ -509,6 +738,7 @@ def _patch_vlm_target_verify_attention() -> None:
         )
 
     q35_lang._qwen3_5_left_padded_attention = patched
+    q35_lang._omlx_tq_target_verify_attention = patched
     q35_lang._omlx_tq_target_verify_original = original
     q35_lang._omlx_tq_target_verify_patched = True
 
