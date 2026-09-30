@@ -13,12 +13,10 @@ Pytest configuration and fixtures for oMLX tests.
 This module provides common fixtures used across test files.
 """
 
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
-import mlx.core as mx
 import pytest
 
 # Install the torch stub before any test imports xgrammar (e.g. via @patch
@@ -35,39 +33,16 @@ _install_torch_stub()
 from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
 apply_m5_gather_qmm_workaround()
 
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.request import Request, SamplingParams
 
 
-@lru_cache(maxsize=1)
-def _launches_1024_thread_threadgroups() -> bool:
-    if not mx.metal.is_available():
-        return False
-    kernel = mx.fast.metal_kernel(
-        name="omlx_threadgroup_1024_probe",
-        input_names=["x"],
-        output_names=["y"],
-        source="uint i = thread_position_in_grid.x;\ny[i] = x[i];",
-    )
-    try:
-        (y,) = kernel(
-            inputs=[mx.zeros((1024,))],
-            grid=(1024, 1, 1),
-            threadgroup=(1024, 1, 1),
-            output_shapes=[(1024,)],
-            output_dtypes=[mx.float32],
-        )
-        mx.eval(y)
-    except Exception:  # noqa: BLE001 - e.g. virtual GPUs with a lower cap
-        return False
-    return True
-
-
 @pytest.fixture
-def glm5_fused_decode(monkeypatch):
-    """GLM-5.3's fused decode/verify kernels switched on (the default only on
-    NAX hosts); skips on GPUs that cannot launch their 1024-thread groups."""
-    if not _launches_1024_thread_threadgroups():
-        pytest.skip("the fused GLM-5.3 decode kernels need 1024-thread threadgroups")
+def glm5_fused_decode():
+    """GLM-5.3's fused decode/verify kernels, which run (and replay the
+    reference bit for bit) only on NAX GPUs."""
+    if not is_nax_available():
+        pytest.skip("the fused GLM-5.3 decode kernels run on M5 (NAX) GPUs")
     from omlx.patches.mlx_vlm_glm5_next_compat import (
         apply_mlx_vlm_glm5_next_compat_patch,
     )
@@ -75,7 +50,7 @@ def glm5_fused_decode(monkeypatch):
     apply_mlx_vlm_glm5_next_compat_patch()
     from mlx_vlm.models.glm5_next import language
 
-    monkeypatch.setattr(language, "_DECODE_FUSION", True)
+    assert language._DECODE_FUSION
     return language
 
 

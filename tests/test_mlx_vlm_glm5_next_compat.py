@@ -3175,8 +3175,7 @@ def _run_with_tf32(snippet: str) -> str:
         "import sys; sys.path[:0] = [%r, %r]\n"
         "from omlx.patches import mlx_vlm_glm5_next_compat as compat\n"
         "compat.apply_mlx_vlm_glm5_next_compat_patch()\n"
-        "import test_mlx_vlm_glm5_next_compat as t\n"
-        "t._language()._DECODE_FUSION = True\n" % (str(here), str(here.parent))
+        "import test_mlx_vlm_glm5_next_compat as t\n" % (str(here), str(here.parent))
     ) + snippet
     env = dict(os.environ, MLX_ENABLE_TF32="1")
     done = subprocess.run(

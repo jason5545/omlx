@@ -1,0 +1,28 @@
+{
+  "scripts": [
+    {
+      "name": "test",
+      "command": "pytest",
+      "mode": "command",
+      "category": "test"
+    },
+    {
+      "name": "lint",
+      "command": "ruff check .",
+      "mode": "command",
+      "category": "lint"
+    },
+    {
+      "name": "format",
+      "command": "black .",
+      "mode": "command",
+      "category": "format"
+    },
+    {
+      "name": "typecheck",
+      "command": "mypy .",
+      "mode": "command",
+      "category": "typecheck"
+    }
+  ]
+}

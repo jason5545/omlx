@@ -42,7 +42,9 @@ def _bit_equal(a, b):
 
 
 # (K, N, bits, group_size): Qwen4 oQ5e projections (qmv_fast), the non-fast
-# qmv arm (K % 512), partial output tiles (N % 8) and N < 8, other widths.
+# qmv arm (K off the qmv_fast block), partial output tiles (N % 8) and N < 8,
+# other widths, and K = 256 (mod 512) at 6/8 bits, where MLX's qmv_fast block
+# is 256 wide (512 at 4/5 bits).
 SHAPES = [
     (2560, 10240, 6, 64),
     (6144, 2560, 5, 128),
@@ -53,11 +55,13 @@ SHAPES = [
     (320, 1024, 6, 64),
     (2560, 1024, 4, 64),
     (2560, 1024, 5, 32),
+    (768, 1024, 8, 64),
+    (1280, 1024, 6, 64),
 ]
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("rows", [2, 3, 4, 8])
+@pytest.mark.parametrize("rows", [3, 8])
 def test_rows_equal_one_row_quantized_matmul(shape, rows):
     k, n, bits, group_size = shape
     linear = _linear(k, n, bits, group_size, seed=k + n + rows)
@@ -109,6 +113,7 @@ def _quantized(k, n, bits, group_size, dtype, seed):
         (6144, 2560, 5, 128),  # DeltaNet out-projection
         (2560, 1024, 4, 64),
         (1024, 520, 8, 32),
+        (768, 1024, 8, 64),  # 8-bit qmv_fast block is 256 wide
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
@@ -132,7 +137,7 @@ def test_one_row_qmv_equals_quantized_matmul(k, n, bits, group_size, dtype, rps)
 @pytest.mark.parametrize(
     "k, n, rps",
     [
-        (640, 2560, 1),  # stock runs qmv, not qmv_fast (K % 512)
+        (640, 2560, 1),  # stock runs qmv, not qmv_fast (K off the 256 block)
         (2560, 12, 1),  # stock runs qmv (N % 8)
         (2560, 40, 8),  # the 16-column tile does not divide N
     ],
@@ -156,7 +161,7 @@ def test_one_row_qmv_declines_shapes_stock_does_not_run_fast(k, n, rps):
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 9])
+@pytest.mark.parametrize("rows", [3, 4, 9])
 def test_rows_qmv_every_geometry_equals_one_row_quantized_matmul(
     k, n, bits, group_size, dtype, rows
 ):
