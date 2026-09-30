@@ -644,7 +644,7 @@ private struct ActiveDownloadsSection: View {
                                 Spacer(minLength: 4)
                                 if let speed = task.speedText {
                                     Text(speed)
-                                        .font(.omlxMono(DesignTokens.FontSize.aux))
+                                        .font(.omlxMono(11))
                                         .foregroundStyle(theme.blueDot)
                                 }
                                 Text(String(localized: "downloads.progress.bytes",
