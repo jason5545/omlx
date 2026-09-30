@@ -377,17 +377,30 @@ def test_high_accept_workload_never_parks():
 def test_losing_speculation_builds_exit_streak():
     # story/4k analog: best speculative score sits between 1.0x and
     # EXIT_MARGIN of the taxed baseline — locally "fine", globally losing
-    # to the pipelined standard step. The streak must build toward exit.
+    # to the pipelined standard step. The streak must build toward exit
+    # once calibration has converged the estimates (the real loop checks
+    # should_exit after every cycle, so track the first crossing; scores
+    # this close to the bar can still reset the streak afterwards).
     c = _DepthController(3)
-    picks = _simulate_with_zero(
-        c,
-        60,
-        p_by_depth=[0.6, 0.5, 0.4],
-        ms_by_depth={0: 12.0, 1: 20.0, 2: 21.5, 3: 23.0},
-    )
-    assert c.should_exit()
-    assert c.exit_streak >= c.EXIT_STREAK
-    del picks
+    rng = random.Random(0)
+    p_by_depth = [0.6, 0.5, 0.4]
+    ms = {0: 12.0, 1: 20.0, 2: 21.5, 3: 23.0}
+    exit_at = None
+    for i in range(60):
+        depth = c.cur
+        accepted = 0
+        for j in range(depth):
+            if rng.random() < p_by_depth[j]:
+                accepted += 1
+            else:
+                break
+        c.observe(depth, accepted, ms[depth])
+        if exit_at is None and c.should_exit():
+            exit_at = i
+    assert exit_at is not None
+    # The gate only judges converged estimates: warmup + calibration +
+    # EXIT_STREAK is the earliest legitimate park.
+    assert exit_at >= 6 + c.CAL_LEN + c.EXIT_STREAK - 1
 
 
 def test_winning_speculation_never_exits():
@@ -484,3 +497,84 @@ def test_seed_revalidation_waits_for_a_valid_timing_sample():
     assert c.t[2] == 15.0
     assert c.t_age[2] == 0.0
     assert c.cur == 1
+
+
+# ---------------------------------------------------------------------------
+# Post-warmup calibration (2026-09-30 long-context park/probe oscillation).
+# ---------------------------------------------------------------------------
+
+# Measured on OrcaSAQ-2-Cyber-27B (qwen3_5 hybrid) at 54-64k context: the
+# in-loop plain step runs ~70 ms while one extra verify row costs ~40 ms
+# more (t[1]/t[0] ~ 1.5), and steady content accepts at 72-88% per position.
+_LONG_CTX_MS = {0: 70.0, 1: 110.0, 2: 120.0, 3: 128.0, 4: 135.0}
+_LONG_CTX_P = [0.80, 0.72, 0.60, 0.50]
+
+
+def _dipped_parked_seed(max_depth, ms_by_depth):
+    """The seed a re-entry probe actually inherits: a controller parked
+    mid-losing-streak, so its acceptance EMA is latched at the dip."""
+    seed = _DepthController(max_depth)
+    seed._warmup = []
+    seed.p = [0.15, 0.10] + [0.10] * (max_depth - 3) + [None]
+    seed.t = dict(ms_by_depth)
+    return seed
+
+
+def test_probe_with_dipped_seed_recovers_at_long_context():
+    # Pre-fix reproduction of the server.log pattern: a probe seeded from a
+    # dip locked depth 0 and re-parked in 23 cycles (d0=18) although the
+    # steady-state economics clearly favor speculation. The exit gate must
+    # stay disarmed until the acceptance EMA has actually converged.
+    probe = _DepthController(4, seed=_dipped_parked_seed(4, _LONG_CTX_MS))
+    picks = _simulate_with_zero(probe, 80, _LONG_CTX_P, _LONG_CTX_MS, seed=7)
+    assert not probe.should_exit()
+    d0_first30 = sum(1 for d in picks[:30] if d == 0)
+    # Only the warmup baseline samples run at depth 0; no lock-in.
+    assert d0_first30 <= 4
+    assert sum(1 for d in picks[31:] if d >= 1) / len(picks[31:]) > 0.9
+    assert probe._best() >= 1
+
+
+def test_genuine_regression_still_parks_after_calibration():
+    # gemma4-style reality (accept ~0.1, verify row 2.5x the plain step):
+    # calibration must not become "never park" — it only delays the verdict
+    # until the estimates are real, then the escape hatch fires.
+    c = _DepthController(4)
+    _simulate_with_zero(
+        c, 80, [0.10, 0.05, 0.05, 0.05],
+        {0: 60.0, 1: 150.0, 2: 160.0, 3: 170.0, 4: 180.0},
+    )
+    assert c.should_exit()
+
+
+def test_calibration_disarms_exit_gate_and_keeps_speculating():
+    # Mechanism: during the CAL_LEN window the controller holds a speculative
+    # depth even when the (unconverged) scores favor 0, and the exit streak
+    # stays frozen — depth-0 cycles would gather no acceptance evidence.
+    c = _DepthController(3)
+    warmup_len = 3 + 3  # sweep 3,2,1 plus the three baseline samples
+    _simulate_with_zero(
+        c, warmup_len, [0.55, 0.5, 0.45],
+        {0: 11.5, 1: 26.0, 2: 27.5, 3: 29.0},
+    )
+    assert c._calibrate_left == c.CAL_LEN
+    picks = _simulate_with_zero(
+        c, c.CAL_LEN, [0.55, 0.5, 0.45],
+        {0: 11.5, 1: 26.0, 2: 27.5, 3: 29.0},
+    )
+    assert all(d >= 1 for d in picks)
+    assert c.exit_streak == 0
+    assert c._calibrate_left == 0
+
+
+def test_calibration_delay_bounds_park_timing():
+    # The exit gate arms right after calibration: on a losing model the
+    # streak then needs exactly EXIT_STREAK cycles, so parking lands at
+    # warmup + CAL_LEN + EXIT_STREAK — bounded, not open-ended.
+    c = _DepthController(3)
+    ms = {0: 11.5, 1: 26.0, 2: 27.5, 3: 29.0}
+    p = [0.55, 0.5, 0.45]
+    _simulate_with_zero(c, 6 + c.CAL_LEN + c.EXIT_STREAK - 1, p, ms)
+    assert not c.should_exit()
+    _simulate_with_zero(c, 1, p, ms)
+    assert c.should_exit()

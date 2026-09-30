@@ -926,13 +926,20 @@ def _maybe_finish_mtp_reentry_probe(
     *,
     was_warmup: bool,
 ) -> bool:
-    """Clear the cooldown once the existing controller measures a win."""
+    """Clear the cooldown once the existing controller measures a win.
+
+    The win must come after the controller's calibration phase: before it,
+    exit_streak is pinned at 0 with the acceptance EMA still unconverged,
+    so an early "win" would carry no evidence (and a later failure would
+    deserve the doubled cooldown it resets).
+    """
     controller = state.controller
     if (
         not state.reentry_probe
         or controller is None
         or was_warmup
         or controller._warmup
+        or getattr(controller, "_calibrate_left", 0) > 0
         or controller.exit_streak != 0
     ):
         return False
@@ -2461,6 +2468,14 @@ class _DepthController:
       large share of cycles probing, so probing is duty-bounded to
       ~``PROBE_DUTY`` of cycles — a scale-free ratio, not a per-model tuning.
 
+    - Acceptance: a token-domain EMA per draft position. It only moves on
+      speculative cycles, so right after the cost sweep it is still
+      seed-shaped — and a seed inherited from a just-parked controller is
+      systematically dipped (parking happens mid-losing-streak). A
+      ``CAL_LEN``-cycle calibration phase follows the sweep: hold the best
+      speculative depth with the exit gate and probes disarmed, so the
+      gate's first verdict uses converged acceptance rather than the dip.
+
     Depth 0 — the escape hatch: speculation is only profitable while the
     multi-token verify forward is cheap relative to a plain decode step.
     On models with a large L=1 -> L=2 forward-cost jump (gemma4 head_dim
@@ -2518,6 +2533,20 @@ class _DepthController:
     # a hardcoded ratio.
     EXIT_MARGIN = 1.15
     EXIT_STREAK = 16
+    # Post-warmup calibration: the sweep measures each depth's cost once, but
+    # the acceptance EMA (ALPHA=0.08) has then seen at most max_depth
+    # speculative cycles — and a seeded controller may start from a dip,
+    # because a parked controller's p is latched mid-losing-streak by
+    # construction. From a dipped seed the score gap vs. depth 0 cannot close
+    # within EXIT_STREAK cycles, and parked-at-0 cycles provide no acceptance
+    # evidence, so the probe deadlocks at depth 0 and re-parks (observed on
+    # qwen3_5 27B at 70k+ context: every re-entry probe died at 23 cycles
+    # with d0=18 while steady-state accept was 72-92%). CAL_LEN cycles at the
+    # best speculative depth converge p before the exit gate arms: from any
+    # plausible seed, 0.92**CAL_LEN * (p_true - p_seed) keeps the residual
+    # under ~0.07. Speculation that truly loses (gemma4) still parks — on
+    # converged evidence, a bounded CAL_LEN cycles later.
+    CAL_LEN = 24
 
     def __init__(
         self,
@@ -2540,6 +2569,7 @@ class _DepthController:
         self.cycles = 0
         self.probe_left = 0
         self.exit_streak = 0
+        self._calibrate_left = 0  # post-warmup evidence-gathering cycles left
         self._ms_probe = 0.0  # wall-time since any probe burst
         self._ms_explore = 0.0  # wall-time since a staleness-exploration burst
         # Measure each depth once (max..1), then the depth-0 plain step
@@ -2609,8 +2639,24 @@ class _DepthController:
             if self._warmup:
                 self.cur = self._warmup[0]
                 return
-            self.cur = self._best()
+            # Costs are now measured but the acceptance EMA is not converged
+            # (see CAL_LEN): run the best speculative depth with the exit
+            # gate disarmed until the evidence catches up.
+            self.cur = self._best_speculative()
+            self._calibrate_left = self.CAL_LEN
             self._ms_probe = 0.0
+            return
+
+        # Calibration: hold a speculative depth so acceptance evidence keeps
+        # flowing (depth-0 cycles measure none). Probes stay suspended; the
+        # depth choice is re-scored each cycle as the EMAs converge.
+        if self._calibrate_left > 0:
+            self._calibrate_left -= 1
+            if self._calibrate_left == 0:
+                self._ms_probe = 0.0
+                self._ms_explore = 0.0
+            else:
+                self.cur = self._best_speculative()
             return
 
         # Finishing a probe burst.
@@ -2722,8 +2768,10 @@ class _DepthController:
     def _speculation_losing(self) -> bool:
         # True when the best speculative depth cannot beat the (taxed)
         # in-loop baseline by EXIT_MARGIN. Only meaningful once the warmup
-        # sweep has measured t[0].
-        if self._warmup or 0 not in self.t:
+        # sweep has measured t[0] and calibration has converged the
+        # acceptance EMA — judging earlier punishes a dipped seed, not the
+        # current content.
+        if self._warmup or self._calibrate_left > 0 or 0 not in self.t:
             return False
         base = self._score(0)
         if base <= 0.0:
@@ -2735,6 +2783,11 @@ class _DepthController:
         """Sustained losing speculation: hand the sequence back to the
         standard decoder."""
         return self.exit_streak >= self.EXIT_STREAK
+
+    def _best_speculative(self) -> int:
+        # argmax score over drafting depths; the calibration phase must not
+        # pick 0 (a plain step gathers no acceptance evidence).
+        return max(range(1, self.max_depth + 1), key=self._score)
 
     def _select_candidates(self) -> List[int]:
         # Depth 0 is only selectable once its cost has actually been

@@ -2714,6 +2714,41 @@ class TestReversiblePerformancePark:
         assert state.reentry_probe is True
         assert gb._omlx_mtp_park_state is park
 
+    def test_calibrating_reentry_probe_is_not_a_win_yet(self):
+        # exit_streak is pinned at 0 throughout calibration, so without the
+        # calibration check the probe would be declared successful on the
+        # first post-warmup cycle — before any acceptance evidence exists.
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        controller = batch_generator._DepthController(3)
+        controller._warmup = []
+        controller._calibrate_left = 5
+        controller.exit_streak = 0
+        state = batch_generator._MtpState(
+            uid=7,
+            controller=controller,
+            reentry_probe=True,
+        )
+        gb = self._fake_batch([7])
+        park = batch_generator._MtpParkState(uid=7, tokens_remaining=0)
+        gb._omlx_mtp_park_state = park
+
+        assert not batch_generator._maybe_finish_mtp_reentry_probe(
+            gb,
+            state,
+            was_warmup=False,
+        )
+        assert state.reentry_probe is True
+        assert gb._omlx_mtp_park_state is park
+
+        controller._calibrate_left = 0
+        assert batch_generator._maybe_finish_mtp_reentry_probe(
+            gb,
+            state,
+            was_warmup=False,
+        )
+        assert state.reentry_probe is False
+
     def test_tax_probe_discarded_when_batch_gains_rows(self):
         from omlx.patches.mlx_lm_mtp.batch_generator import (
             _STD_TAX_SKIP,
