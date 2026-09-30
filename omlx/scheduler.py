@@ -3973,7 +3973,7 @@ class Scheduler:
                 request.benchmark_prefill_chunks.append(int(n_to_process))
                 request.benchmark_requested_steps.append(int(prefill_step_size))
 
-            _pre_active, _, _pre_cpu = Scheduler._chunk_memory_sample()
+            _pre_active, _pre_total, _pre_cpu = Scheduler._chunk_memory_sample()
             # External prefill bypasses BatchGenerator, so it must establish
             # the per-engine stream context itself. Native lazy primitives
             # otherwise bind to the worker's unrelated default stream and can
@@ -4071,6 +4071,7 @@ class Scheduler:
                 kv_len=base_size + processed_tokens,
                 requested_step=prefill_step_size,
                 gathered_core=gathered_core,
+                pre_pool_bytes=_pre_total - _pre_active,
             )
             self._maybe_record_fixed_state_bytes(prompt_cache)
             # Enforcer-requested hard-pressure drain. The flag's normal
@@ -4301,6 +4302,11 @@ class Scheduler:
     # scales with query_len * kv_len, so per-token cost grows with context
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
+    # A chunk-start MLX pool above this share of the chunk's delta (and the
+    # floor) makes the measurement an upper bound: the delta is taken above
+    # live arrays, so the retained pool is charged to the chunk again.
+    _RETAINED_POOL_TOLERANCE: float = 0.1
+    _RETAINED_POOL_FLOOR_BYTES: int = 64 * 1024**2
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
@@ -5427,6 +5433,7 @@ class Scheduler:
         kv_len: int = 0,
         requested_step: int | None = None,
         gathered_core: bool = False,
+        pre_pool_bytes: int = 0,
     ) -> None:
         """Record footprint growth after a completed prefill chunk.
 
@@ -5434,9 +5441,20 @@ class Scheduler:
         without scaling it by token count. Other models retain token-linear
         observations. Negative deltas record released buffers; positive deltas
         repay reallocation charges. Partial speed-priority chunks do not
-        replace representative overhead or full-step measurements.
+        replace representative overhead or full-step measurements; they can
+        only lower the per-token rates (``PrefillTransientTracker.tighten``).
+
+        ``pre_pool_bytes`` is the MLX buffer pool at chunk start. The delta
+        is taken above live arrays, so a pool the previous chunk left behind
+        (``_should_clear_after_chunk`` keeps it under decode contention) is
+        charged to this chunk again. Such a sample is an upper bound and is
+        handled like a speed partial.
         """
         delta = post_bytes - pre_bytes
+        pool_retained = pre_pool_bytes > max(
+            Scheduler._RETAINED_POOL_FLOOR_BYTES,
+            int(max(delta, 0) * Scheduler._RETAINED_POOL_TOLERANCE),
+        )
         monitor = getattr(self, "memory_monitor", None)
         if (
             MemoryMonitor is not None
@@ -5444,7 +5462,7 @@ class Scheduler:
             and monitor.uses_flat_overhead_accounting()
         ):
             min_chunk = max(1, self._prefill_min_chunk_tokens)
-            representative = n_tokens >= min_chunk and not (
+            representative = n_tokens >= min_chunk and not pool_retained and not (
                 getattr(self, "_prefill_speed_priority", False)
                 and requested_step is not None
                 and n_tokens < requested_step
@@ -5511,19 +5529,28 @@ class Scheduler:
                 delta,
             )
             return
-        if (
+        speed_partial = (
             getattr(self, "_prefill_speed_priority", False)
             and requested_step is not None
             and n_tokens < requested_step
-        ):
+        )
+        if speed_partial or pool_retained:
+            lowered = self._prefill_transient_tracker.tighten(
+                n_tokens, delta, gathered_core=gathered_core
+            )
             logger.debug(
-                "[throttle:%s] measure rid=%s n=%d delta=%.2fMB "
-                "(skipped: speed partial < requested_step=%d)",
+                "[throttle:%s] measure rid=%s n=%d delta=%.2fMB pre_pool=%.2fMB "
+                "(upper bound only: %s, requested_step=%s; lowered=%s ewma=%.1fKB)",
                 loop_label,
                 request_id,
                 n_tokens,
                 delta / 1024**2,
+                pre_pool_bytes / 1024**2,
+                "speed partial" if speed_partial else "retained pool",
                 requested_step,
+                lowered,
+                self._prefill_transient_tracker.bytes_per_token_for(gathered_core)
+                / 1024,
             )
             return
         self._prefill_transient_tracker.update(
@@ -6041,7 +6068,7 @@ class Scheduler:
             state.request.benchmark_prefill_chunks.append(int(n))
             state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
-        _pre_active, _, _pre_cpu = Scheduler._chunk_memory_sample()
+        _pre_active, _pre_total, _pre_cpu = Scheduler._chunk_memory_sample()
         # Chunked prefill also bypasses BatchGenerator and must establish the
         # same per-engine stream context as the regular external prefill path.
         # The chunk views stay inside it for the same reason (single-stream
@@ -6109,6 +6136,7 @@ class Scheduler:
             kv_len=state.base_size + state.tokens_processed,
             requested_step=prefill_step_size,
             gathered_core=actual_gathered_core,
+            pre_pool_bytes=_pre_total - _pre_active,
         )
         self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n

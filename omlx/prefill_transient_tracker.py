@@ -166,6 +166,51 @@ class PrefillTransientTracker:
         history.last_delta_bytes = transient_bytes
         history.last_n_tokens = n_tokens
 
+    def tighten(
+        self,
+        n_tokens: int,
+        transient_bytes: int,
+        *,
+        gathered_core: bool = False,
+    ) -> bool:
+        """Lower the per-token rates from an upper-bound sample.
+
+        Some chunks cannot be charged at face value. A speed-priority partial
+        spreads the per-chunk fixed cost over fewer tokens, and a chunk that
+        started with buffers retained in the MLX pool is measured against live
+        arrays only, so the retained pool shows up as its own growth. Both
+        overstate a representative chunk's per-token cost and never understate
+        it, so such a sample may lower the EWMA and last-delta rates but never
+        raise them, and it does not count as a sample.
+
+        Without this path an inflated estimate could not come back down:
+        chunks the throttle shrank were skipped as partials, and admission
+        rejected every prompt that would have run a full chunk (2026-09-30,
+        OrcaSAQ-2-Cyber-27B: 256-token chunks under decode contention charged
+        the retained pool again on every chunk, climbing to 68 MB/token, and
+        a 14.9k-token prompt was priced at 174 GB for the rest of the process).
+
+        Returns True when either rate was lowered.
+        """
+        if n_tokens <= 0 or transient_bytes <= 0:
+            return False
+        history = self._history(gathered_core)
+        if history.samples == 0:
+            return False
+        per_token = transient_bytes / n_tokens
+        lowered = False
+        if per_token < history.ewma_per_token:
+            history.ewma_per_token = per_token
+            lowered = True
+        if (
+            history.last_n_tokens > 0
+            and per_token * history.last_n_tokens < history.last_delta_bytes
+        ):
+            # Keep the width so last_n_tokens still names a full step.
+            history.last_delta_bytes = int(per_token * history.last_n_tokens)
+            lowered = True
+        return lowered
+
     def observe_flat_overhead(
         self,
         n_tokens: int,

@@ -1143,6 +1143,114 @@ def test_record_chunk_transient_keeps_partial_context_sample():
     assert tracker.last_delta_bytes == partial_delta
 
 
+def _speed_record_ctx():
+    tracker = PrefillTransientTracker()
+    ns = SimpleNamespace(
+        _prefill_min_chunk_tokens=32,
+        _prefill_speed_priority=True,
+        _prefill_transient_tracker=tracker,
+        _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
+        memory_monitor=None,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    return ns, tracker
+
+
+_MB = 1024**2
+
+
+def test_contended_chunks_with_retained_pool_cannot_inflate_admission():
+    """Replay of the 2026-09-30 OrcaSAQ-2-Cyber-27B poisoning.
+
+    A clean 2048-token prompt measured ~3 MB/token. The next turn prefilled
+    alongside a small decode, so fairness capped chunks at 256 tokens and
+    ``_should_clear_after_chunk`` kept the pool. Each chunk's delta then
+    included every earlier chunk's pool (2.4 GB climbing to 17 GB), the rate
+    reached 68 MB/token, and a fresh 14.9k-token prompt was priced at 174 GB.
+    """
+    ns, tracker = _speed_record_ctx()
+    for delta_mb in (6599.42, 5726.94, 6056.70, 6088.30, 6031.70, 5991.68, 6344.10):
+        ns._record_chunk_transient(
+            2048, 0, int(delta_mb * _MB), request_id="r1", loop_label="unit",
+            requested_step=2048,
+        )
+    clean_rate = tracker.bytes_per_token
+
+    contended_mb = (
+        2405.93, 4801.64, 6269.53, 7558.70, 9154.61, 11752.73, 12172.16,
+        12674.47, 13397.25, 13893.82, 14115.96, 14813.61, 15064.05,
+        15921.03, 16792.14, 17053.38,
+    )
+    pool = 0
+    for delta_mb in contended_mb:
+        delta = int(delta_mb * _MB)
+        ns._record_chunk_transient(
+            256, 0, delta, request_id="r2", loop_label="unit",
+            requested_step=256, pre_pool_bytes=pool,
+        )
+        # The pool the next chunk starts with is what this one left behind.
+        pool = delta - 16 * _MB
+
+    # Only the first contended chunk started on a cleared pool.
+    assert tracker.samples == 8
+    assert tracker.last_n_tokens == 256
+    assert tracker.last_delta_bytes == int(2405.93 * _MB)
+    assert tracker.bytes_per_token < 2 * clean_rate
+    predicted = Scheduler._predicted_chunk_transient(ns, 2048, 15_000)
+    assert predicted < 30 * _GB  # was ~173 GB
+
+    # Chunks the throttle shrank below the full step tighten the rate back.
+    for n, delta_mb in ((1152, 6288.20), (896, 6056.88), (1152, 6529.60)):
+        ns._record_chunk_transient(
+            n, 0, int(delta_mb * _MB), request_id="r2", loop_label="unit",
+            requested_step=2048,
+        )
+    assert tracker.samples == 8
+    predicted = Scheduler._predicted_chunk_transient(ns, 2048, 15_000)
+    assert predicted == pytest.approx(
+        6288.20 * _MB / 1152 * 2048 * Scheduler._PREFILL_TRANSIENT_SAFETY,
+        rel=1e-6,
+    )
+    assert 22 * _GB + predicted < 115.9 * _GB
+
+
+def test_small_retained_pool_still_records_the_sample():
+    """Pool left by the one-time cache reserve stays within tolerance."""
+    ns, tracker = _speed_record_ctx()
+    ns._record_chunk_transient(
+        2048, 0, 6 * _GB, request_id="r", loop_label="unit",
+        requested_step=2048, pre_pool_bytes=128 * _MB,
+    )
+    assert tracker.samples == 1
+    assert tracker.last_delta_bytes == 6 * _GB
+
+
+def test_speed_partial_recovers_a_poisoned_estimate():
+    """A cheaper partial proves the full-step rate is too high."""
+    ns, tracker = _speed_record_ctx()
+    ns._record_chunk_transient(
+        2048, 0, 3 * _GB, request_id="r", loop_label="unit", requested_step=2048,
+    )
+    # Poisoned state: a small chunk measured a huge per-token rate.
+    ns._record_chunk_transient(
+        256, 0, int(17053.38 * _MB), request_id="r", loop_label="unit",
+        requested_step=256,
+    )
+    assert Scheduler._predicted_chunk_transient(ns, 2048, 15_000) > 100 * _GB
+
+    ns._record_chunk_transient(
+        686, 0, int(2761.75 * _MB), request_id="side", loop_label="unit",
+        requested_step=2048,
+    )
+    predicted = Scheduler._predicted_chunk_transient(ns, 2048, 15_000)
+    assert predicted == pytest.approx(
+        2761.75 * _MB / 686 * 2048 * Scheduler._PREFILL_TRANSIENT_SAFETY,
+        rel=1e-6,
+    )
+
+
 def test_chunk_backpressure_holds_mlx_at_the_peak_target(monkeypatch):
     """While a chunk runs, MLX memory is capped at the guard's peak target."""
     calls = []
@@ -1345,6 +1453,7 @@ def test_step_prefill_reclaims_before_first_guard(
         kv_len=0,
         requested_step=2,
         gathered_core=expected_gathered,
+        pre_pool_bytes=0,
     )
     assert state.qwen4_gathered_core is expected_state_route
 

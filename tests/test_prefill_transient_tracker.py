@@ -359,3 +359,44 @@ class TestPoolReleaseAccounting:
         )
         assert tracker.flat_overhead_charge_for(True) == 0
         assert tracker.flat_overhead_charge_for(False) == 3 * 1024**3
+
+
+class TestTighten:
+    def test_lower_sample_lowers_ewma_and_last_rate(self):
+        t = PrefillTransientTracker("m")
+        t.update(2048, 2048 * 60_000)  # 60 KB/token baseline
+        assert t.tighten(1024, 1024 * 5_000) is True
+        assert t.bytes_per_token == 5_000.0
+        # The full-step width is kept; only its rate drops.
+        assert t.last_n_tokens == 2048
+        assert t.last_delta_bytes == 2048 * 5_000
+        assert t.samples == 1, "an upper bound is not a sample"
+
+    def test_higher_sample_never_raises(self):
+        t = PrefillTransientTracker("m")
+        t.update(2048, 2048 * 3_000)
+        assert t.tighten(256, 256 * 68_000) is False
+        assert t.bytes_per_token == 3_000.0
+        assert t.last_delta_bytes == 2048 * 3_000
+
+    def test_noop_without_a_baseline(self):
+        t = PrefillTransientTracker("m")
+        assert t.tighten(256, 256 * 1_000) is False
+        assert t.samples == 0
+        assert t.bytes_per_token == 0.0
+
+    def test_ignores_empty_samples(self):
+        t = PrefillTransientTracker("m")
+        t.update(2048, 2048 * 3_000)
+        assert t.tighten(0, 100) is False
+        assert t.tighten(256, 0) is False
+        assert t.tighten(256, -5) is False
+        assert t.bytes_per_token == 3_000.0
+
+    def test_routes_are_tightened_separately(self):
+        t = PrefillTransientTracker("m")
+        t.update(2048, 2048 * 3_000)
+        t.update(2048, 2048 * 9_000, gathered_core=True)
+        assert t.tighten(1024, 1024 * 1_000, gathered_core=True) is True
+        assert t.bytes_per_token_for(True) == 1_000.0
+        assert t.bytes_per_token_for(False) == 3_000.0
