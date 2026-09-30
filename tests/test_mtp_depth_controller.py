@@ -535,6 +535,18 @@ def test_probe_with_dipped_seed_recovers_at_long_context():
     assert probe._best() >= 1
 
 
+def test_probe_with_dipped_seed_and_free_verify_row():
+    # The bandwidth-bound ideal (t[1] ~= t[0]): even from a dipped seed the
+    # probe must never lock at depth 0 — speculation wins at any p1 >= ~0.3.
+    ms = {0: 100.0, 1: 105.0, 2: 112.0, 3: 118.0, 4: 125.0}
+    p = [0.78, 0.72, 0.62, 0.52]
+    probe = _DepthController(4, seed=_dipped_parked_seed(4, ms))
+    picks = _simulate_with_zero(probe, 60, p, ms, seed=5)
+    assert not probe.should_exit()
+    assert sum(1 for d in picks[:30] if d == 0) <= 4
+    assert probe._best() >= 1
+
+
 def test_genuine_regression_still_parks_after_calibration():
     # gemma4-style reality (accept ~0.1, verify row 2.5x the plain step):
     # calibration must not become "never park" — it only delays the verdict
