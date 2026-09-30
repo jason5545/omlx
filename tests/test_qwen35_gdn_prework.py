@@ -1131,11 +1131,14 @@ def test_fp16_sigmoid_matches_mx_sigmoid_over_all_finite_values():
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_bf16_prework_matches_pre_fp16_change_reference():
-    # Raw uint16 arrays captured before the fp16 change by
+    # Raw uint16 arrays originally captured before the fp16 change by
     # /tmp/omlx-gdn-prework-step0/verify_step0.py (seed 20260923).
+    # q/k re-recorded 2026-09-30 after upstream moved the RMS eps onto
+    # sum(x^2) (mlx-lm ``normalize_qk`` parity): one intended rounding step
+    # on the two normalized outputs; v and conv_state stay bit-identical.
     expected_hashes = {
-        "q": "051823627b9a50ca580ae84cbb5da49b89828c39effc80428d8de73655667569",
-        "k": "c0640182a8b00cec6c45884e4f030e04439ef5e769a5ff1e174e61465167cd11",
+        "q": "d3933395169b0bb0bc7942d215ae3547f8fdd5d26d5c6d01d11134092f0c4dd8",
+        "k": "a48d5d69bb336149a97660855c19370843728e9d37231bebe258f87edcd28ac3",
         "v": "f1d5a142d7128eeb0fa83a4fbf4727e2055290e62d94b44187454c7c8f61a237",
         "conv_state": "2adedd345751f0eef499bf070dcbe779ca2e0eaaeb759311b13dc7b41abb50e4",
     }
