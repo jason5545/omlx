@@ -5,7 +5,10 @@ When TurboQuantKVCache is detected, routes attention to:
   - Decode (L=1): cache.decode_attention() — Metal kernel, no dequant
   - Decode-shaped multi-row (1 < L <= 15, causal; MTP verify): a fused
     2-pass kernel that unpacks each KV token once per chunk of two rows and
-    scores the chunk against it (MSE codecs, issue #2215); outside its
+    scores the chunk against it (MSE codecs, issue #2215); on GPUs with
+    matrix units (M5 and later) a pass 1 that scores every row at once with
+    MetalPerformancePrimitives matmul2d replaces it for 4-bit, D=256 states
+    up to 48 rows; outside its
     envelope the L rows are folded into the GQA repeat dimension so the
     codecs' decode kernels apply, with the causal tail mask injected between
     key scoring and the value weighted sum — one lazy pass over the KV, no
@@ -19,6 +22,7 @@ applied (``_patch_vlm_target_verify_attention``).
 """
 
 import logging
+import re
 from functools import cache, lru_cache
 from typing import Optional
 
@@ -57,6 +61,23 @@ _FUSED_MULTIROW_ROWS_PER_SIMDGROUP = 2
 # layer at 131k tokens, L=2: 2.33 ms at 1 token, 1.91 at 2, 1.84 at 3, 2.02
 # at 4 (registers); 32k: 0.77 -> 0.66 ms at 3.
 _FUSED_MULTIROW_TOKENS_PER_ITER = 3
+# Matrix-unit pass 1 (_nax_multirow_pass1_kernel). Measured on M5 Max: 8x8
+# simdgroup_matrix peaks at ~14 TFLOPS, matmul2d on the matrix units at ~60
+# (16x32x32 half/bf16 operands; any float operand drops it to ~15). The
+# switch exists so tests can exercise the portable kernel on such GPUs.
+_NAX_MULTIROW_ENABLED = True
+# Tokens a threadgroup scores per step: one 32-token tile per simdgroup and
+# row fragment. The step's score rows live in threadgroup memory, so with
+# three 16-row fragments (48 rows: 6 repeats x L <= 8) the kernel sits near
+# the 32 KB limit; wider calls keep the portable kernel.
+_NAX_MULTIROW_CHUNK = 128
+_NAX_MULTIROW_MAX_ROW_FRAGS = 3
+# Split half operands into hi + lo halves (QK: q_hi.k_hi + q_lo.k_hi +
+# q_hi.k_lo; PV: p.v_hi + p.v_lo) so scores keep float precision. Plain half
+# drifts with peaked attention: queries x16 (logits ~50) put the output 1.2e-2
+# off a CPU float32 reference, the split 5e-5 (portable kernel 4e-5). Costs
+# 131k tokens, L=2: 0.35 -> 0.53 ms per layer (batched).
+_NAX_MULTIROW_SPLIT_HALF = True
 
 
 @cache
@@ -350,10 +371,444 @@ def _fused_mse_multirow_2pass1_kernel(
     )
 
 
+@cache
+def _nax_available() -> bool:
+    """Whether the GPU has the matrix units MetalPerformancePrimitives'
+    matmul2d runs on (Apple GPU family 17, M5, and later). MLX checks the
+    same thing internally (``is_nax_available``) but does not expose it."""
+    try:
+        if not mx.metal.is_available():
+            return False
+        device_info = getattr(mx, "device_info", None) or mx.metal.device_info
+        arch = str(device_info().get("architecture", ""))
+    except Exception:
+        return False
+    match = re.match(r"applegpu_g(\d+)", arch)
+    return bool(match) and int(match.group(1)) >= 17
+
+
+def _nax_multirow_blocks(total: int) -> int:
+    """Pass-1 block count for the matrix-unit kernel: a power of two giving
+    at most 2048 tokens per block, clamped to [32, 512] (few distinct
+    template values). Its blocks are contiguous token ranges with a per-
+    threadgroup setup, so it wants fewer, longer blocks than the portable
+    kernel's table; 16..128 blocks measured within noise at 4k, 32k and
+    131k tokens."""
+    needed = -(-max(total, 1) // 2048)
+    return min(512, max(32, 1 << (needed - 1).bit_length()))
+
+
+@cache
+def _nax_multirow_pass1_kernel(row_frags: int, padded: bool = False):
+    """Pass 1 of the fused multi-row MSE verify attention on matrix units.
+
+    Same outputs as ``_fused_mse_multirow_2pass1_kernel`` (per row, per
+    block: out_acc, out_sums, out_maxs), so mlx-vlm's pass 2 is reused. 4-bit
+    keys and values, D = 256. All RepeatCount * QRows rows of a kv head are
+    scored together, padded to ``row_frags`` 16-row fragments.
+
+    A threadgroup (4 * row_frags simdgroups) owns one contiguous token range
+    of one (batch row, kv head) and walks it _NAX_MULTIROW_CHUNK tokens at a
+    time in three phases:
+      1. scores: each simdgroup takes one 32-token tile for one fragment,
+         S = Q K^T as 16x32x32 matmul2d ops, the packed key codes unpacked
+         straight into the right-operand cooperative tensor; key norms,
+         causal tail and padding mask applied, rows written to threadgroup
+         memory.
+      2. online softmax per row over the step; P' = exp(S - max) * v_norm
+         written back in place, rescale factor per row.
+      3. each simdgroup owns two 16x32 output blocks: O = O * alpha + P' V,
+         value codes unpacked straight into the right operand.
+    A matmul2d cooperative-tensor lane holds rows fm and fm + 8 and four
+    consecutive columns 4 * fc + e of each 16-wide fragment (MLX's
+    BaseNAXFrag layout, checked against get_multidimensional_index). Logical
+    k index 32 * jp + 16 * g + 4 * fc + e maps to packed dim 64 * fc + 8 * jp
+    + 4 * g + e and output column 32 * J + 16 * f + 4 * fc + e to dim
+    64 * fc + 8 * J + 4 * f + e, so a lane reads one contiguous 32-byte run
+    (8 words) of each token's packed row.
+
+    ``padded`` builds the left-padded batch variant, as in the portable
+    kernel: each block starts at its row's ``pads`` entry and an optional
+    bool ``mask`` (HasMask; (MaskB, 1, MaskT, token_count)) hides columns.
+    Every variant starts the running max at a finite floor: blocks with no
+    visible token for a row are normal here (contiguous ranges, padding).
+    """
+    if not 1 <= row_frags <= _NAX_MULTIROW_MAX_ROW_FRAGS or not _nax_available():
+        return None
+    from mlx_vlm import turboquant as _tq
+
+    if not _tq._metal_available():
+        return None
+
+    frags = row_frags
+    rows = 16 * frags
+    simdgroups = 4 * frags
+    threads = 32 * simdgroups
+    chunk = _NAX_MULTIROW_CHUNK
+    split = _NAX_MULTIROW_SPLIT_HALF
+    # Phase-2 threads per score row (TPR * rows <= threads, within a simdgroup)
+    tpr = 1
+    while tpr * 2 * rows <= threads and tpr < 32:
+        tpr *= 2
+
+    nl = "\n                "
+    # Phase 1: unpack 32 key dims of the four token slots this lane holds
+    # (tokens fm, fm + 8, fm + 16, fm + 24 of the tile) into kb[16g + 4s + e].
+    k_unpack = []
+    for s in range(4):
+        k_unpack.append(f"{{ uint w = kw[{s}][jp >> 2][jp & 3];")
+        for g in range(2):
+            base = 16 * g + 4 * s
+            for tensor, lut in [("kb", "k_lut")] + ([("kb_lo", "k_lut_lo")] if split else []):
+                k_unpack.append(
+                    f"  {{ half2 a = {lut}[(w >> {16 * g}) & 0xFF]; half2 b = {lut}[(w >> {16 * g + 8}) & 0xFF];"
+                    f" {tensor}[{base}] = a.x; {tensor}[{base + 1}] = a.y; {tensor}[{base + 2}] = b.x; {tensor}[{base + 3}] = b.y; }}"
+                )
+        k_unpack.append("}")
+    # Queries (float) -> qa[8g + 4ii + e] (+ the half rounding residue)
+    q_load = []
+    for g in range(2):
+        for ii in range(2):
+            for e in range(4):
+                i = 8 * g + 4 * ii + e
+                if split:
+                    q_load.append(
+                        f"{{ float x = q{ii}[8 * jp + {4 * g + e}]; half h = half(x);"
+                        f" qa[{i}] = h; qa_lo[{i}] = half(x - float(h)); }}"
+                    )
+                else:
+                    q_load.append(f"qa[{i}] = half(q{ii}[8 * jp + {4 * g + e}]);")
+    qk_runs = ["qk_op.run(qa, kb, S);"]
+    if split:
+        qk_runs += ["qk_op.run(qa_lo, kb, S);", "qk_op.run(qa, kb_lo, S);"]
+
+    # Phase 3: each simdgroup's two output blocks are items 2 * sg and
+    # 2 * sg + 1 over (column block J, row fragment); with an even fragment
+    # count both share J, so the value codes are unpacked once. All value
+    # words of the step are loaded before any unpack.
+    groups = [[0, 1]] if frags % 2 == 0 else [[0], [1]]
+    pv_lines = []
+    for gi, items in enumerate(groups):
+        pv_lines.append(f"uint vw{gi}[4];")
+        pv_lines.append(
+            f"for (int q = 0; q < 4; q++) vw{gi}[q] = v_pk[tt[q] * v_pk_step + 8 * fc + col{items[0]}];"
+        )
+    for gi, items in enumerate(groups):
+        pv_lines.append("{")
+        for g in range(2):
+            for ii in range(2):
+                pv_lines.append(f"  {{ uint w = vw{gi}[{2 * g + ii}];")
+                for f in range(2):
+                    base = 16 * g + 8 * f + 4 * ii
+                    for tensor, lut in [("pb", "v_lut")] + ([("pb_lo", "v_lut_lo")] if split else []):
+                        pv_lines.append(
+                            f"    {{ half2 a = {lut}[(w >> {16 * f}) & 0xFF]; half2 b = {lut}[(w >> {16 * f + 8}) & 0xFF];"
+                            f" {tensor}[{base}] = a.x; {tensor}[{base + 1}] = a.y; {tensor}[{base + 2}] = b.x; {tensor}[{base + 3}] = b.y; }}"
+                        )
+                pv_lines.append("  }")
+        for k in items:
+            for g in range(2):
+                for ii in range(2):
+                    base = 8 * g + 4 * ii
+                    pv_lines.append(
+                        f"  {{ float4 p = *((threadgroup float4*)(scores + (frag{k} * 16 + fm + {8 * ii}) * SST"
+                        f" + kc * 32 + {16 * g} + 4 * fc));"
+                        f" pa[{base}] = half(p.x); pa[{base + 1}] = half(p.y); pa[{base + 2}] = half(p.z); pa[{base + 3}] = half(p.w); }}"
+                    )
+            pv_lines.append(f"  pv_op.run(pa, pb, o{k});")
+            if split:
+                pv_lines.append(f"  pv_op.run(pa, pb_lo, o{k});")
+        pv_lines.append("}")
+
+    out_lines = []
+    for k in range(2):
+        for f in range(2):
+            for ii in range(2):
+                base = 8 * f + 4 * ii
+                out_lines.append(
+                    f"{{ int m = frag{k} * 16 + fm + {8 * ii};"
+                    f" if (m < RC) *((device float4*)(out_acc + ((q_row0 + m) * Blocks + block) * D"
+                    f" + 64 * fc + 8 * col{k} + {4 * f})) = float4(o{k}[{base}], o{k}[{base + 1}],"
+                    f" o{k}[{base + 2}], o{k}[{base + 3}]); }}"
+                )
+
+    if padded:
+        # Left-padded batch row: never touch its padding columns
+        t_begin = "max(block * span, (int)pads[batch_idx])"
+        mask_check = """
+                    if constexpr (HasMask)
+                        visible = visible && mask[
+                            ((MaskB == 1 ? 0 : batch_idx) * MaskT
+                             + (MaskT == 1 ? 0 : m % QRows)) * T + t];"""
+        name_kind = "padded_"
+        extra_inputs = ["pads", "mask"]
+    else:
+        t_begin = "block * span"
+        mask_check = ""
+        name_kind = ""
+        extra_inputs = []
+    lo_luts = (
+        "threadgroup half2 k_lut_lo[256];\n        threadgroup half2 v_lut_lo[256];"
+        if split
+        else ""
+    )
+    lo_lut_fill = (
+        """
+            float k0 = key_codebook[i & 15], k1 = key_codebook[i >> 4];
+            float v0 = val_codebook[i & 15], v1 = val_codebook[i >> 4];
+            k_lut_lo[i] = half2(half(k0 - float(half(k0))), half(k1 - float(half(k1))));
+            v_lut_lo[i] = half2(half(v0 - float(half(v0))), half(v1 - float(half(v1))));"""
+        if split
+        else ""
+    )
+    lo_tensors_qk = (
+        "QA qa_lo = qk_op.template get_left_input_cooperative_tensor<half, half, float>();\n"
+        "                QB kb_lo = qk_op.template get_right_input_cooperative_tensor<half, half, float>();"
+        if split
+        else ""
+    )
+    lo_tensors_pv = (
+        "PB pb_lo = pv_op.template get_right_input_cooperative_tensor<half, half, float>();"
+        if split
+        else ""
+    )
+
+    source = f"""
+        constexpr int D = Dim;
+        constexpr int RC = RepeatCount * QRows;
+        constexpr int CH = {chunk};
+        constexpr int SST = CH + 4;
+        constexpr int TPR = {tpr};
+        static_assert(D == 256, "matrix-unit verify kernel: D == 256");
+        static_assert(RC <= {rows}, "rows exceed the kernel's row fragments");
+
+        threadgroup float scores[{rows} * SST];
+        threadgroup float v_norm_sh[CH];
+        threadgroup half2 k_lut[256];
+        threadgroup half2 v_lut[256];
+        {lo_luts}
+        threadgroup float alpha_sh[{rows}];
+
+        const int tid = thread_position_in_threadgroup.x;
+        const int sg = tid >> 5;
+        const int lane = tid & 31;
+        const int block = threadgroup_position_in_grid.x;
+        const int kv_head = threadgroup_position_in_grid.y;
+        const int batch_idx = threadgroup_position_in_grid.z;
+        const int n_kv = key_norms_shape[1];
+        const int T = key_norms_shape[2];
+
+        // matmul2d cooperative-tensor lane coordinates (see the docstring)
+        const int fm = ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
+        const int fc = ((lane >> 3) & 1) * 2 + (lane & 1);
+
+        // This block's contiguous token range (32-token aligned split)
+        const int span = ((T + Blocks - 1) / Blocks + 31) & ~31;
+        const int t_begin = {t_begin};
+        const int t_end = min(T, block * span + span);
+
+        // KV states are views sliced out of the cache's preallocated buffer:
+        // walk them by stride (each token's packed words stay contiguous).
+        auto k_nm = key_norms + batch_idx * key_norms_strides[0]
+            + kv_head * key_norms_strides[1];
+        auto k_pk = key_packed + batch_idx * key_packed_strides[0]
+            + kv_head * key_packed_strides[1];
+        auto v_nm = val_norms + batch_idx * val_norms_strides[0]
+            + kv_head * val_norms_strides[1];
+        auto v_pk = val_packed + batch_idx * val_packed_strides[0]
+            + kv_head * val_packed_strides[1];
+        const int k_nm_step = key_norms_strides[2];
+        const int k_pk_step = key_packed_strides[2];
+        const int v_nm_step = val_norms_strides[2];
+        const int v_pk_step = val_packed_strides[2];
+
+        // Packed byte -> its two codebook entries
+        for (int i = tid; i < 256; i += {threads}) {{
+            k_lut[i] = half2(half(key_codebook[i & 15]), half(key_codebook[i >> 4]));
+            v_lut[i] = half2(half(val_codebook[i & 15]), half(val_codebook[i >> 4]));{lo_lut_fill}
+        }}
+        const int q_row0 = (batch_idx * n_kv + kv_head) * RC;
+
+        constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
+            16, 32, 32, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<qk_desc, metal::execution_simdgroup> qk_op;
+        constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
+            16, 32, 32, false, false, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<pv_desc, metal::execution_simdgroup> pv_op;
+        using QA = decltype(qk_op.template get_left_input_cooperative_tensor<half, half, float>());
+        using QB = decltype(qk_op.template get_right_input_cooperative_tensor<half, half, float>());
+        using PA = decltype(pv_op.template get_left_input_cooperative_tensor<half, half, float>());
+        using PB = decltype(pv_op.template get_right_input_cooperative_tensor<half, half, float>());
+
+        // Phase-1 item: tile qk_tile of each step, fragment qk_frag
+        const int qk_tile = sg / {frags};
+        const int qk_frag = sg % {frags};
+        // Phase-3 items: (column block col, fragment frag) for 2sg, 2sg + 1
+        const int col0 = (2 * sg) / {frags};
+        const int frag0 = (2 * sg) % {frags};
+        const int col1 = (2 * sg + 1) / {frags};
+        const int frag1 = (2 * sg + 1) % {frags};
+        auto o0 = pv_op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<PA>, metal::remove_addrspace_t<PB>, float>();
+        auto o1 = pv_op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<PA>, metal::remove_addrspace_t<PB>, float>();
+        // Element loops over cooperative tensors: one tensor per loop,
+        // unrolled. With o0 and o1 zeroed in one plain loop the kernel ran
+        // 9% slower at 131k tokens (same output).
+        #pragma unroll
+        for (int i = 0; i < 16; i++)
+            o0[i] = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 16; i++)
+            o1[i] = 0.0f;
+
+        // Phase-2 row ownership and running softmax stats
+        const int p2_row = tid / TPR;
+        const int p2_part = tid % TPR;
+        const bool p2_active = p2_row < {rows};
+        float m_run = -3.402823466e+38f;
+        float l_run = 0.0f;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int cb = t_begin; cb < t_end; cb += CH) {{
+            const int n_valid = min(CH, t_end - cb);
+            const int n_cols = (n_valid + 31) & ~31;
+
+            // Phase 1: scores
+            for (int c = tid; c < CH; c += {threads}) {{
+                int t = cb + c;
+                v_norm_sh[c] = t < t_end ? float(v_nm[t * v_nm_step]) : 0.0f;
+            }}
+            const int tb = cb + qk_tile * 32;
+            if (tb < t_end) {{
+                uint4 kw[4][2];
+                for (int s = 0; s < 4; s++) {{
+                    int t = min(tb + 16 * (s >> 1) + 8 * (s & 1) + fm, T - 1);
+                    auto p = (const device uint4*)(k_pk + t * k_pk_step) + 2 * fc;
+                    kw[s][0] = p[0];
+                    kw[s][1] = p[1];
+                }}
+                auto S = qk_op.template get_destination_cooperative_tensor<
+                    metal::remove_addrspace_t<QA>, metal::remove_addrspace_t<QB>, float>();
+                #pragma unroll
+                for (int i = 0; i < 16; i++)
+                    S[i] = 0.0f;
+                const int m0 = qk_frag * 16 + fm;
+                auto q0 = queries + (q_row0 + min(m0, RC - 1)) * D + 64 * fc;
+                auto q1 = queries + (q_row0 + min(m0 + 8, RC - 1)) * D + 64 * fc;
+                QB kb = qk_op.template get_right_input_cooperative_tensor<half, half, float>();
+                QA qa = qk_op.template get_left_input_cooperative_tensor<half, half, float>();
+                {lo_tensors_qk}
+                #pragma unroll
+                for (int jp = 0; jp < 8; jp++) {{
+                {nl.join(k_unpack)}
+                {nl.join(q_load)}
+                {nl.join(qk_runs)}
+                }}
+                // Key norms, causal tail (and padding mask), then store
+                float kn[8];
+                for (int i = 0; i < 8; i++)
+                    kn[i] = float(k_nm[min(tb + 16 * (i >> 2) + 4 * fc + (i & 3), T - 1) * k_nm_step]);
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {{
+                    int m = m0 + 8 * ((i >> 2) & 1);
+                    int t = tb + 16 * (i >> 3) + 4 * fc + (i & 3);
+                    bool visible = t < t_end && m < RC && t <= T - QRows + (m % QRows);{mask_check}
+                    scores[m * SST + (t - cb)] =
+                        visible ? S[i] * kn[4 * (i >> 3) + (i & 3)] : -INFINITY;
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 2: online softmax per row over this step
+            if (p2_active) {{
+                float step_max = -INFINITY;
+                for (int c = p2_part; c < n_cols; c += TPR)
+                    step_max = max(step_max, scores[p2_row * SST + c]);
+                for (int o = TPR / 2; o > 0; o >>= 1)
+                    step_max = max(step_max, simd_shuffle_xor(step_max, o));
+                float m_new = max(m_run, step_max);
+                float alpha = fast::exp(m_run - m_new);
+                float sum = 0.0f;
+                for (int c = p2_part; c < n_cols; c += TPR) {{
+                    float p = fast::exp(scores[p2_row * SST + c] - m_new);
+                    sum += p;
+                    scores[p2_row * SST + c] = p * v_norm_sh[c];
+                }}
+                for (int o = TPR / 2; o > 0; o >>= 1)
+                    sum += simd_shuffle_xor(sum, o);
+                l_run = l_run * alpha + sum;
+                m_run = m_new;
+                if (p2_part == 0)
+                    alpha_sh[p2_row] = alpha;
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 3: O = O * alpha + P' V
+            {{
+                float a00 = alpha_sh[frag0 * 16 + fm], a01 = alpha_sh[frag0 * 16 + fm + 8];
+                float a10 = alpha_sh[frag1 * 16 + fm], a11 = alpha_sh[frag1 * 16 + fm + 8];
+                #pragma unroll
+                for (int i = 0; i < 16; i++)
+                    o0[i] *= (i & 4) ? a01 : a00;
+                #pragma unroll
+                for (int i = 0; i < 16; i++)
+                    o1[i] *= (i & 4) ? a11 : a10;
+                PA pa = pv_op.template get_left_input_cooperative_tensor<half, half, float>();
+                PB pb = pv_op.template get_right_input_cooperative_tensor<half, half, float>();
+                {lo_tensors_pv}
+                #pragma unroll
+                for (int kc = 0; kc < CH / 32; kc++) {{
+                    if (kc * 32 < n_cols) {{
+                        int tt[4];
+                        for (int q = 0; q < 4; q++)
+                            tt[q] = min(cb + kc * 32 + 16 * (q >> 1) + fm + 8 * (q & 1), T - 1);
+                        {(nl + "        ").join(pv_lines)}
+                    }}
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        // Per-row partial results for this block
+        if (p2_active && p2_part == 0 && p2_row < RC) {{
+            out_sums[(q_row0 + p2_row) * Blocks + block] = l_run;
+            out_maxs[(q_row0 + p2_row) * Blocks + block] = m_run;
+        }}
+        {(nl[:-8]).join(out_lines)}
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"omlx_tq_mse_multirow_nax_{name_kind}2pass1_f{frags}_s{int(split)}",
+        input_names=[
+            "queries",
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
+            *extra_inputs,
+        ],
+        output_names=["out_acc", "out_sums", "out_maxs"],
+        source=source,
+        header="#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n",
+        ensure_row_contiguous=False,
+    )
+
+
 def _fused_multirow_mse_attention(
     real_cache, queries, keys_state, values_state, scale, total, pads=None, mask=None
 ):
     """Run MTP verify attention through the fused multi-row kernel.
+
+    Pass 1 is the matrix-unit kernel (``_nax_multirow_pass1_kernel``) when
+    the GPU has matrix units and the call fits it (4-bit K/V, D=256, at most
+    48 rows per kv head); otherwise the portable kernel
+    (``_fused_mse_multirow_2pass1_kernel``). Both feed mlx-vlm's pass 2.
 
     ``pads`` (int32, one entry per batch row) and ``mask`` (bool,
     (1|B, 1, 1|L, total)) select the left-padded kernel variant; with both
@@ -391,36 +846,55 @@ def _fused_multirow_mse_attention(
     n_repeats = n_q_heads // n_kv_heads
 
     padded = pads is not None or mask is not None
-    pass1 = _fused_mse_multirow_2pass1_kernel(
-        int(key_codec.bits), int(value_codec.bits), D, padded
-    )
     pass2 = _tq._fused_mse_decode_2pass_2_kernel()
-    if pass1 is None or pass2 is None:
+    if pass2 is None:
         return None
 
-    # Each simdgroup scores a chunk of rows_per rows. A row count that does
-    # not split evenly gets copies of the first row prepended: they sit just
-    # before it in the causal order, so the real rows keep their positions,
-    # and their outputs are dropped. A short chunk with a runtime row count
-    # cost as much as a full one and more (131k tokens: L=3 4.5 ms, L=4
-    # 3.9 ms).
-    rows_per = min(L, _FUSED_MULTIROW_ROWS_PER_SIMDGROUP)
-    row_chunks = -(-L // rows_per)
-    lead = row_chunks * rows_per - L
-    if lead > total - L:
-        return None
-    if lead:
-        queries = mx.concatenate([queries[:, :, :1]] * lead + [queries], axis=2)
-        if mask is not None and mask.shape[2] == L:
-            mask = mx.concatenate([mask[:, :, :1]] * lead + [mask], axis=2)
+    nax_pass1 = None
+    row_frags = -(-(n_repeats * L) // 16)
+    if (
+        _NAX_MULTIROW_ENABLED
+        and key_codec.bits == 4
+        and value_codec.bits == 4
+        and D == 256
+    ):
+        nax_pass1 = _nax_multirow_pass1_kernel(row_frags, padded)
+
+    if nax_pass1 is not None:
+        # All rows in one pass: no row chunks, no prepended rows.
+        lead = 0
+    else:
+        pass1 = _fused_mse_multirow_2pass1_kernel(
+            int(key_codec.bits), int(value_codec.bits), D, padded
+        )
+        if pass1 is None:
+            return None
+        # Each simdgroup scores a chunk of rows_per rows. A row count that
+        # does not split evenly gets copies of the first row prepended: they
+        # sit just before it in the causal order, so the real rows keep their
+        # positions, and their outputs are dropped. A short chunk with a
+        # runtime row count cost as much as a full one and more (131k
+        # tokens: L=3 4.5 ms, L=4 3.9 ms).
+        rows_per = min(L, _FUSED_MULTIROW_ROWS_PER_SIMDGROUP)
+        row_chunks = -(-L // rows_per)
+        lead = row_chunks * rows_per - L
+        if lead > total - L:
+            return None
+        if lead:
+            queries = mx.concatenate([queries[:, :, :1]] * lead + [queries], axis=2)
+            if mask is not None and mask.shape[2] == L:
+                mask = mx.concatenate([mask[:, :, :1]] * lead + [mask], axis=2)
     rows = L + lead
 
     grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, rows, D)
     q_rot = key_codec.prepare_queries(grouped)
     q_rot_flat = q_rot.reshape(B * n_kv_heads * n_repeats * rows, D)
 
-    # Same block split table as turboquant's 2-pass decode dispatch.
-    if total <= 8192:
+    if nax_pass1 is not None:
+        num_blocks = _nax_multirow_blocks(total)
+    # Portable kernel: same block split table as turboquant's 2-pass decode
+    # dispatch.
+    elif total <= 8192:
         num_blocks = 64
     elif total <= 32768:
         num_blocks = 128
@@ -461,14 +935,8 @@ def _fused_multirow_mse_attention(
             ("MaskT", mask.shape[2] if has_mask else 1),
         ]
 
-    template += [("RowsPer", rows_per), ("RowChunks", row_chunks)]
-
     n_rows = B * n_q_heads * rows
-    out_acc, out_sums, out_maxs = pass1(
-        inputs=inputs,
-        template=template,
-        grid=(n_kv_heads * 32, B * row_chunks * n_repeats, num_blocks),
-        threadgroup=(32, n_repeats, 1),
+    outputs = dict(
         output_shapes=[
             (n_rows * num_blocks, D),
             (n_rows * num_blocks,),
@@ -476,6 +944,26 @@ def _fused_multirow_mse_attention(
         ],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
+    if nax_pass1 is not None:
+        # One threadgroup of 4 simdgroups per row fragment for each (block,
+        # kv head, batch row).
+        threads = 32 * 4 * row_frags
+        out_acc, out_sums, out_maxs = nax_pass1(
+            inputs=inputs,
+            template=template,
+            grid=(num_blocks * threads, n_kv_heads, B),
+            threadgroup=(threads, 1, 1),
+            **outputs,
+        )
+    else:
+        template += [("RowsPer", rows_per), ("RowChunks", row_chunks)]
+        out_acc, out_sums, out_maxs = pass1(
+            inputs=inputs,
+            template=template,
+            grid=(n_kv_heads * 32, B * row_chunks * n_repeats, num_blocks),
+            threadgroup=(32, n_repeats, 1),
+            **outputs,
+        )
     out = pass2(
         inputs=[out_acc, out_sums, out_maxs],
         template=[("Dim", D), ("Blocks", num_blocks)],

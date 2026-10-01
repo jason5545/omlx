@@ -616,13 +616,27 @@ def test_decode_multirow_matches_dequantize_reference(q_len):
     assert mx.abs(ref_nomask - ref).max().item() > 1e-3
 
 
+@pytest.fixture(params=["nax", "portable"])
+def multirow_kernel(request, monkeypatch):
+    """Run a fused multi-row test through the matrix-unit pass 1 (skipped on
+    GPUs without matrix units) and through the portable kernel."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    if request.param == "nax":
+        if not tq_attention._nax_available():
+            pytest.skip("GPU has no matrix units")
+    else:
+        monkeypatch.setattr(tq_attention, "_NAX_MULTIROW_ENABLED", False)
+    return request.param
+
+
 @pytest.mark.parametrize("q_len", [2, 3, 4, 5, 8, 15])
-def test_fused_multirow_kernel_matches_dequantize_reference(q_len):
+def test_fused_multirow_kernel_matches_dequantize_reference(q_len, multirow_kernel):
     """Above the token floor, MSE-codec MTP verify takes the fused multi-row
-    kernel (one KV unpack shared across each two-row chunk, issue #2215) at
-    every verify width. Its output must match the dequantize+SDPA reference
-    with the causal tail mask, and the dispatcher must route to it
-    bit-exactly."""
+    kernel (one KV unpack shared across each two-row chunk, issue #2215; all
+    rows at once on matrix units) at every verify width. Its output must
+    match the dequantize+SDPA reference with the causal tail mask, and the
+    dispatcher must route to it bit-exactly."""
     from omlx.patches import turboquant_attention as tq_attention
 
     mx.random.seed(0)
@@ -655,7 +669,7 @@ def test_fused_multirow_kernel_matches_dequantize_reference(q_len):
     assert routed_diff.max().item() == 0.0
 
 
-def test_fused_multirow_kernel_reads_sliced_cache_views():
+def test_fused_multirow_kernel_reads_sliced_cache_views(multirow_kernel):
     """Decode appends into a preallocated buffer, so attention gets states
     sliced to the written length out of a larger capacity (not row
     contiguous). The fused kernel walks them by stride instead of copying;
@@ -978,11 +992,12 @@ def _pad_aware_reference(batch, ks, vs, queries, pads, scale):
         ((3000, 40), 1, "left_padded_decode", 4.0, "fused"),
         ((3000, 40), 4, "array", 4.0, "fused"),
         ((3000, 400), 3, "array", 3.5, "fused"),
-        # Wider calls run as two-row chunks; odd widths prepend a copy of
-        # row 0 and of its mask row.
+        # The portable kernel runs wider calls as two-row chunks; odd widths
+        # prepend a copy of row 0 and of its mask row. The matrix-unit
+        # kernel takes all 6L rows at once (L=8: three 16-row fragments).
         ((3000, 400), 5, "array", 4.0, "fused"),
         ((3000, 40), 8, "array", 4.0, "fused"),
-        # Past 8192 tokens the kernel splits into 128 blocks.
+        # Past 8192 tokens the portable kernel splits into 128 blocks.
         ((9000, 131), 1, "left_padded_decode", 4.0, "fused"),
         # Below the token floor: masked fold path, and one-shot quantized
         # past the fold knee.
@@ -992,7 +1007,7 @@ def _pad_aware_reference(batch, ks, vs, queries, pads, scale):
     ],
 )
 def test_vlm_left_padded_attention_matches_pad_aware_reference(
-    monkeypatch, lengths, q_len, mask_kind, bits, route
+    monkeypatch, multirow_kernel, lengths, q_len, mask_kind, bits, route
 ):
     """B>1 decode / verify on a left-padded TurboQuant batch must honor each
     row's padding and causal tail straight from the quantized states.
@@ -1086,7 +1101,9 @@ def test_vlm_left_padded_dequantize_fallback_honors_padding(monkeypatch):
     assert mx.abs(out.astype(mx.float32) - ref).max().item() < 5e-2
 
 
-def test_padded_fused_kernel_without_padding_matches_unpadded_kernel():
+def test_padded_fused_kernel_without_padding_matches_unpadded_kernel(
+    multirow_kernel,
+):
     """The padded kernel variant with zero padding and no mask must
     reproduce the unpadded kernel bit for bit (same loop, finite max floor
     only matters for empty blocks)."""
@@ -1114,6 +1131,88 @@ def test_padded_fused_kernel_without_padding_matches_unpadded_kernel():
     assert plain is not None and padded is not None
     diff = mx.abs(plain.astype(mx.float32) - padded.astype(mx.float32))
     assert diff.max().item() == 0.0
+
+
+@pytest.mark.parametrize("q_len", [2, 3, 5, 8])
+def test_nax_multirow_kernel_matches_portable_kernel(monkeypatch, q_len):
+    """On GPUs with matrix units, SAQ-shaped verify calls (24 q / 4 kv
+    heads, D=256, 4-bit; up to three 16-row fragments) take the matrix-unit
+    pass 1 and must agree with the portable kernel, over sliced cache views
+    (capacity > offset) with B=2."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    if not tq_attention._nax_available():
+        pytest.skip("GPU has no matrix units")
+    mx.random.seed(0)
+    B, n_q, n_kv, D = 2, 24, 4, 256
+    tq = TurboQuantKVCache(bits=4.0)
+    for _ in range(3):
+        tq.update_and_fetch(
+            mx.random.normal((B, n_kv, 1000, D)).astype(mx.float16),
+            mx.random.normal((B, n_kv, 1000, D)).astype(mx.float16),
+        )
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((B, n_kv, q_len, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, q_len, D)).astype(mx.float16),
+    )
+    T = tq.offset
+    assert tq.keys.indices.shape[2] > T
+    ks, vs = tq._unwrap(ks), tq._unwrap(vs)
+    queries = mx.random.normal((B, n_q, q_len, D))
+    scale = D**-0.5
+
+    row_frags = -(-(n_q // n_kv * q_len) // 16)
+    assert tq_attention._nax_multirow_pass1_kernel(row_frags) is not None
+    nax = tq_attention._fused_multirow_mse_attention(tq, queries, ks, vs, scale, T)
+    monkeypatch.setattr(tq_attention, "_NAX_MULTIROW_ENABLED", False)
+    portable = tq_attention._fused_multirow_mse_attention(
+        tq, queries, ks, vs, scale, T
+    )
+    assert nax is not None and portable is not None
+    assert mx.abs(nax - portable).max().item() < 2e-4
+
+
+def test_nax_multirow_split_half_keeps_peaked_attention_precise(monkeypatch):
+    """Peaked attention (queries x16, logits ~50) magnifies the half
+    rounding of queries and codebook entries in the scores: plain half
+    operands put the output ~1e-2 off, the hi/lo split must stay within 1e-3
+    of the float32 portable kernel."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    if not tq_attention._nax_available():
+        pytest.skip("GPU has no matrix units")
+    mx.random.seed(0)
+    B, n_q, n_kv, D, q_len = 1, 24, 4, 256, 4
+    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 2048
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    ks, vs = tq._unwrap(ks), tq._unwrap(vs)
+    queries = mx.random.normal((B, n_q, q_len, D)) * 16
+    scale = D**-0.5
+
+    def run(enabled):
+        monkeypatch.setattr(tq_attention, "_NAX_MULTIROW_ENABLED", enabled)
+        return tq_attention._fused_multirow_mse_attention(
+            tq, queries, ks, vs, scale, T
+        )
+
+    portable = run(False)
+    split = run(True)
+    assert mx.abs(split - portable).max().item() < 1e-3
+
+    # The split is what holds it: plain half operands drift.
+    monkeypatch.setattr(tq_attention, "_NAX_MULTIROW_SPLIT_HALF", False)
+    tq_attention._nax_multirow_pass1_kernel.cache_clear()
+    try:
+        plain = run(True)
+        assert mx.abs(plain - portable).max().item() > 3e-3
+    finally:
+        tq_attention._nax_multirow_pass1_kernel.cache_clear()
 
 
 # ---------------------------------------------------------------------------
