@@ -1215,6 +1215,47 @@ def test_nax_multirow_split_half_keeps_peaked_attention_precise(monkeypatch):
         tq_attention._nax_multirow_pass1_kernel.cache_clear()
 
 
+def test_nax_multirow_split_p_tracks_portable_kernel(monkeypatch):
+    """Splitting the softmax weights too keeps the matrix-unit kernel within
+    ~3e-7 of the float32 portable kernel (measured 3.0e-7 at 4k tokens);
+    with P rounded to half it sits ~1.6e-5 off, which on SAQ's verify path
+    moved next-token probabilities several times more than reordering the
+    portable kernel's sums does."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    if not tq_attention._nax_available():
+        pytest.skip("GPU has no matrix units")
+    mx.random.seed(0)
+    B, n_q, n_kv, D, q_len = 1, 24, 4, 256, 2
+    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 2048
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    ks, vs = tq._unwrap(ks), tq._unwrap(vs)
+    queries = mx.random.normal((B, n_q, q_len, D))
+    scale = D**-0.5
+
+    def run(enabled):
+        monkeypatch.setattr(tq_attention, "_NAX_MULTIROW_ENABLED", enabled)
+        return tq_attention._fused_multirow_mse_attention(
+            tq, queries, ks, vs, scale, T
+        )
+
+    portable = run(False)
+    assert mx.abs(run(True) - portable).max().item() < 2e-6
+
+    monkeypatch.setattr(tq_attention, "_NAX_MULTIROW_SPLIT_P", False)
+    tq_attention._nax_multirow_pass1_kernel.cache_clear()
+    try:
+        assert mx.abs(run(True) - portable).max().item() > 4e-6
+    finally:
+        tq_attention._nax_multirow_pass1_kernel.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # Codec rebuild tests (SSD cache reconstruction, issue #577)
 # ---------------------------------------------------------------------------

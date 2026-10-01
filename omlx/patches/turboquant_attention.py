@@ -78,6 +78,14 @@ _NAX_MULTIROW_MAX_ROW_FRAGS = 3
 # off a CPU float32 reference, the split 5e-5 (portable kernel 4e-5). Costs
 # 131k tokens, L=2: 0.35 -> 0.53 ms per layer (batched).
 _NAX_MULTIROW_SPLIT_HALF = True
+# Also split the softmax weights P (adds p_lo.v_hi). Without it the half
+# rounding of P left the kernel 3e-6 off the reference at 131k (portable
+# 4e-8, with it 2.3e-7), and on SAQ's real verify path (131k) the next-token
+# probabilities moved up to 1.5% from the portable kernel's, 5-8x the 0.2-0.3%
+# that reordering the portable kernel's sums moves them; with it 0.35%.
+# Costs 0-6% of the verify forward (131k: L=2 52.6 -> 52.7 ms, L=5 64.3 ->
+# 68.1).
+_NAX_MULTIROW_SPLIT_P = True
 
 
 @cache
@@ -446,6 +454,7 @@ def _nax_multirow_pass1_kernel(row_frags: int, padded: bool = False):
     threads = 32 * simdgroups
     chunk = _NAX_MULTIROW_CHUNK
     split = _NAX_MULTIROW_SPLIT_HALF
+    split_p = split and _NAX_MULTIROW_SPLIT_P
     # Phase-2 threads per score row (TPR * rows <= threads, within a simdgroup)
     tpr = 1
     while tpr * 2 * rows <= threads and tpr < 32:
@@ -513,9 +522,19 @@ def _nax_multirow_pass1_kernel(row_frags: int, padded: bool = False):
                     pv_lines.append(
                         f"  {{ float4 p = *((threadgroup float4*)(scores + (frag{k} * 16 + fm + {8 * ii}) * SST"
                         f" + kc * 32 + {16 * g} + 4 * fc));"
-                        f" pa[{base}] = half(p.x); pa[{base + 1}] = half(p.y); pa[{base + 2}] = half(p.z); pa[{base + 3}] = half(p.w); }}"
                     )
+                    for e, comp in enumerate("xyzw"):
+                        if split_p:
+                            pv_lines.append(
+                                f"    {{ half h = half(p.{comp}); pa[{base + e}] = h;"
+                                f" pa_lo[{base + e}] = half(p.{comp} - float(h)); }}"
+                            )
+                        else:
+                            pv_lines.append(f"    pa[{base + e}] = half(p.{comp});")
+                    pv_lines.append("  }")
             pv_lines.append(f"  pv_op.run(pa, pb, o{k});")
+            if split_p:
+                pv_lines.append(f"  pv_op.run(pa_lo, pb, o{k});")
             if split:
                 pv_lines.append(f"  pv_op.run(pa, pb_lo, o{k});")
         pv_lines.append("}")
@@ -570,6 +589,10 @@ def _nax_multirow_pass1_kernel(row_frags: int, padded: bool = False):
     lo_tensors_pv = (
         "PB pb_lo = pv_op.template get_right_input_cooperative_tensor<half, half, float>();"
         if split
+        else ""
+    ) + (
+        "\n                PA pa_lo = pv_op.template get_left_input_cooperative_tensor<half, half, float>();"
+        if split_p
         else ""
     )
 
@@ -782,7 +805,7 @@ def _nax_multirow_pass1_kernel(row_frags: int, padded: bool = False):
     """
 
     return mx.fast.metal_kernel(
-        name=f"omlx_tq_mse_multirow_nax_{name_kind}2pass1_f{frags}_s{int(split)}",
+        name=f"omlx_tq_mse_multirow_nax_{name_kind}2pass1_f{frags}_s{int(split)}{int(split_p)}",
         input_names=[
             "queries",
             "key_norms",
