@@ -52,6 +52,11 @@ _FUSED_MULTIROW_MIN_TOKENS = 2048
 # simdgroup spilled past two (131k tokens, 24q/4kv, D=256, fp32 queries:
 # L=3 5.0 ms and L=4 8.3 ms per layer against 2.2 ms at L=2).
 _FUSED_MULTIROW_ROWS_PER_SIMDGROUP = 2
+# Tokens each KV-loop iteration unpacks and scores together: independent
+# unpack/score chains for ILP, and one online-softmax rescale per group. One
+# layer at 131k tokens, L=2: 2.33 ms at 1 token, 1.91 at 2, 1.84 at 3, 2.02
+# at 4 (registers); 32k: 0.77 -> 0.66 ms at 3.
+_FUSED_MULTIROW_TOKENS_PER_ITER = 3
 
 
 @cache
@@ -66,7 +71,9 @@ def _fused_mse_multirow_2pass1_kernel(
     online softmax stats, causal tail applied inline). The upstream decode
     kernels re-unpack the KV per query row, so MTP verify paid the unpack ALU
     L times over (issue #2215). QRows rows split into RowChunks chunks along
-    the grid's y axis; QRows must be a multiple of RowsPer.
+    the grid's y axis; QRows must be a multiple of RowsPer. The KV loop takes
+    ``_FUSED_MULTIROW_TOKENS_PER_ITER`` tokens per iteration and finishes the
+    remainder one token at a time.
 
     ``padded`` builds the left-padded batch variant (a separate kernel; the
     unpadded source is unchanged). Each batch row starts its KV loop at its
@@ -93,6 +100,7 @@ def _fused_mse_multirow_2pass1_kernel(
         val_bits, elems_per_lane, "val_codebook", "v_bit_off" if v_misaligned else ""
     )
     v_exprs = [e.replace("kb[", "vb[") for e in v_exprs]
+    group = _FUSED_MULTIROW_TOKENS_PER_ITER
     k_lines = "\n            ".join(
         f"k_el[{i}] = {expr};" for i, expr in enumerate(k_exprs)
     )
@@ -131,7 +139,7 @@ def _fused_mse_multirow_2pass1_kernel(
 """
         first_row_block = "\n"
         row_visible = "vis[r]"
-        name = f"omlx_tq_mse_multirow_padded_2pass1_strided_k{key_bits}_v{val_bits}_d{dim}"
+        name = f"omlx_tq_mse_multirow_padded_2pass1_strided_g{group}_k{key_bits}_v{val_bits}_d{dim}"
         extra_inputs = ["pads", "mask"]
     else:
         pad_setup = ""
@@ -145,8 +153,75 @@ def _fused_mse_multirow_2pass1_kernel(
             int first_row = t - (int)token_count + QRows - row_base;
 """
         row_visible = "r >= first_row"
-        name = f"omlx_tq_mse_multirow_2pass1_strided_k{key_bits}_v{val_bits}_d{dim}"
+        name = f"omlx_tq_mse_multirow_2pass1_strided_g{group}_k{key_bits}_v{val_bits}_d{dim}"
         extra_inputs = []
+
+    # The main KV loop takes `group` tokens (t, t + Blocks, ...) per iteration;
+    # the per-token loop after it finishes the remainder.
+    nl = "\n            "
+    tokens = range(group)
+    group_vis = "".join(
+        f"""
+            bool vis{j}[RowsPer];
+            for (int r = 0; r < RowsPer; r++) {{
+                vis{j}[r] = r >= t{j} - (int)token_count + QRows - row_base;
+                if constexpr (HasMask)
+                    vis{j}[r] = vis{j}[r] && mask[
+                        ((MaskB == 1 ? 0 : (int)batch_idx) * MaskT
+                         + (MaskT == 1 ? 0 : row_base + r)) * (int)token_count + t{j}];
+                any_vis = any_vis || vis{j}[r];
+            }}"""
+        if padded
+        else f"""
+            int first{j} = t{j} - (int)token_count + QRows - row_base;"""
+        for j in tokens
+    )
+    group_unpack = "".join(
+        f"""
+            U kn{j} = static_cast<U>(k_nm[t{j} * k_nm_step]);
+            auto kb{j} = (const device uint8_t*)(k_pk + t{j} * k_pk_step)
+                + k_byte_base;
+            U k_el{j}[qk_per_thread];
+            {nl.join(f"k_el{j}[{i}] = {e.replace('kb[', f'kb{j}[')};" for i, e in enumerate(k_exprs))}
+            U vn{j} = static_cast<U>(v_nm[t{j} * v_nm_step]);
+            auto vb{j} = (const device uint8_t*)(v_pk + t{j} * v_pk_step)
+                + v_byte_base;
+            U v_el{j}[v_per_thread];
+            {nl.join(f"v_el{j}[{i}] = {e.replace('vb[', f'vb{j}[')};" for i, e in enumerate(v_exprs))}"""
+        for j in tokens
+    )
+    row_nl = "\n                "
+    group_score = row_nl.join(
+        f"U s{j} = simd_sum(d{j}) * kn{j};"
+        f" bool see{j} = {f'vis{j}[r]' if padded else f'r >= first{j}'};"
+        f" if (see{j}) m = max(m, s{j});"
+        for j in tokens
+    )
+    group_weight = row_nl.join(
+        f"U e{j} = see{j} ? fast::exp(s{j} - m) : 0.0f; U w{j} = e{j} * vn{j};"
+        for j in tokens
+    )
+    group_loop = f"""
+        // KV loop, {group} tokens per iteration: unpack each token once, score
+        // the chunk's rows against all of them, one rescale per group.
+        int t = {t_start};
+        for (; t + {group - 1} * Blocks < (int)token_count; t += {group} * Blocks) {{
+            {nl.join(f"int t{j} = t + {j} * Blocks;" for j in tokens)}{"" if not padded else f"{nl}bool any_vis = false;"}{group_vis}{f"{nl}if (!any_vis){nl}    continue;" if padded else ""}{group_unpack}
+            for (int r = 0; r < RowsPer; r++) {{
+                {" ".join(f"U d{j} = 0;" for j in tokens)}
+                for (int i = 0; i < qk_per_thread; i++) {{
+                    {" ".join(f"d{j} += q[r][i] * k_el{j}[i];" for j in tokens)}
+                }}
+                U m = max_score[r];
+                {group_score}
+                U factor = fast::exp(max_score[r] - m);
+                {group_weight}
+                max_score[r] = m;
+                sum_exp_score[r] = sum_exp_score[r] * factor + {" + ".join(f"e{j}" for j in tokens)};
+                for (int i = 0; i < v_per_thread; i++)
+                    o[r][i] = o[r][i] * factor + {" + ".join(f"w{j} * v_el{j}[i]" for j in tokens)};
+            }}
+        }}"""
 
     source = f"""
         constexpr int BD = 32;
@@ -210,8 +285,10 @@ def _fused_mse_multirow_2pass1_kernel(
         {"int k_bit_off = k_bit_start & 7;" if k_misaligned else ""}
         {"int v_bit_off = v_bit_start & 7;" if v_misaligned else ""}
 
-        // KV loop: unpack each token once, score the chunk's rows against it
-        for (int t = {t_start}; t < (int)token_count; t += Blocks) {{{row_visibility}
+{group_loop}
+
+        // Remaining tokens, one per iteration
+        for (; t < (int)token_count; t += Blocks) {{{row_visibility}
             U kn = static_cast<U>(k_nm[t * k_nm_step]);
             auto kb = (const device uint8_t*)(k_pk + t * k_pk_step)
                 + k_byte_base;
