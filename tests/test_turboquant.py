@@ -616,12 +616,13 @@ def test_decode_multirow_matches_dequantize_reference(q_len):
     assert mx.abs(ref_nomask - ref).max().item() > 1e-3
 
 
-@pytest.mark.parametrize("q_len", [2, 3, 4])
+@pytest.mark.parametrize("q_len", [2, 3, 4, 5, 8, 15])
 def test_fused_multirow_kernel_matches_dequantize_reference(q_len):
     """Above the token floor, MSE-codec MTP verify takes the fused multi-row
-    kernel (one KV unpack shared across rows, issue #2215). Its output must
-    match the dequantize+SDPA reference with the causal tail mask, and the
-    dispatcher must route to it bit-exactly."""
+    kernel (one KV unpack shared across each two-row chunk, issue #2215) at
+    every verify width. Its output must match the dequantize+SDPA reference
+    with the causal tail mask, and the dispatcher must route to it
+    bit-exactly."""
     from omlx.patches import turboquant_attention as tq_attention
 
     mx.random.seed(0)
@@ -928,11 +929,14 @@ def _pad_aware_reference(batch, ks, vs, queries, pads, scale):
         ((3000, 40), 1, "left_padded_decode", 4.0, "fused"),
         ((3000, 40), 4, "array", 4.0, "fused"),
         ((3000, 400), 3, "array", 3.5, "fused"),
+        # Wider calls run as two-row chunks; odd widths prepend a copy of
+        # row 0 and of its mask row.
+        ((3000, 400), 5, "array", 4.0, "fused"),
+        ((3000, 40), 8, "array", 4.0, "fused"),
         # Past 8192 tokens the kernel splits into 128 blocks.
         ((9000, 131), 1, "left_padded_decode", 4.0, "fused"),
-        # Wider than the fused row cap / fold knee: one-shot quantized.
-        ((3000, 400), 5, "array", 4.0, "oneshot"),
-        # Below the token floor: masked fold path.
+        # Below the token floor: masked fold path, and one-shot quantized
+        # past the fold knee.
         ((600, 100), 1, "left_padded_decode", 4.0, "fold"),
         ((600, 100), 4, "array", 4.0, "fold"),
         ((600, 100), 5, "array", 4.0, "oneshot"),

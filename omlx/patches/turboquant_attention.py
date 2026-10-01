@@ -4,11 +4,12 @@
 When TurboQuantKVCache is detected, routes attention to:
   - Decode (L=1): cache.decode_attention() — Metal kernel, no dequant
   - Decode-shaped multi-row (1 < L <= 15, causal; MTP verify): a fused
-    2-pass kernel that unpacks each KV token once and scores all L rows
-    against it (MSE codecs, issue #2215); outside its envelope the L rows
-    are folded into the GQA repeat dimension so the codecs' decode kernels
-    apply, with the causal tail mask injected between key scoring and the
-    value weighted sum — one lazy pass over the KV, no dequantize
+    2-pass kernel that unpacks each KV token once per chunk of two rows and
+    scores the chunk against it (MSE codecs, issue #2215); outside its
+    envelope the L rows are folded into the GQA repeat dimension so the
+    codecs' decode kernels apply, with the causal tail mask injected between
+    key scoring and the value weighted sum — one lazy pass over the KV, no
+    dequantize
   - Prefill (L>1): tiled quantized attention first for long contexts;
     cache.prefill_attention() first for short contexts; then dequantized SDPA
 
@@ -38,12 +39,19 @@ _DECODE_MULTIROW_MAX_Q_LEN = 15
 _MAX_FOLDED_REPEATS = 24
 # Softmax-denominator floor, matching turboquant's quantized_attention.
 _STATS_EPS = 1e-6
-# Fused multi-row verify kernel envelope. Register arrays scale with QRows
-# (q + o accumulators per row), so cap the rows; the adaptive MTP controller
-# tops out at depth 3 (L=4). Below the token floor the fold path is already
-# sub-0.2ms and the 2-pass block split has too few tokens per block.
-_FUSED_MULTIROW_MAX_Q_ROWS = 4
+# Fused multi-row verify kernel envelope. Below the token floor the fold path
+# is already sub-0.2ms and the 2-pass block split has too few tokens per block.
+# Above it the fused kernel takes every verify width up to
+# _DECODE_MULTIROW_MAX_Q_LEN: with two-row chunks it beat the fold and one-shot
+# routes at every L from 4 to 15 (4k tokens: 0.33-0.76 ms vs 0.93-1.15 ms;
+# 131k: 4.1-7.7 ms at L=4-8 vs 23-27 ms one-shot).
 _FUSED_MULTIROW_MIN_TOKENS = 2048
+# Rows one simdgroup scores per KV unpack. Wider verify calls split their rows
+# into chunks of this many across the grid: each chunk re-reads the KV, but
+# the q/o register arrays stay at the two-row size. Holding all rows in one
+# simdgroup spilled past two (131k tokens, 24q/4kv, D=256, fp32 queries:
+# L=3 5.0 ms and L=4 8.3 ms per layer against 2.2 ms at L=2).
+_FUSED_MULTIROW_ROWS_PER_SIMDGROUP = 2
 
 
 @cache
@@ -54,10 +62,11 @@ def _fused_mse_multirow_2pass1_kernel(
 
     Derived from turboquant's ``_fused_mse_decode_2pass_1_kernel`` with one
     structural change: each simdgroup unpacks a token's K/V codebook entries
-    once and reuses them across all QRows query rows (per-row online softmax
-    stats, causal tail applied inline). The upstream decode kernels re-unpack
-    the KV per query row, so MTP verify paid the unpack ALU L times over
-    (issue #2215).
+    once and reuses them across its chunk of RowsPer query rows (per-row
+    online softmax stats, causal tail applied inline). The upstream decode
+    kernels re-unpack the KV per query row, so MTP verify paid the unpack ALU
+    L times over (issue #2215). QRows rows split into RowChunks chunks along
+    the grid's y axis; QRows must be a multiple of RowsPer.
 
     ``padded`` builds the left-padded batch variant (a separate kernel; the
     unpadded source is unchanged). Each batch row starts its KV loop at its
@@ -102,18 +111,19 @@ def _fused_mse_multirow_2pass1_kernel(
         max_init = "-3.402823466e+38f"
         t_start = "t_start"
         row_visibility = """
-            // Row r sits at global position token_count - QRows + r; token
-            // t is invisible to rows r < t - (token_count - QRows) and to
-            // rows the caller's mask hides. Skip the unpack if none sees t.
-            int first_row = t - (int)token_count + QRows;
-            bool vis[QRows];
+            // Chunk row r is query row row_base + r, at global position
+            // token_count - QRows + row_base + r; token t is invisible to
+            // rows before it and to rows the caller's mask hides. Skip the
+            // unpack if none sees t.
+            int first_row = t - (int)token_count + QRows - row_base;
+            bool vis[RowsPer];
             bool any_vis = false;
-            for (int r = 0; r < QRows; r++) {
+            for (int r = 0; r < RowsPer; r++) {
                 vis[r] = r >= first_row;
                 if constexpr (HasMask)
                     vis[r] = vis[r] && mask[
                         ((MaskB == 1 ? 0 : (int)batch_idx) * MaskT
-                         + (MaskT == 1 ? 0 : r)) * (int)token_count + t];
+                         + (MaskT == 1 ? 0 : row_base + r)) * (int)token_count + t];
                 any_vis = any_vis || vis[r];
             }
             if (!any_vis)
@@ -129,9 +139,10 @@ def _fused_mse_multirow_2pass1_kernel(
         t_start = "block_idx"
         row_visibility = ""
         first_row_block = """
-            // Row r sits at global position token_count - QRows + r; token
-            // t is invisible to rows r < t - (token_count - QRows).
-            int first_row = t - (int)token_count + QRows;
+            // Chunk row r is query row row_base + r, at global position
+            // token_count - QRows + row_base + r; token t is invisible to
+            // chunk rows r < first_row.
+            int first_row = t - (int)token_count + QRows - row_base;
 """
         row_visible = "r >= first_row"
         name = f"omlx_tq_mse_multirow_2pass1_k{key_bits}_v{val_bits}_d{dim}"
@@ -145,8 +156,11 @@ def _fused_mse_multirow_2pass1_kernel(
 
         // Thread identity — matches turboquant's mse_sdpa_2pass_1 layout
         auto kv_head_idx = threadgroup_position_in_grid.x;
-        auto batch_idx = threadgroup_position_in_grid.y;
+        auto batch_idx = threadgroup_position_in_grid.y / RowChunks;
         auto block_idx = threadgroup_position_in_grid.z;
+        // This threadgroup's chunk of RowsPer query rows (QRows is a
+        // multiple of RowsPer; the caller pads short calls).
+        int row_base = (threadgroup_position_in_grid.y % RowChunks) * RowsPer;
         auto simd_lid = thread_index_in_simdgroup;
         auto gqa_idx = thread_position_in_threadgroup.y;
 
@@ -161,19 +175,19 @@ def _fused_mse_multirow_2pass1_kernel(
         auto v_nm = val_norms + bh * token_count;
         auto v_pk = val_packed + bh * token_count * VPackedWidth;{pad_setup}
 
-        // All QRows pre-rotated queries for this (kv_head, repeat) pair
-        thread U q[QRows][qk_per_thread];
-        for (int r = 0; r < QRows; r++) {{
-            auto qr = queries + (bqh * QRows + r) * Dim
+        // This chunk's pre-rotated queries for the (kv_head, repeat) pair
+        thread U q[RowsPer][qk_per_thread];
+        for (int r = 0; r < RowsPer; r++) {{
+            auto qr = queries + (bqh * QRows + row_base + r) * Dim
                 + simd_lid * qk_per_thread;
             for (int i = 0; i < qk_per_thread; i++)
                 q[r][i] = static_cast<U>(qr[i]);
         }}
 
-        thread U o[QRows][v_per_thread] = {{}};
-        U max_score[QRows];
-        U sum_exp_score[QRows];
-        for (int r = 0; r < QRows; r++) {{
+        thread U o[RowsPer][v_per_thread] = {{}};
+        U max_score[RowsPer];
+        U sum_exp_score[RowsPer];
+        for (int r = 0; r < RowsPer; r++) {{
             max_score[r] = {max_init};
             sum_exp_score[r] = 0;
         }}
@@ -186,7 +200,7 @@ def _fused_mse_multirow_2pass1_kernel(
         {"int k_bit_off = k_bit_start & 7;" if k_misaligned else ""}
         {"int v_bit_off = v_bit_start & 7;" if v_misaligned else ""}
 
-        // KV loop: unpack each token once, score all QRows rows against it
+        // KV loop: unpack each token once, score the chunk's rows against it
         for (int t = {t_start}; t < (int)token_count; t += Blocks) {{{row_visibility}
             U kn = static_cast<U>(k_nm[t]);
             auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth)
@@ -199,7 +213,7 @@ def _fused_mse_multirow_2pass1_kernel(
             U vn = static_cast<U>(v_nm[t]);
             U v_el[v_per_thread];
             {v_lines}
-{first_row_block}            for (int r = 0; r < QRows; r++) {{
+{first_row_block}            for (int r = 0; r < RowsPer; r++) {{
                 U dot = 0;
                 for (int i = 0; i < qk_per_thread; i++)
                     dot += q[r][i] * k_el[i];
@@ -217,8 +231,8 @@ def _fused_mse_multirow_2pass1_kernel(
         }}
 
         // Write per-row partial results for this block
-        for (int r = 0; r < QRows; r++) {{
-            auto row_out = bqh * QRows + r;
+        for (int r = 0; r < RowsPer; r++) {{
+            auto row_out = bqh * QRows + row_base + r;
             if (simd_lid == 0) {{
                 out_sums[row_out * Blocks + block_idx] = sum_exp_score[r];
                 out_maxs[row_out * Blocks + block_idx] = max_score[r];
@@ -294,9 +308,26 @@ def _fused_multirow_mse_attention(
     if pass1 is None or pass2 is None:
         return None
 
-    grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
+    # Each simdgroup scores a chunk of rows_per rows. A row count that does
+    # not split evenly gets copies of the first row prepended: they sit just
+    # before it in the causal order, so the real rows keep their positions,
+    # and their outputs are dropped. A short chunk with a runtime row count
+    # cost as much as a full one and more (131k tokens: L=3 4.5 ms, L=4
+    # 3.9 ms).
+    rows_per = min(L, _FUSED_MULTIROW_ROWS_PER_SIMDGROUP)
+    row_chunks = -(-L // rows_per)
+    lead = row_chunks * rows_per - L
+    if lead > total - L:
+        return None
+    if lead:
+        queries = mx.concatenate([queries[:, :, :1]] * lead + [queries], axis=2)
+        if mask is not None and mask.shape[2] == L:
+            mask = mx.concatenate([mask[:, :, :1]] * lead + [mask], axis=2)
+    rows = L + lead
+
+    grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, rows, D)
     q_rot = key_codec.prepare_queries(grouped)
-    q_rot_flat = q_rot.reshape(B * n_kv_heads * n_repeats * L, D)
+    q_rot_flat = q_rot.reshape(B * n_kv_heads * n_repeats * rows, D)
 
     # Same block split table as turboquant's 2-pass decode dispatch.
     if total <= 8192:
@@ -320,7 +351,7 @@ def _fused_multirow_mse_attention(
     template = [
         ("Dim", D),
         ("RepeatCount", n_repeats),
-        ("QRows", L),
+        ("QRows", rows),
         ("Blocks", num_blocks),
         ("KPackedWidth", keys_state.indices.shape[-1]),
         ("VPackedWidth", values_state.indices.shape[-1]),
@@ -336,11 +367,13 @@ def _fused_multirow_mse_attention(
             ("MaskT", mask.shape[2] if has_mask else 1),
         ]
 
-    n_rows = B * n_q_heads * L
+    template += [("RowsPer", rows_per), ("RowChunks", row_chunks)]
+
+    n_rows = B * n_q_heads * rows
     out_acc, out_sums, out_maxs = pass1(
         inputs=inputs,
         template=template,
-        grid=(n_kv_heads * 32, B * n_repeats, num_blocks),
+        grid=(n_kv_heads * 32, B * row_chunks * n_repeats, num_blocks),
         threadgroup=(32, n_repeats, 1),
         output_shapes=[
             (n_rows * num_blocks, D),
@@ -358,9 +391,12 @@ def _fused_multirow_mse_attention(
         output_dtypes=[mx.float32],
     )[0]
 
-    out_rotated = out.reshape(B, n_kv_heads, n_repeats, L, D)
+    out_rotated = out.reshape(B, n_kv_heads, n_repeats, rows, D)
     output = value_codec._rotate_inverse(out_rotated)
-    return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
+    output = output.reshape(B, n_q_heads, rows, D)
+    if lead:
+        output = output[:, :, lead:]
+    return output.astype(queries.dtype)
 
 
 def _decode_multirow_quantized_attention(
@@ -445,7 +481,7 @@ def _decode_multirow_attention(
     if total < L:
         return None
     padded = pads is not None or mask is not None
-    if L <= _FUSED_MULTIROW_MAX_Q_ROWS and total > _FUSED_MULTIROW_MIN_TOKENS:
+    if total > _FUSED_MULTIROW_MIN_TOKENS:
         try:
             result = _fused_multirow_mse_attention(
                 real_cache,
