@@ -131,7 +131,7 @@ def _fused_mse_multirow_2pass1_kernel(
 """
         first_row_block = "\n"
         row_visible = "vis[r]"
-        name = f"omlx_tq_mse_multirow_padded_2pass1_k{key_bits}_v{val_bits}_d{dim}"
+        name = f"omlx_tq_mse_multirow_padded_2pass1_strided_k{key_bits}_v{val_bits}_d{dim}"
         extra_inputs = ["pads", "mask"]
     else:
         pad_setup = ""
@@ -145,7 +145,7 @@ def _fused_mse_multirow_2pass1_kernel(
             int first_row = t - (int)token_count + QRows - row_base;
 """
         row_visible = "r >= first_row"
-        name = f"omlx_tq_mse_multirow_2pass1_k{key_bits}_v{val_bits}_d{dim}"
+        name = f"omlx_tq_mse_multirow_2pass1_strided_k{key_bits}_v{val_bits}_d{dim}"
         extra_inputs = []
 
     source = f"""
@@ -165,15 +165,25 @@ def _fused_mse_multirow_2pass1_kernel(
         auto gqa_idx = thread_position_in_threadgroup.y;
 
         auto token_count = key_norms_shape[2];
-        auto kv_heads = key_norms_shape[1];
-        auto bh = batch_idx * kv_heads + kv_head_idx;
-        auto bqh = batch_idx * kv_heads * RepeatCount
+        auto bqh = batch_idx * key_norms_shape[1] * RepeatCount
             + kv_head_idx * RepeatCount + gqa_idx;
 
-        auto k_nm = key_norms + bh * token_count;
-        auto k_pk = key_packed + bh * token_count * KPackedWidth;
-        auto v_nm = val_norms + bh * token_count;
-        auto v_pk = val_packed + bh * token_count * VPackedWidth;{pad_setup}
+        // The cache hands attention its states as views sliced to the
+        // written length of a larger preallocated buffer. Walk them by
+        // stride rather than have MLX copy them contiguous on every call;
+        // each token's packed words stay contiguous (token-axis slices).
+        auto k_nm = key_norms + batch_idx * key_norms_strides[0]
+            + kv_head_idx * key_norms_strides[1];
+        auto k_pk = key_packed + batch_idx * key_packed_strides[0]
+            + kv_head_idx * key_packed_strides[1];
+        auto v_nm = val_norms + batch_idx * val_norms_strides[0]
+            + kv_head_idx * val_norms_strides[1];
+        auto v_pk = val_packed + batch_idx * val_packed_strides[0]
+            + kv_head_idx * val_packed_strides[1];
+        auto k_nm_step = key_norms_strides[2];
+        auto k_pk_step = key_packed_strides[2];
+        auto v_nm_step = val_norms_strides[2];
+        auto v_pk_step = val_packed_strides[2];{pad_setup}
 
         // This chunk's pre-rotated queries for the (kv_head, repeat) pair
         thread U q[RowsPer][qk_per_thread];
@@ -202,15 +212,15 @@ def _fused_mse_multirow_2pass1_kernel(
 
         // KV loop: unpack each token once, score the chunk's rows against it
         for (int t = {t_start}; t < (int)token_count; t += Blocks) {{{row_visibility}
-            U kn = static_cast<U>(k_nm[t]);
-            auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth)
+            U kn = static_cast<U>(k_nm[t * k_nm_step]);
+            auto kb = (const device uint8_t*)(k_pk + t * k_pk_step)
                 + k_byte_base;
             U k_el[qk_per_thread];
             {k_lines}
 
-            auto vb = (const device uint8_t*)(v_pk + t * VPackedWidth)
+            auto vb = (const device uint8_t*)(v_pk + t * v_pk_step)
                 + v_byte_base;
-            U vn = static_cast<U>(v_nm[t]);
+            U vn = static_cast<U>(v_nm[t * v_nm_step]);
             U v_el[v_per_thread];
             {v_lines}
 {first_row_block}            for (int r = 0; r < RowsPer; r++) {{
@@ -257,6 +267,9 @@ def _fused_mse_multirow_2pass1_kernel(
         ],
         output_names=["out_acc", "out_sums", "out_maxs"],
         source=source,
+        # The KV states are read by stride (see the kernel); the caller makes
+        # every other input contiguous.
+        ensure_row_contiguous=False,
     )
 
 
@@ -339,28 +352,32 @@ def _fused_multirow_mse_attention(
     else:
         num_blocks = 512
 
+    # The pass-1 kernel walks the KV states by stride (they are views sliced
+    # out of the cache's preallocated buffer; a contiguous copy cost 0.57 ms
+    # per layer per call at 131k tokens). Everything else must be contiguous.
     inputs = [
-        q_rot_flat,
+        mx.contiguous(q_rot_flat),
         keys_state.norms,
         keys_state.indices,
-        key_codec.codebook,
+        mx.contiguous(key_codec.codebook),
         values_state.norms,
         values_state.indices,
-        value_codec.codebook,
+        mx.contiguous(value_codec.codebook),
     ]
     template = [
         ("Dim", D),
         ("RepeatCount", n_repeats),
         ("QRows", rows),
         ("Blocks", num_blocks),
-        ("KPackedWidth", keys_state.indices.shape[-1]),
-        ("VPackedWidth", values_state.indices.shape[-1]),
     ]
     if padded:
         if pads is None:
             pads = mx.zeros((B,), dtype=mx.int32)
         has_mask = mask is not None
-        inputs += [pads, mask if has_mask else mx.array([True])]
+        inputs += [
+            mx.contiguous(pads),
+            mx.contiguous(mask) if has_mask else mx.array([True]),
+        ]
         template += [
             ("HasMask", has_mask),
             ("MaskB", mask.shape[0] if has_mask else 1),

@@ -655,6 +655,55 @@ def test_fused_multirow_kernel_matches_dequantize_reference(q_len):
     assert routed_diff.max().item() == 0.0
 
 
+def test_fused_multirow_kernel_reads_sliced_cache_views():
+    """Decode appends into a preallocated buffer, so attention gets states
+    sliced to the written length out of a larger capacity (not row
+    contiguous). The fused kernel walks them by stride instead of copying;
+    it must match the dequantize reference and, bit for bit, the same
+    states made contiguous."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(0)
+    B, n_q, n_kv, D, q_len = 2, 16, 2, 256, 3
+    tq = TurboQuantKVCache(bits=4.0)
+    for _ in range(3):
+        tq.update_and_fetch(
+            mx.random.normal((B, n_kv, 1000, D)).astype(mx.float16),
+            mx.random.normal((B, n_kv, 1000, D)).astype(mx.float16),
+        )
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((B, n_kv, q_len, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, q_len, D)).astype(mx.float16),
+    )
+    T = tq.offset
+    assert T > tq_attention._FUSED_MULTIROW_MIN_TOKENS
+    assert tq.keys.indices.shape[2] > T
+    ks, vs = tq._unwrap(ks), tq._unwrap(vs)
+    queries = mx.random.normal((B, n_q, q_len, D)).astype(mx.float16)
+    scale = D**-0.5
+
+    sliced = tq_attention._fused_multirow_mse_attention(
+        tq, queries, ks, vs, scale, T
+    )
+    contiguous = tq_attention._fused_multirow_mse_attention(
+        tq,
+        queries,
+        type(ks)(*(mx.contiguous(x) for x in ks)),
+        type(vs)(*(mx.contiguous(x) for x in vs)),
+        scale,
+        T,
+    )
+    assert sliced is not None and contiguous is not None
+    assert mx.abs(sliced.astype(mx.float32) - contiguous.astype(mx.float32)).max().item() == 0.0
+
+    dk, dv = tq.dequantize()
+    causal = mx.arange(T)[None, :] <= mx.arange(T - q_len, T)[:, None]
+    ref = mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, mask=causal
+    )
+    assert mx.abs(sliced.astype(mx.float32) - ref).max().item() < 5e-3
+
+
 @pytest.mark.parametrize("bits", [2.5, 3.5, 8])
 def test_fused_multirow_kernel_handles_mixed_bit_codecs(bits):
     """Fractional turboquant_kv_bits split into different K/V integer bit
