@@ -161,7 +161,11 @@ BASE=$(jq -r .source.scm_revision "${RECEIPT}")
 if jq -e '.used_options | index("--with-custom-kernel") != null' "${RECEIPT}" >/dev/null; then
   die "這份安裝帶 --with-custom-kernel，重裝純 Python wheel 會蓋掉編譯好的 kernel，要整套重裝"
 fi
-CHANGED=$(git -C "${REPO}" diff --name-only "${BASE}" "${SHA}" -- pyproject.toml setup.py Formula)
+CHANGED=$(git -C "${REPO}" diff --name-only "${BASE}" "${SHA}" -- pyproject.toml setup.py)
+# Formula 只有 url／sha256（release tarball）變不算：HEAD 安裝不用它們，每次 upstream 發版都會動。
+FORMULA_REAL=$(git -C "${REPO}" diff -U0 "${BASE}" "${SHA}" -- Formula \
+  | { grep -E '^[+-][^+-]' || true; } | { grep -vE '^[+-][[:space:]]*(url|sha256)[[:space:]]' || true; })
+[[ -z ${FORMULA_REAL} ]] || CHANGED=$(printf '%s\nFormula/omlx.rb' "${CHANGED}" | sed '/^$/d')
 [[ -z ${CHANGED} ]] || die "跟 venv 依賴基準 ${BASE:0:8} 比，改到下列檔案，要整套重裝：
 ${CHANGED}"
 

@@ -70,7 +70,7 @@ https://github.com/jason5545/omlx.git
 
 一定要整套重裝：
 
-- 改到 `pyproject.toml`（依賴、extras、版本 pin、build-system）、`setup.py`、`Formula/omlx.rb`。
+- 改到 `pyproject.toml`（依賴、extras、版本 pin、build-system）、`setup.py`、`Formula/omlx.rb`。Formula 只動 `url`／`sha256`（upstream 發版換 release tarball）不算：`--HEAD` 安裝不用這兩行，腳本會略過它們。
 - 要升級或新增依賴、有需要編譯的東西（custom kernel），或這份安裝帶 `--with-custom-kernel`：重裝純 Python wheel 會把編譯好的 kernel 蓋掉。
 - 快速路徑失敗、`/health` 回不到 `healthy`，或模型載入失敗。
 
@@ -97,7 +97,7 @@ git fetch origin
 SHA=$(git rev-parse origin/main)                    # 或要部署的 commit；必須在 origin/main 上
 PIP=$(readlink -f /opt/homebrew/opt/omlx)/libexec/bin/pip
 BASE=$(jq -r .source.scm_revision /opt/homebrew/opt/omlx/INSTALL_RECEIPT.json)
-git diff --name-only "$BASE" "$SHA" -- pyproject.toml setup.py Formula             # 有輸出就改走整套重裝
+git diff --name-only "$BASE" "$SHA" -- pyproject.toml setup.py Formula             # 有輸出就改走整套重裝（Formula 只動 url／sha256 除外，要人工看 diff）
 "$PIP" wheel --no-deps -w "$(mktemp -d)" "git+file://$PWD@$SHA"                   # 預先建置，不動正式 venv
 # 確認沒有進行中的請求（見下面），再換檔案重啟
 brew services stop jason5545/omlx/omlx
