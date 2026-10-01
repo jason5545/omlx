@@ -26,6 +26,9 @@ from omlx.exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
 )
+from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+    Qwen4ExpResidencyEstimate,
+)
 from omlx.scheduler import PrefillEvictionRequest, SchedulerConfig
 
 
@@ -727,6 +730,48 @@ class TestQwenCpuShareMemoryEstimate:
         assert settings.qwen4_ple_ssd_offload is False
         assert effective.qwen4_ple_ssd_offload is True
         assert signature["qwen4_ple_ssd_offload"] == "True"
+
+    @pytest.mark.asyncio
+    async def test_qwen4_forced_offload_logs_again_on_load(self, tmp_path, caplog):
+        model = tmp_path / "qwen4"
+        model.mkdir()
+        entry = EngineEntry(
+            model_id="qwen4",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            config_model_type="qwen4_exp",
+            estimated_size=400,
+        )
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=950,
+            ple_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._get_residency_ceiling = lambda: 500
+        pool._entries[entry.model_id] = entry
+        engine = MagicMock()
+        engine.start = AsyncMock()
+
+        with (
+            patch(
+                "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+                "qwen4_exp_residency_estimate",
+                return_value=estimate,
+            ),
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            caplog.at_level(logging.WARNING, logger="omlx.engine_pool"),
+        ):
+            pool._qwen4_ple_offload_status(entry, None)
+            await pool._load_engine("qwen4")
+
+        assert entry.engine is engine
+        assert (
+            sum("Qwen4-Exp PLE forced" in r.getMessage() for r in caplog.records) == 2
+        )
 
     def test_glm5_next_offload_admission_threads_mtp_resident(self, tmp_path):
         # glm5_next Lightning MTP + expert offload: the admission estimate

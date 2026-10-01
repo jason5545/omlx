@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import platform
+import pwd
 import secrets
 import socket
 import subprocess
@@ -56,6 +57,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .registry import SSH_USER_PATTERN
 
 logger = logging.getLogger(__name__)
 
@@ -486,6 +489,7 @@ class DeviceRegistryBridge:
                 addrs=record.get("last_addrs") or None,
                 paired_at=record.get("paired_at"),
                 http_port=record.get("http_port"),
+                ssh_user=record.get("ssh_user"),
             )
             return
         self._call(self._PUT, record)
@@ -786,6 +790,19 @@ def normalize_ssh_public_key(public_key: str) -> str:
     return normalized
 
 
+def _pairing_caps(caps: dict[str, Any]) -> dict[str, Any]:
+    # Enrollment installs keys in this account's ~/.ssh. Older peers reject new
+    # top-level fields but keep any caps key; discovery HELLO never sends it.
+    return {**caps, "ssh_user": pwd.getpwuid(os.geteuid()).pw_name}
+
+
+def _advertised_ssh_user(caps: Any) -> str | None:
+    user = caps.get("ssh_user") if isinstance(caps, dict) else None
+    if isinstance(user, str) and SSH_USER_PATTERN.fullmatch(user):
+        return user
+    return None
+
+
 def ssh_host_target(address: str) -> str:
     """Format one validated IP for the existing known_hosts API."""
 
@@ -930,7 +947,7 @@ class PairingManager:
         return {
             "node_id": self.node_id,
             "friendly_name": self.friendly_name,
-            "caps": self._caps_provider() if self._caps_provider else {},
+            "caps": _pairing_caps(self._caps_provider() if self._caps_provider else {}),
             "addrs": addresses,
             "ssh_public_key": normalize_ssh_public_key(self._ssh_key_provider() or ""),
             "ssh_host_public_key": normalize_ssh_public_key(
@@ -994,7 +1011,7 @@ class PairingManager:
         return {
             "node_id": self.node_id,
             "friendly_name": self.friendly_name,
-            "caps": dict(caps),
+            "caps": _pairing_caps(caps),
             "code_hash": pairing_code_hash(
                 code,
                 self.node_id,
@@ -1127,6 +1144,8 @@ class PairingManager:
             "state": "paired",
             "role": "coordinator",
         }
+        if ssh_user := _advertised_ssh_user(coordinator.get("caps")):
+            record["ssh_user"] = ssh_user
         key_record = {
             "cluster_key": cluster_key.hex(),
             "peer_public_key": coordinator.get("ssh_public_key"),
@@ -1425,6 +1444,8 @@ class PairingManager:
             "state": "paired",
             "role": "peer",
         }
+        if ssh_user := _advertised_ssh_user(pending.caps):
+            record["ssh_user"] = ssh_user
         key_record = {
             "cluster_key": cluster_key.hex(),
             # The joiner retrieves this package via pair/status and unwraps it

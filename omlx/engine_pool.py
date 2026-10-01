@@ -382,6 +382,8 @@ class EnginePool:
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
+        # Last logged forced-offload state per (model_id, kind).
+        self._offload_warn_state: dict[tuple[str, str], bool] = {}
         # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
         # from ServerSettings.gpu_keep_warm_interval; started on first load.
         self._gpu_keep_warm_interval: float = 0.0
@@ -629,6 +631,33 @@ class EnginePool:
         footprint = int(estimate.resident_bytes / 1.05)
         return footprint > line >= estimate.mmap_bytes
 
+    def _log_offload_decision_once(
+        self,
+        model_id: str,
+        kind: str,
+        forced: bool,
+        message: str,
+        *args: object,
+    ) -> None:
+        """Log a forced offload only when its state changes for this model.
+
+        The admin model list and the runtime signature resolve it on every poll
+        and request.
+        """
+
+        state = getattr(self, "_offload_warn_state", None)
+        if state is None:
+            # Pools built via __new__ (tests, single-purpose embedders) never
+            # ran __init__; keep dedup working without requiring it.
+            state = {}
+            self._offload_warn_state = state
+        key = (model_id, kind)
+        if state.get(key) == forced:
+            return
+        state[key] = forced
+        if forced:
+            logger.warning(message, *args)
+
     def _qwen4_ple_offload_status(
         self,
         entry: EngineEntry,
@@ -687,17 +716,19 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        if forced:
-            logger.warning(
-                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
-                "room to serve prompts under the %.1fGB memory ceiling (mmap "
-                "needs %.1fGB). Decode will be roughly 2.5x slower than a "
-                "resident load.",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        self._log_offload_decision_once(
+            entry.model_id,
+            "qwen4_ple_ssd_offload",
+            forced,
+            "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
+            "room to serve prompts under the %.1fGB memory ceiling (mmap "
+            "needs %.1fGB). Decode will be roughly 2.5x slower than a "
+            "resident load.",
+            entry.model_id,
+            estimate.resident_bytes / 1e9,
+            ceiling / 1e9,
+            estimate.mmap_bytes / 1e9,
+        )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -778,16 +809,18 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        if forced:
-            logger.warning(
-                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
-                "no room to serve prompts under the %.1fGB memory ceiling (mmap "
-                "needs %.1fGB).",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        self._log_offload_decision_once(
+            entry.model_id,
+            "deepseek_v41_engram_ssd_offload",
+            forced,
+            "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
+            "no room to serve prompts under the %.1fGB memory ceiling (mmap "
+            "needs %.1fGB).",
+            entry.model_id,
+            estimate.resident_bytes / 1e9,
+            ceiling / 1e9,
+            estimate.mmap_bytes / 1e9,
+        )
         requested = bool(
             settings is not None
             and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
@@ -3289,6 +3322,10 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            # A status read may have logged a forced offload long before this
+            # load. Log it again next to the load.
+            for kind in ("qwen4_ple_ssd_offload", "deepseek_v41_engram_ssd_offload"):
+                self._offload_warn_state.pop((model_id, kind), None)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
