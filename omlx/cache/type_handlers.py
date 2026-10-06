@@ -1764,6 +1764,17 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
             )
         total = sum(state_lengths)
         capacity = self._restore_capacity(total)
+        concatenated = self._gather_direct(states, state_lengths, capacity)
+        if concatenated is not None:
+            return {
+                **{
+                    info.name: value
+                    for info, value in zip(self.get_state_axis_info(), concatenated)
+                },
+                "states": tuple(concatenated),
+                "cache_type": self.cache_type.value,
+                "qsa_length": total,
+            }
         concatenated = []
         for info, elements in zip(self.get_state_axis_info(), grouped):
             if info.name == "index_position_ids":
@@ -1789,6 +1800,93 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
             result["qsa_length"] = total
         return result
 
+    def _gather_direct(
+        self,
+        states: list[dict[str, Any]],
+        state_lengths: list[int],
+        capacity: int,
+    ) -> tuple[Any, ...] | None:
+        """Build the restore buffers by reading block tensors in place.
+
+        Each block state may carry ``direct_source``: its parsed SSD file
+        and tensor-name prefix (``layer_{i}_state``, element ``k`` at
+        ``{prefix}_{k}``). File-backed blocks are ``preadv``-ed straight
+        into the capacity-sized result; blocks served from memory are
+        copied. None (callers concatenate instead) unless every block has
+        all four tensors, the positions share one channel count and every
+        file span matches its block's shape and dtype.
+        """
+        from .direct_restore import Piece, SafetensorsFile, gather_along_axis
+
+        if capacity <= 0 or not states or 0 in state_lengths:
+            return None
+        axis_info = self.get_state_axis_info()
+        per_element: list[list[Piece]] = [[] for _ in axis_info]
+        any_file = False
+        for state, length in zip(states, state_lengths):
+            elements = state.get("states")
+            if elements is None:
+                elements = tuple(state.get(info.name) for info in axis_info)
+            if len(elements) != len(axis_info) or any(e is None for e in elements):
+                return None
+            source, prefix = state.get("direct_source") or (None, None)
+            if not isinstance(source, SafetensorsFile):
+                source = None
+            for k, (info, element) in enumerate(zip(axis_info, elements)):
+                span = source.span(f"{prefix}_{k}") if source is not None else None
+                if span is not None and (
+                    span.shape != tuple(element.shape)
+                    or span.dtype != str(element.dtype).split(".")[-1]
+                ):
+                    span = None
+                if span is not None:
+                    any_file = True
+                    per_element[k].append(Piece(length, file=source, span=span))
+                else:
+                    per_element[k].append(Piece(length, array=element))
+        if not any_file:
+            return None
+        first = states[0].get("states") or tuple(
+            states[0].get(info.name) for info in axis_info
+        )
+        channels = {
+            int((s.get("states") or (None,) * 4)[3].shape[1])
+            for s in states
+            if (s.get("states") or (None,) * 4)[3] is not None
+        }
+        if len(channels) != 1:
+            return None  # mixed text/MRoPE positions need promotion
+        try:
+            gathered = tuple(
+                gather_along_axis(
+                    pieces,
+                    axis=info.sequence_axis,
+                    capacity=capacity,
+                    shape=tuple(first[k].shape),
+                    dtype=first[k].dtype,
+                )
+                for k, (info, pieces) in enumerate(zip(axis_info, per_element))
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to concatenate
+            level = logging.INFO if not Qwen4QSAKVCacheHandler._direct_fallback_logged else logging.DEBUG
+            Qwen4QSAKVCacheHandler._direct_fallback_logged = True
+            logger.log(level, "Direct QSA prefix restore fell back to concatenate: %s", exc)
+            return None
+        if not Qwen4QSAKVCacheHandler._direct_logged:
+            Qwen4QSAKVCacheHandler._direct_logged = True
+            from_memory = sum(1 for p in per_element[0] if p.file is None)
+            logger.info(
+                "QSA prefix restore reads SSD blocks in place "
+                "(%d blocks, %d served from memory, capacity %d tokens)",
+                len(per_element[0]),
+                from_memory,
+                capacity,
+            )
+        return gathered
+
+    _direct_logged = False
+    _direct_fallback_logged = False
+
     # Dense QSA restores land in capacity-sized buffers (see
     # ``QSAKVCache.restore_with_capacity``); subclasses that rebuild a
     # different cache from the dense blocks keep exact-length arrays.
@@ -1798,10 +1896,18 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
         if not self._RESTORE_WITH_CAPACITY or total <= 0:
             return total
         try:
+            from ..patches.mlx_vlm_qwen4_exp_compat import (
+                apply_mlx_vlm_qwen4_exp_compat_patch,
+            )
+
+            apply_mlx_vlm_qwen4_exp_compat_patch()
             from mlx_vlm.models.qwen4_exp.language import QSAKVCache
         except Exception:  # noqa: BLE001
             return total
-        return max(total, int(QSAKVCache.restore_capacity(total)))
+        restore_capacity = getattr(QSAKVCache, "restore_capacity", None)
+        if restore_capacity is None:
+            return total
+        return max(total, int(restore_capacity(total)))
 
     def deserialize_state(
         self,

@@ -2052,6 +2052,27 @@ class PagedSSDCacheManager(CacheManager):
             self._hot_cache_budget.touch(self, block_hash)
         return entry
 
+    def direct_read_source(self, block_hash: bytes):
+        """The block's SSD file, parsed, for reading tensors in place.
+
+        None when the block is served from memory (hot cache or a pending
+        write, whose file may not be complete yet), is not indexed, or its
+        header cannot be read. Membership checks only: no LRU or stats
+        side effects.
+        """
+        from .direct_restore import safetensors_file
+
+        with self._hot_cache_lock:
+            if block_hash in self._hot_cache:
+                return None
+        with self._pending_write_hashes_lock:
+            if block_hash in self._pending_write_buffers:
+                return None
+        metadata = self._index.get(block_hash)
+        if metadata is None:
+            return None
+        return safetensors_file(metadata.file_path)
+
     def _pending_write_buffer_get(self, block_hash: bytes) -> dict | None:
         """Get entry from pending-write buffer. Returns None on miss."""
         with self._pending_write_hashes_lock:
