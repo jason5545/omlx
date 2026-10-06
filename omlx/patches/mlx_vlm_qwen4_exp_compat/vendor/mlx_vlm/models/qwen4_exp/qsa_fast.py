@@ -100,8 +100,16 @@ _DECODE_SELECT_DISABLED = os.environ.get(
     "OMLX_QWEN4_QSA_DECODE_SELECT", "1"
 ).strip().lower() in {"0", "false", "no", "off"}
 _DECODE_SELECT_THREADS = 1024
-# Keys held per thread; larger block banks keep the MLX ops.
-_DECODE_SELECT_MAX_PER_THREAD = 32
+# Keys held per thread; larger block banks keep the MLX ops. The kernel is one
+# threadgroup and its epilogue barriers once per PER chunk, so its latency
+# grows with the bank while the MLX ops spread over the GPU. Dependency-chained
+# latency on M5 Max (one row, kernel vs MLX ops): <= 8192 blocks 0.035-0.043 vs
+# 0.044-0.067 ms, 16384 blocks 0.063 vs 0.070 ms, but 22250 blocks (PER 32,
+# 89k tokens) 0.111-0.114 vs 0.077 ms. Every decode and verify row waits on
+# its selection, so banks past 16384 blocks (65,536 tokens) take the MLX ops.
+# A scratch-key PER 64-256 variant for 160k+ banks measured 0.18-0.21 vs
+# 0.08-0.10 ms and made 167k decode slower in the served trace; not kept.
+_DECODE_SELECT_MAX_PER_THREAD = 16
 _DECODE_SELECT_KERNELS: dict[str, object] = {}
 _DECODE_SELECT_VALIDATED: set[tuple] = set()
 # Failed template signatures and their errors. Register use grows with PER, so

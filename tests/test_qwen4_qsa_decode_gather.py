@@ -1212,3 +1212,18 @@ def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
     _require_selection(actual)
     assert actual.dtype == expected.dtype and actual.shape == expected.shape
     assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize("key_len,kernel", [(32773, True), (65539, True), (65540, False), (89001, False), (160003, False)])
+def test_selection_kernel_stops_at_its_latency_crossover(key_len, kernel):
+    """Up to 16384 blocks (PER 16) the one-launch kernel selects; larger banks
+    keep the MLX ops, whose latency is lower there (89k: 0.077 vs 0.111 ms)."""
+    blocks = key_len // RATIO
+    scores = mx.array(_head_scores(blocks, "normal", key_len).reshape(1, 1, 4, blocks))
+    result = qsa_fast.decode_block_selection_tokens(
+        scores, head_dim=HEAD_DIM, key_tokens=key_len, compress_ratio=RATIO, block_topk=TOPK
+    )
+    if kernel:
+        assert mx.array_equal(_require_selection(result), _official_gathered_tokens(scores, key_len)).item()
+    else:
+        assert result is None
