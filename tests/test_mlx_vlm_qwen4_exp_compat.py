@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
@@ -2194,3 +2195,200 @@ def test_ple_depthwise_conv_validation_mismatch_disables_kernel(_depthwise_conv_
     assert mx.array_equal(out, conv(x)).item()
     assert language._DEPTHWISE_CONV_STATE["enabled"] is False
     assert language._DEPTHWISE_CONV_STATE["validated"] is False
+
+
+def test_ple_host_ngram_indices_match_the_mlx_hash():
+    """The numpy hash wraps int64 products and floors ``%`` exactly as the MLX graph does."""
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpNGramEmbedding
+
+    config = _tiny_config()
+    config = getattr(config, "text_config", config)
+    embedding = Qwen4ExpNGramEmbedding(config, config.ple_embed_dim, 1, 0)
+    rng = np.random.default_rng(5)
+    for trial in range(200):
+        steps = int(rng.integers(3, 30))
+        length = int(rng.integers(1, steps + 1))
+        history = rng.integers(0, config.vocab_size, size=(2, steps)).astype(np.int64)
+        if trial % 3 == 0:
+            history[rng.integers(0, 2), rng.integers(0, steps)] = embedding.eos_token_id
+        if trial % 5 == 0:
+            history[:, : int(rng.integers(1, steps + 1))] = embedding.eos_token_id
+        want = np.array(embedding._ngram_indices(mx.array(history), length))
+        assert np.array_equal(embedding._ngram_indices_host(history, length), want)
+
+
+def _tiny_disk_ple_model(tmp_path):
+    """The tiny model with its PLE table moved into an SSD-backed bf16 safetensors file."""
+    from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding, LanguageModel
+
+    config = _tiny_config()
+    mx.random.seed(3)
+    model = LanguageModel(config.text_config, config)
+    ple = next(layer.ple for layer in model.model.layers if getattr(layer, "ple", None) is not None)
+    resident = ple.ple_embedding.ngram_embedding
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    tensors = {
+        f"{prefix}.shard_{index}.weight": shard.weight.astype(mx.bfloat16)
+        for index, shard in enumerate(resident.shards)
+    }
+    mx.eval(*tensors.values())
+    filename = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: filename for key in tensors}}), encoding="utf-8"
+    )
+    disk = DiskBackedShardedEmbedding(
+        tmp_path,
+        prefix,
+        num_embeddings=resident.shard_offsets[-1],
+        dims=resident.dims,
+        num_shards=len(resident.shards),
+    )
+    ple.ple_embedding.ngram_embedding = disk
+    return model, disk
+
+
+def _ple_decode_session(model, after_rollback=lambda cache: None):
+    """Prefill, a partly accepted verify, decode steps through an EOS, a rejected verify."""
+    cache = model.make_cache()
+    logits = [model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache).logits]
+    verified = model(mx.array([[5, 6, 7, 8]], dtype=mx.int32), cache=cache, return_hidden=True)
+    logits.append(verified.logits)
+    model.rollback_speculative_cache(cache, verified.gdn_states, accepted=1, block_size=4)
+    after_rollback(cache)
+    windows = [cache[0][3]]
+    for token in (9, 1, 10):
+        logits.append(model(mx.array([[token]], dtype=mx.int32), cache=cache).logits)
+    verified = model(mx.array([[11, 12]], dtype=mx.int32), cache=cache, return_hidden=True)
+    logits.append(verified.logits)
+    model.rollback_speculative_cache(cache, verified.gdn_states, accepted=0, block_size=2)
+    after_rollback(cache)
+    windows.append(cache[0][3])
+    logits.append(model(mx.array([[13]], dtype=mx.int32), cache=cache).logits)
+    windows.append(cache[0][3])
+    mx.eval(logits, windows)
+    return logits, windows, cache
+
+
+def test_ple_host_indices_match_the_mlx_readback_bit_for_bit(tmp_path, monkeypatch):
+    """Hashing on the host changes no logit or token window, and rollback keeps the host mirror."""
+    from mlx_vlm.models.qwen4_exp import language
+
+    model, disk = _tiny_disk_ple_model(tmp_path)
+    try:
+        monkeypatch.setattr(language, "_PLE_HOST_INDICES", False)
+        want_logits, want_windows, _ = _ple_decode_session(model)
+
+        monkeypatch.setattr(language, "_PLE_HOST_INDICES", True)
+        monkeypatch.setattr(
+            disk, "_host_indices", MagicMock(side_effect=AssertionError("rows read back from MLX"))
+        )
+
+        def mirror_is_live(cache):
+            mirror = cache[0]._qwen4_exp_ple_host_window
+            assert mirror[0] is cache[0][3]
+            assert np.array_equal(mirror[1], np.array(cache[0][3]))
+
+        got_logits, got_windows, cache = _ple_decode_session(model, mirror_is_live)
+        assert len(got_logits) == len(want_logits)
+        for got, want in zip(got_logits, want_logits):
+            assert mx.array_equal(got, want).item()
+        for got, want in zip(got_windows, want_windows):
+            assert mx.array_equal(got, want).item()
+        mirror_is_live(cache)
+    finally:
+        disk.close()
+
+
+def test_ple_host_window_falls_back_when_the_cache_slot_is_replaced(tmp_path):
+    """A window stored by any other path is read back from MLX, never taken from a stale mirror."""
+    model, disk = _tiny_disk_ple_model(tmp_path)
+    try:
+        cache = model.make_cache()
+        model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
+        cache[0][3] = mx.array([[7, 8]], dtype=mx.int64)
+        embedding = next(
+            layer.ple.ple_embedding for layer in model.model.layers if getattr(layer, "ple", None) is not None
+        )
+        assert np.array_equal(embedding._previous_context_host(cache[0], 1), [[7, 8]])
+    finally:
+        disk.close()
+
+
+def test_disk_backed_ple_advises_every_shard_tensor_of_a_small_gather(tmp_path, monkeypatch):
+    """Weight, scales and biases of every touched shard are advised before any row is copied."""
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=5)
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    events = []
+    advise, rows_np = language._SafeTensorMMap.advise_rows, language._SafeTensorMMap.rows_np
+
+    def record_advise(self, key, rows):
+        events.append(("advise", key, sorted(np.asarray(rows).tolist())))
+        return advise(self, key, rows)
+
+    def record_copy(self, key, rows):
+        events.append(("copy", key))
+        return rows_np(self, key, rows)
+
+    monkeypatch.setattr(language._SafeTensorMMap, "advise_rows", record_advise)
+    monkeypatch.setattr(language._SafeTensorMMap, "rows_np", record_copy)
+    try:
+        indices = mx.array([[3, 17, 5, 22]], dtype=mx.int32)
+        values = embedding(indices)
+        assert mx.array_equal(values, mx.take(table, indices.reshape(-1), axis=0)[None]).item()
+        advised = [event for event in events if event[0] == "advise"]
+        assert sorted(advised) == sorted(
+            [("advise", f"{prefix}.shard_0.{family}", [3, 5]) for family in ("weight", "scales", "biases")]
+            + [("advise", f"{prefix}.shard_2.{family}", [1, 6]) for family in ("weight", "scales", "biases")]
+        )
+        first_copy = next(index for index, event in enumerate(events) if event[0] == "copy")
+        assert all(event[0] == "advise" for event in events[:first_copy])
+        assert first_copy == len(advised)
+
+        monkeypatch.setattr(language, "_PLE_ADVISE", False)
+        events.clear()
+        embedding(indices)
+        assert all(event[0] == "copy" for event in events)
+    finally:
+        embedding.close()
+
+
+def test_ple_advise_rows_covers_straddling_pages(disk_ple_reader):
+    ple, reader, _ = disk_ple_reader
+    page_size = ple._PLE_PAGE_SIZE
+    row_bytes = 83 * 2
+    base = reader._data_start + reader._header["weight"]["data_offsets"][0]
+    crossing = next(
+        row
+        for row in range(4096)
+        if (base + row * row_bytes) % page_size + row_bytes > page_size
+    )
+    rows = [crossing, 0, 4095, crossing]
+    expected = sorted(
+        {
+            offset // page_size
+            for row in rows
+            for offset in range(base + row * row_bytes, base + (row + 1) * row_bytes)
+        }
+    )
+    calls = []
+    real = reader._mapping
+
+    class Recorder:
+        def __len__(self):
+            return len(real)
+
+        def madvise(self, option, start, length):
+            calls.append((option, start, length))
+
+    reader._mapping = Recorder()
+    try:
+        reader.advise_rows("weight", rows)
+    finally:
+        reader._mapping = real
+    assert [start // page_size for _, start, _ in calls] == expected
+    assert all(option == ple.mmap.MADV_WILLNEED for option, _, _ in calls)
+    assert all(start % page_size == 0 and 0 < length <= page_size for _, start, length in calls)
+    assert calls[-1][1] + calls[-1][2] <= len(real)

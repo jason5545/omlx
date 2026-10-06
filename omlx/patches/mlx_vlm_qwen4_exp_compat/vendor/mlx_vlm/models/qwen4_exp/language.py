@@ -162,6 +162,11 @@ class _PLESpeculativeState:
     input_ids: mx.array
     conv_state: mx.array
     conv_inputs: mx.array
+    # Host copies of ``history`` and ``input_ids`` when the SSD-backed table
+    # hashed this window on the host; rollback rebuilds the host mirror of the
+    # restored token window from them instead of reading it back from MLX.
+    host_history: Optional[np.ndarray] = None
+    host_input_ids: Optional[np.ndarray] = None
 
 
 def configure_mtp_runtime(
@@ -2747,6 +2752,22 @@ _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 _PLE_REARM_FLOOR_SECONDS = 0.0005
 _PLE_REARM_PER_ROW_SECONDS = 2e-6
 _PLE_REARM_MIN_INTERVAL_SECONDS = 60.0
+# A decode or verify gather reads one or two rows from each of many tensors
+# (16 rows per token over 128 shards, times weight, scales and biases), too few
+# per tensor for the pool prefetch, so its page faults ran one after another
+# while the GPU waited (about 80 us each on M5 Max internal SSD). Advising
+# every page of the gather with MADV_WILLNEED before copying any of them lets
+# the kernel overlap the reads: 48 cold pages took 0.3 ms instead of 3.6-4.3
+# ms. Prefill chunks keep the pool prefetch. OMLX_QWEN4_PLE_ADVISE=0 disables.
+_PLE_ADVISE = os.environ.get("OMLX_QWEN4_PLE_ADVISE", "1").strip() != "0"
+_PLE_ADVISE_MAX_ROWS = 1024
+# Hash the n-gram rows of an SSD-backed table on the host from the token ids
+# rather than in an MLX graph evaluated in the middle of the forward, which
+# cost a GPU round trip per step. OMLX_QWEN4_PLE_HOST_INDICES=0 disables.
+_PLE_HOST_INDICES = (
+    os.environ.get("OMLX_QWEN4_PLE_HOST_INDICES", "1").strip() != "0"
+)
+_PLE_ITEM_SIZES = {"BF16": 2, "F16": 2, "F32": 4, "U32": 4, "F8_E4M3": 1}
 
 
 class _SafeTensorMMap:
@@ -2850,6 +2871,39 @@ class _SafeTensorMMap:
 
     def rows(self, key: str, rows: list[int]) -> mx.array:
         return self.to_mx(*self.rows_np(key, rows))
+
+    def advise_rows(self, key: str, rows) -> None:
+        """Start the kernel reading the pages of ``rows`` (MADV_WILLNEED) without waiting."""
+        self._require_owner()
+        advice = getattr(mmap, "MADV_WILLNEED", None)
+        row_indices = np.asarray(rows, dtype=np.int64)
+        if advice is None or row_indices.size == 0:
+            return
+        with self._resource_lock:
+            if self._mapping is None:
+                return
+            entry = self._header[key]
+            item_size = _PLE_ITEM_SIZES.get(entry["dtype"])
+            if item_size is None or len(entry["shape"]) != 2:
+                return
+            row_bytes = int(entry["shape"][1]) * item_size
+            offsets = (
+                self._data_start + entry["data_offsets"][0] + row_indices * row_bytes
+            )
+            pages = np.unique(
+                np.concatenate(
+                    (offsets // _PLE_PAGE_SIZE, (offsets + row_bytes - 1) // _PLE_PAGE_SIZE)
+                )
+            )
+            size = len(self._mapping)
+            for page in pages.tolist():
+                start = page * _PLE_PAGE_SIZE
+                if start >= size:
+                    break
+                try:
+                    self._mapping.madvise(advice, start, min(_PLE_PAGE_SIZE, size - start))
+                except (OSError, ValueError):
+                    return
 
     def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
         """Prefetch unmarked pages; return whether all were already marked."""
@@ -3122,8 +3176,16 @@ class DiskBackedShardedEmbedding(nn.Module):
         """Copy every family's rows into one host buffer in index order (runs off the main thread on prefetch)."""
         shard, local, touched, specs, families, _, _, _ = plan
         buffers: dict[int, np.ndarray] = {}
-        for shard_index, spec in zip(touched, specs):
-            positions = np.flatnonzero(shard == shard_index)
+        selected = [
+            (spec, np.flatnonzero(shard == shard_index))
+            for shard_index, spec in zip(touched, specs)
+        ]
+        if _PLE_ADVISE and host.size <= _PLE_ADVISE_MAX_ROWS:
+            for spec, positions in selected:
+                for family in families:
+                    key = spec[family]
+                    self._tensor_readers[key].advise_rows(key, local[positions])
+        for spec, positions in selected:
             rows = local[positions]
             for family in families:
                 key = spec[family]
@@ -3177,9 +3239,22 @@ class DiskBackedShardedEmbedding(nn.Module):
                 raise RuntimeError("SSD-backed Qwen4 PLE embedding is closed")
             return self._call_owned(indices)
 
+    def gather_host(self, host: np.ndarray) -> mx.array:
+        """Rows for host-computed indices; ``__call__`` without the MLX readback."""
+        self._require_owner()
+        shape = tuple(host.shape)
+        flat = np.ascontiguousarray(host, dtype=np.int64).reshape(-1)
+        if flat.size and (int(flat.min()) < 0 or int(flat.max()) >= self.shard_offsets[-1]):
+            raise IndexError("embedding index is outside the sharded vocabulary")
+        with self._prefetch_lock:
+            if self._prefetch_closed:
+                raise RuntimeError("SSD-backed Qwen4 PLE embedding is closed")
+            return self._gather_owned(flat, shape)
+
     def _call_owned(self, indices):
-        shape = indices.shape
-        host = self._host_indices(indices)
+        return self._gather_owned(self._host_indices(indices), indices.shape)
+
+    def _gather_owned(self, host, shape):
         if host.size == 0:
             return mx.zeros((*shape, self.dims), dtype=mx.bfloat16)
         pending = self._pending.pop(host.tobytes(), None)
@@ -3607,7 +3682,99 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         history = mx.concatenate([previous_context.astype(mx.int64), next_ids], axis=-1)
         prefetch(self._ngram_indices(history, next_ids.shape[1]))
 
+    def _host_hash_tables(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Host copies of the multipliers, head sizes and offsets, taken after load."""
+        source = (
+            self.layer_multipliers,
+            self.ngram_heads_vocab_sizes,
+            self.ngram_heads_offsets,
+        )
+        cached = getattr(self, "_host_tables", None)
+        if cached is None or any(a is not b for a, b in zip(cached[0], source)):
+            tables = tuple(np.array(array.tolist(), dtype=np.int64) for array in source)
+            cached = (source, tables)
+            object.__setattr__(self, "_host_tables", cached)
+        return cached[1]
+
+    def _ngram_indices_host(self, token_history: np.ndarray, length: int) -> np.ndarray:
+        """``_ngram_indices`` in numpy; int64 products wrap and ``%`` floors as in MLX."""
+        multipliers, sizes, offsets = self._host_hash_tables()
+        batch, steps = token_history.shape
+        positions = np.arange(steps, dtype=np.int64)
+        eos_positions = np.where(token_history == self.eos_token_id, positions, -1)
+        previous_eos_inclusive = np.maximum.accumulate(eos_positions, axis=1)
+        previous_eos = np.concatenate(
+            [np.full((batch, 1), -1, dtype=np.int64), previous_eos_inclusive[:, :-1]],
+            axis=1,
+        )
+        position_in_segment = positions[None] - (previous_eos + 1)
+        shifted_tokens = [token_history]
+        for shift in range(1, self.ngram_size):
+            source_positions = positions - shift
+            gather_positions = np.broadcast_to(
+                np.maximum(source_positions, 0)[None], (batch, steps)
+            )
+            shifted = np.take_along_axis(token_history, gather_positions, axis=1)
+            valid = (position_in_segment >= shift) & (source_positions[None] >= 0)
+            shifted_tokens.append(np.where(valid, shifted, self.eos_token_id))
+        blocks = []
+        with np.errstate(over="ignore"):
+            for ngram in range(2, self.ngram_size + 1):
+                start = (ngram - 2) * self.heads_per_ngram
+                end = start + self.heads_per_ngram
+                mixed_ids = shifted_tokens[0] * multipliers[0]
+                for position in range(1, ngram):
+                    mixed_ids = np.bitwise_xor(
+                        mixed_ids, shifted_tokens[position] * multipliers[position]
+                    )
+                ngram_ids = np.mod(mixed_ids[..., None], sizes[start:end][None, None])
+                blocks.append(ngram_ids + offsets[start:end][None, None])
+        return np.concatenate(blocks, axis=-1)[:, -length:]
+
+    def _previous_context_host(self, cache, batch: int) -> np.ndarray:
+        if cache is None or cache[3] is None:
+            return np.full((batch, self.context_len), self.eos_token_id, dtype=np.int64)
+        current = cache[3]
+        # The mirror is valid only for the exact array this module stored; any
+        # path that replaces the window (rollback, batch filter, cache restore)
+        # stores a new array, and the window is read back from MLX instead.
+        mirror = getattr(cache, "_qwen4_exp_ple_host_window", None)
+        if mirror is not None and mirror[0] is current:
+            return mirror[1]
+        return np.asarray(current).astype(np.int64)
+
+    def take_host_inputs(self) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        """Host ``(previous context, input ids)`` of the last host-hashed call, once."""
+        inputs = getattr(self, "_last_host", None)
+        object.__setattr__(self, "_last_host", None)
+        return inputs
+
+    def _call_host(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+        """``__call__`` with the rows hashed on the host.
+
+        Reading the token ids waits for the step that produced them, as the
+        readback of the MLX-hashed rows did, but the hash no longer runs on the
+        GPU after that step: one GPU round trip fewer per step while the GPU is
+        idle waiting for this layer's rows.
+        """
+        ids = np.asarray(input_ids).astype(np.int64)
+        previous = self._previous_context_host(cache, ids.shape[0])
+        history = np.concatenate([previous, ids], axis=1)
+        if cache is not None:
+            window = cache.update_window(3, mx.array(history), self.context_len)
+            cache._qwen4_exp_ple_host_window = (
+                window,
+                np.ascontiguousarray(history[:, -self.context_len :]),
+            )
+        object.__setattr__(self, "_last_host", (previous, ids))
+        rows = self._ngram_indices_host(history, ids.shape[1])
+        embeddings = self.ngram_embedding.gather_host(rows)
+        return embeddings.reshape(*embeddings.shape[:-2], -1)
+
     def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+        if _PLE_HOST_INDICES and hasattr(self.ngram_embedding, "gather_host"):
+            return self._call_host(input_ids, cache)
+        object.__setattr__(self, "_last_host", None)
         input_ids = input_ids.astype(mx.int64)
         previous_context = self._previous_context(input_ids, cache)
 
@@ -3778,6 +3945,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 input_ids.astype(mx.int64), cache
             )
         embeddings = self.ple_embedding(input_ids, cache)
+        host_inputs = self.ple_embedding.take_host_inputs()
         keys = self.norm_key(
             (
                 _target_verify_linear(self.key_proj, embeddings)
@@ -3810,6 +3978,8 @@ class Qwen4ExpPLELayer(nn.Module):
                 input_ids=input_ids.astype(mx.int64),
                 conv_state=conv_state,
                 conv_inputs=normed,
+                host_history=None if host_inputs is None else host_inputs[0],
+                host_input_ids=None if host_inputs is None else host_inputs[1],
             )
         return gated_values + conv_output
 
@@ -4341,6 +4511,17 @@ class LanguageModel(Qwen3_5LanguageModel):
         cache[3] = mx.contiguous(
             mx.take_along_axis(history, history_positions, axis=1)
         )
+        if snapshot.host_history is not None and snapshot.host_input_ids is not None:
+            host = np.concatenate([snapshot.host_history, snapshot.host_input_ids], axis=1)
+            cache._qwen4_exp_ple_host_window = (
+                cache[3],
+                np.stack(
+                    [
+                        host[row, value + 1 : value + 1 + history_len]
+                        for row, value in enumerate(values)
+                    ]
+                ),
+            )
 
         state_len = snapshot.conv_state.shape[1]
         if state_len:
