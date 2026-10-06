@@ -3191,12 +3191,6 @@ class BlockAwarePrefixCache(CacheManager):
                 None  # meta_states from last block (for non-sliceable caches)
             )
             all_block_meta_states = []  # per-block meta_states for walk-back truncation
-            # id(block_data) -> the block's parsed SSD file, for handlers that
-            # read tensors straight into their restore buffer.
-            block_sources: dict[int, Any] = {}
-            direct_read_source = getattr(
-                self.paged_ssd_cache, "direct_read_source", None
-            )
 
             for idx, block_id in enumerate(block_table.block_ids):
                 block = self.paged_cache.allocated_blocks.get(block_id)
@@ -3388,13 +3382,6 @@ class BlockAwarePrefixCache(CacheManager):
                     break  # Stop here, use valid prefix
 
                 all_block_data.append(block_data)
-                if callable(direct_read_source):
-                    try:
-                        block_sources[id(block_data)] = direct_read_source(
-                            block.block_hash
-                        )
-                    except Exception:  # noqa: BLE001 - optional fast path
-                        pass
                 valid_block_count += 1
                 valid_token_count += block.token_count
 
@@ -4406,10 +4393,6 @@ class BlockAwarePrefixCache(CacheManager):
                         state_dict = {
                             "states": elements,
                             "cache_type": marker_class,
-                            "direct_source": (
-                                block_sources.get(id(block_data)),
-                                f"layer_{layer_idx}_state",
-                            ),
                         }
                         for info, elem in zip(axis_info, elements):
                             state_dict[info.name] = elem
