@@ -1227,3 +1227,23 @@ def test_selection_kernel_stops_at_its_latency_crossover(key_len, kernel):
         assert mx.array_equal(_require_selection(result), _official_gathered_tokens(scores, key_len)).item()
     else:
         assert result is None
+
+
+@pytest.mark.parametrize("key_len,kernel", [(89001, True), (131075, True), (131076, False), (160003, False)])
+def test_verify_rows_keep_the_selection_kernel_to_per_32(key_len, kernel):
+    """Row-exact verify rows select with the kernel up to 32768 blocks (PER 32),
+    past the 16384 blocks where one-row decode switches to the MLX ops."""
+    blocks = key_len // RATIO
+    scores = mx.array(_head_scores(blocks, "normal", key_len).reshape(1, 1, 4, blocks))
+    result = qsa_fast.decode_block_selection_tokens(
+        scores,
+        head_dim=HEAD_DIM,
+        key_tokens=key_len,
+        compress_ratio=RATIO,
+        block_topk=TOPK,
+        max_per_thread=qsa_fast._VERIFY_SELECT_MAX_PER_THREAD,
+    )
+    if kernel:
+        assert mx.array_equal(_require_selection(result), _official_gathered_tokens(scores, key_len)).item()
+    else:
+        assert result is None

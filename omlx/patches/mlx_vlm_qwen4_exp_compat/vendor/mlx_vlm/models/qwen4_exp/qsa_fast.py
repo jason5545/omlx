@@ -110,6 +110,13 @@ _DECODE_SELECT_THREADS = 1024
 # A scratch-key PER 64-256 variant for 160k+ banks measured 0.18-0.21 vs
 # 0.08-0.10 ms and made 167k decode slower in the served trace; not kept.
 _DECODE_SELECT_MAX_PER_THREAD = 16
+# Row-exact verify rows keep PER 32 (131,072 tokens), the cap before the
+# one-row crossover above was measured. A multi-row window selects its rows
+# back to back; with twelve QSA layers and GPU work between them, 2-3 row
+# windows at 89-120k ran 0.8-2.0 ms faster per cycle on the kernel (served
+# Lightning MTP verifies mostly 2-3 rows), 4 rows 4.9-7.1 ms slower. That
+# harness also ran 4 rows faster than 2 on one arm, so it is not settled.
+_VERIFY_SELECT_MAX_PER_THREAD = 32
 _DECODE_SELECT_KERNELS: dict[str, object] = {}
 _DECODE_SELECT_VALIDATED: set[tuple] = set()
 # Failed template signatures and their errors. Register use grows with PER, so
@@ -320,6 +327,7 @@ def _decode_block_selection(
     compress_ratio: int,
     block_topk: int,
     tokens: bool,
+    max_per_thread: int | None = None,
 ) -> mx.array | None:
     if _DECODE_SELECT_DISABLED:
         return None
@@ -338,7 +346,9 @@ def _decode_block_selection(
     per_thread = 8
     while per_thread * _DECODE_SELECT_THREADS < blocks:
         per_thread *= 2
-    if per_thread > _DECODE_SELECT_MAX_PER_THREAD:
+    if per_thread > (
+        _DECODE_SELECT_MAX_PER_THREAD if max_per_thread is None else max_per_thread
+    ):
         return None
     heads = int(head_scores.shape[1] * head_scores.shape[2])
     output = "tokens" if tokens else "mask"
@@ -421,14 +431,22 @@ def decode_block_selection_tokens(
     key_tokens: int,
     compress_ratio: int,
     block_topk: int,
+    max_per_thread: int | None = None,
 ) -> mx.array | None:
     """Sorted selected token indices ``[1, block_topk * ratio + tail]`` (int32)
     of one decode row, or None: what the gathered arm builds from its
     argpartition, with ``head_scores`` ``[1, 1, heads, blocks]`` scored as in
-    :func:`decode_block_selection_mask`."""
+    :func:`decode_block_selection_mask`. ``max_per_thread`` overrides the
+    one-row bank cap (``_DECODE_SELECT_MAX_PER_THREAD``)."""
 
     return _decode_block_selection(
-        head_scores, head_dim, key_tokens, compress_ratio, block_topk, tokens=True
+        head_scores,
+        head_dim,
+        key_tokens,
+        compress_ratio,
+        block_topk,
+        tokens=True,
+        max_per_thread=max_per_thread,
     )
 
 
@@ -1099,11 +1117,16 @@ def contiguous_causal_gathered_qsa_decode(
     compress_ratio: int,
     token_budget: int,
     pooled_index_keys_f32: mx.array | None = None,
+    verify_row: bool = False,
 ) -> mx.array:
     """Run exact batch-one QSA decode over only the selected K/V rows.
 
     ``pooled_index_keys_f32``, when given, is the same bank already converted
     to float32 (exact); the FP32 block scores then skip the per-call cast.
+    ``verify_row`` marks one row of a row-exact verify window: its selection
+    keeps the one-launch kernel up to ``_VERIFY_SELECT_MAX_PER_THREAD``. Both
+    selection arms return the same tokens, so the row still equals a decode
+    step bit for bit.
 
     This is the singleton counterpart to :func:`contiguous_causal_gathered_qsa`.
     The query is the final visible token, so every completed compressed block
@@ -1173,6 +1196,7 @@ def contiguous_causal_gathered_qsa_decode(
                 key_tokens=key_tokens,
                 compress_ratio=compress_ratio,
                 block_topk=block_budget,
+                max_per_thread=_VERIFY_SELECT_MAX_PER_THREAD if verify_row else None,
             )
         if selected_tokens is None:
             block_scores = mx.sum(mx.maximum(head_scores, 0), axis=-2) / math.sqrt(

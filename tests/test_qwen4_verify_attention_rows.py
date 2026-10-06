@@ -362,3 +362,51 @@ def test_float32_pooled_bank_follows_trim_and_regrowth():
     mirror = cache.pooled_indexer_keys_f32(*args, cache_tag=indexer)
     assert _bit_equal(mirror, bank.astype(mx.float32))
     assert not _bit_equal(mirror[:, -2:], first[:, -2:])
+
+
+def test_gathered_verify_rows_keep_the_selection_kernel_past_the_decode_cap(monkeypatch):
+    """Past 65,536 tokens a decode row selects with the MLX ops while row-exact
+    verify rows keep the one-launch kernel (PER 32). Both arms pick the same
+    tokens, so every verify row still equals its serial decode step."""
+    qsa_fast = importlib.import_module("mlx_vlm.models.qwen4_exp.qsa_fast")
+    attn = _attention(seed=7)
+    cache = _prefill(attn, 65601, seed=8)
+    picks = []
+    original = qsa_fast.decode_block_selection_tokens
+
+    def recording(*args, **kwargs):
+        result = original(*args, **kwargs)
+        picks.append(result is not None)
+        return result
+
+    monkeypatch.setattr(qsa_fast, "decode_block_selection_tokens", recording)
+    mx.random.seed(41)
+    x = (mx.random.normal((1, 3, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+    try:
+        verified = attn(
+            x, mask="causal", cache=cache, position_ids=_rank_two(cache.offset, 3), target_verify=True
+        )
+        mx.eval(verified)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+    verified_state = _state(cache)
+    verify_picks = picks[:]
+    picks.clear()
+    cache.trim(3)
+
+    rows = []
+    for row in range(3):
+        rows.append(attn(x[:, row : row + 1], mask=None, cache=cache, position_ids=_rank_two(cache.offset, 1)))
+        mx.eval(rows[-1])
+    serial = mx.concatenate(rows, axis=1)
+
+    if not all(verify_picks) and any(
+        "threads per threadgroup" in error for error in qsa_fast._DECODE_SELECT_FAILED.values()
+    ):
+        pytest.skip("decode selection threadgroup exceeds this GPU's pipeline limit")
+    assert verify_picks == [True, True, True]
+    assert picks == [False, False, False]
+    assert _bit_equal(verified, serial)
+    for got, want in zip(verified_state, _state(cache)):
+        assert _bit_equal(got, want)

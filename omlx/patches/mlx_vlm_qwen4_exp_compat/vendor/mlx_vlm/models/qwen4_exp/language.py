@@ -2002,6 +2002,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                     compress_ratio=self.indexer.compress_ratio,
                     token_budget=self.indexer.token_budget,
                     pooled_index_keys_f32=_pooled_bank_f32(cache, self.indexer),
+                    verify_row=True,
                 )
             else:
                 output = q35_language.scaled_dot_product_attention(
