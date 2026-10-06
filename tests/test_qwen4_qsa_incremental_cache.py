@@ -231,3 +231,91 @@ def test_portable_qsa_flattened_gemm_is_exactly_the_broadcast_reference(dtype):
     actual = qsa_fast._portable_indexer_scores(queries, pooled, 128)
     mx.eval(actual, expected)
     assert mx.array_equal(actual, expected).item()
+
+
+cache_module = importlib.import_module("mlx_vlm.models.qwen4_exp.cache")
+
+
+def test_kv_capacity_ladder_depends_only_on_length_and_stays_within_a_quarter():
+    bucket = cache_module.kv_capacity_bucket
+    assert [bucket(n, 8192) for n in (1, 8192, 8193, 32768, 32769)] == [8192, 8192, 16384, 32768, 40960]
+    # Consecutive agent turns at 90k and 220k ask for one size.
+    assert bucket(89_891, 8192) == bucket(90_925, 8192) == 98_304
+    assert bucket(220_087, 8192) == bucket(222_778, 8192) == 229_376
+    previous = 0
+    for n in range(1, 600_000, 997):
+        capacity = bucket(n, 8192)
+        assert capacity >= n and capacity % 8192 == 0
+        assert capacity >= previous  # monotonic in the length
+        assert capacity - n < max(8192, 0.25 * n) + 1  # one step, or a quarter past 32k
+        previous = capacity
+
+
+def test_qsa_kv_growth_follows_the_ladder_instead_of_doubling():
+    cache = language.QSAKVCache()
+    keys = mx.zeros((1, 1, 70_000, 4), dtype=mx.float16)
+    cache.update_and_fetch(keys, keys)
+    assert cache.keys.shape[2] == 81_920  # doubling from 65,536 would be 131,072
+    cache.update_and_fetch(keys[:, :, :12_000], keys[:, :, :12_000])
+    assert cache.keys.shape[2] == cache_module.kv_capacity_bucket(82_000, 8192) == 98_304
+    assert cache.state[0].shape[2] == 82_000
+
+
+def _qsa_blocks(lengths, seed=7):
+    mx.random.seed(seed)
+    blocks = []
+    start = 0
+    for n in lengths:
+        blocks.append(
+            {
+                "states": (
+                    mx.random.normal((1, 2, n, 8)).astype(mx.bfloat16),
+                    mx.random.normal((1, 2, n, 8)).astype(mx.bfloat16),
+                    mx.random.normal((1, n, 4)).astype(mx.bfloat16),
+                    mx.arange(start, start + n, dtype=mx.int32)[None, None],
+                )
+            }
+        )
+        start += n
+    return blocks
+
+
+@pytest.mark.parametrize("lengths", [(2048, 2048, 1500), (2048,) * 44 + (1906,)])
+def test_prefix_restore_lands_in_ladder_capacity_with_exact_state(lengths):
+    from omlx.cache.type_handlers import Qwen4QSAKVCacheHandler
+
+    handler = Qwen4QSAKVCacheHandler()
+    blocks = _qsa_blocks(lengths)
+    total = sum(lengths)
+    cache = handler.reconstruct_cache(handler.concatenate_states(blocks))
+
+    capacity = language.QSAKVCache.restore_capacity(total)
+    assert cache.keys.shape[2] == cache.values.shape[2] == capacity > total
+    assert cache._index_keys.shape[1] == capacity
+    assert cache.offset == total and cache._index_offset == total
+    expected = [mx.concatenate([b["states"][i] for b in blocks], axis=a) for i, a in ((0, 2), (1, 2), (2, 1))]
+    keys, values, index_keys, positions = cache.state
+    for got, want in zip((keys, values, index_keys), expected):
+        assert got.shape == want.shape and mx.array_equal(got, want).item()
+    assert positions.shape == (1, total)
+    assert mx.array_equal(positions, mx.arange(total, dtype=mx.int32)[None]).item()
+
+    # The suffix prefill appends into the restored buffers in place.
+    backing, index_backing = cache.keys, cache._index_keys
+    suffix = mx.ones((1, 2, 300, 8), dtype=mx.bfloat16)
+    cache.update_and_fetch(suffix, suffix)
+    cache.update_indexer(mx.ones((1, 300, 4), dtype=mx.bfloat16), mx.arange(total, total + 300, dtype=mx.int32)[None])
+    assert cache.keys is backing and cache._index_keys is index_backing
+    assert cache.state[0].shape[2] == total + 300
+    assert mx.array_equal(cache.state[0][:, :, :total], expected[0]).item()
+
+
+def test_consecutive_turn_restores_ask_for_one_buffer_size():
+    from omlx.cache.type_handlers import Qwen4QSAKVCacheHandler
+
+    handler = Qwen4QSAKVCacheHandler()
+    first = handler.reconstruct_cache(handler.concatenate_states(_qsa_blocks((2048,) * 43 + (1907,))))
+    second = handler.reconstruct_cache(handler.concatenate_states(_qsa_blocks((2048,) * 44 + (337,))))
+    assert first.offset != second.offset
+    assert first.keys.shape == second.keys.shape
+    assert first._index_keys.shape == second._index_keys.shape

@@ -2529,6 +2529,23 @@ class Scheduler:
 
         return 2 * 1024**3
 
+    def _deferred_clear_needed(self) -> bool:
+        """Whether the post-completion clear should release the pool.
+
+        The finished request's buffers stay pooled for the next request:
+        Qwen4 QSA caches restore and grow on a fixed capacity ladder, so an
+        agent's next turn asks MLX for the same sizes and takes them back
+        instead of allocating (and residency-committing) a fresh prefix
+        every turn. Releasing the whole pool after every request made each
+        turn re-allocate its full context (2026-10-06 trace of 90k-token
+        agent turns: Metal allocation with residency commits plus the clear
+        itself were half of the inference thread's samples while the GPU sat
+        idle during prefill). Only a pool past the periodic
+        threshold is released here; soft/hard pressure and the enforcer's
+        Mac-headroom check still return it sooner when memory runs short.
+        """
+        return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
+
     def _should_periodic_clear_cache(self) -> bool:
         """Decide whether the per-step periodic clear should fire.
 
@@ -13677,8 +13694,9 @@ class Scheduler:
             self._deferred_clear_at is not None
             and self._step_counter >= self._deferred_clear_at
         ):
-            should_clear = True
             self._deferred_clear_at = None
+            if self._deferred_clear_needed():
+                should_clear = True
         # Hard-pressure reclaim requested by ProcessMemoryEnforcer. Drains via
         # the same _sync_and_clear_cache path so freed hot-cache / pooled
         # buffers are returned to the OS at a synchronized, lock-protected

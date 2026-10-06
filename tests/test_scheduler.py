@@ -8354,3 +8354,13 @@ def test_memory_snapshot_line_names_process_and_mac_state(caplog):
         "mac_available=5.0GB compressed=4.0GB swap_used=11.0GB vm_pressure=2"
     )
     assert holder._last_memory_log_at > 0
+
+
+@pytest.mark.parametrize("pool_gb,cleared", [(1, False), (17, True)])
+def test_post_completion_clear_keeps_a_reusable_pool(pool_gb, cleared):
+    """The deferred clear after a request only releases a pool past the
+    periodic threshold; a small pool stays for the next turn to reuse."""
+    holder = SimpleNamespace(_memory_limit_bytes=110 * 1024**3)
+    holder._periodic_clear_threshold_bytes = lambda: scheduler_module.Scheduler._periodic_clear_threshold_bytes(holder)
+    with patch.object(scheduler_module.mx, "get_cache_memory", return_value=pool_gb * 1024**3):
+        assert scheduler_module.Scheduler._deferred_clear_needed(holder) is cleared

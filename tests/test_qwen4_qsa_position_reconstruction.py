@@ -32,11 +32,16 @@ def _mrope(values, length, batch=1):
 
 
 def _positions(*segments):
-    result = Qwen4QSAKVCacheHandler().concatenate_states(
+    state = Qwen4QSAKVCacheHandler().concatenate_states(
         [_state(segment) for segment in segments]
-    )["index_position_ids"]
+    )
+    result = state["index_position_ids"]
     mx.eval(result)
-    return result
+    # Restores land in capacity-sized buffers: the logical prefix, then zeros.
+    length = state.get("qsa_length", result.shape[-1])
+    if result.shape[-1] > length:
+        assert not result[..., length:].any().item()
+    return result[..., :length]
 
 
 @pytest.mark.parametrize(

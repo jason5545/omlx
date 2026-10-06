@@ -1762,14 +1762,22 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
             raise ValueError(
                 "Non-empty QSA prefix chains cannot contain empty cache blocks"
             )
+        total = sum(state_lengths)
+        capacity = self._restore_capacity(total)
         concatenated = []
         for info, elements in zip(self.get_state_axis_info(), grouped):
             if info.name == "index_position_ids":
                 elements = _normalize_qsa_position_states(elements)
+            if elements and capacity > total:
+                # Pad inside the one concatenate: its output is the restored
+                # buffer itself, at a size the next request asks for again.
+                pad_shape = list(elements[0].shape)
+                pad_shape[info.sequence_axis] = capacity - total
+                elements = [*elements, mx.zeros(pad_shape, dtype=elements[0].dtype)]
             concatenated.append(
                 mx.concatenate(elements, axis=info.sequence_axis) if elements else None
             )
-        return {
+        result = {
             **{
                 info.name: value
                 for info, value in zip(self.get_state_axis_info(), concatenated)
@@ -1777,11 +1785,29 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
             "states": tuple(concatenated),
             "cache_type": self.cache_type.value,
         }
+        if capacity > total:
+            result["qsa_length"] = total
+        return result
+
+    # Dense QSA restores land in capacity-sized buffers (see
+    # ``QSAKVCache.restore_with_capacity``); subclasses that rebuild a
+    # different cache from the dense blocks keep exact-length arrays.
+    _RESTORE_WITH_CAPACITY = True
+
+    def _restore_capacity(self, total: int) -> int:
+        if not self._RESTORE_WITH_CAPACITY or total <= 0:
+            return total
+        try:
+            from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+        except Exception:  # noqa: BLE001
+            return total
+        return max(total, int(QSAKVCache.restore_capacity(total)))
 
     def deserialize_state(
         self,
         elements: tuple[Any, ...],
         meta_state: Any | None = None,
+        length: int | None = None,
     ) -> Any:
         del meta_state
         try:
@@ -1799,6 +1825,15 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
         self._validate_serialized_state(elements)
         keys, values, index_keys, position_ids = elements
         cache = QSAKVCache()
+        if length is not None and keys is not None and length < keys.shape[2]:
+            cache.restore_with_capacity(
+                keys,
+                values,
+                index_keys,
+                _deserialize_qsa_positions(position_ids),
+                length,
+            )
+            return cache
         cache.state = (
             keys,
             values,
@@ -1817,7 +1852,9 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
             elements = tuple(
                 state.get(info.name) for info in self.get_state_axis_info()
             )
-        return self.deserialize_state(tuple(elements), meta_state)
+        return self.deserialize_state(
+            tuple(elements), meta_state, length=state.get("qsa_length")
+        )
 
 
 class Qwen4QSAQuantizedKVCacheHandler(Qwen4QSAKVCacheHandler):

@@ -27,7 +27,13 @@ from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_pl
 from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
-from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
+from .cache import (
+    BatchKVCache,
+    KVCache,
+    QuantizedKVCache,
+    dynamic_roll,
+    kv_capacity_bucket,
+)
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.ops.linear import _target_verify_linear, _target_verify_linears
@@ -589,6 +595,37 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
         self.offset = 0 if self.keys is None else self.keys.shape[2]
         self._geometric_capacity_managed = False
         self._restore_indexer_state(index_keys, index_position_ids)
+
+    @classmethod
+    def restore_capacity(cls, length: int) -> int:
+        """Token capacity a prefix restore of ``length`` tokens allocates."""
+        return kv_capacity_bucket(length, cls.step)
+
+    def restore_with_capacity(
+        self, keys, values, index_keys, index_position_ids, length: int
+    ) -> None:
+        """Restore ``length`` tokens from arrays that already hold capacity.
+
+        ``keys``/``values`` (sequence axis 2) and the raw indexer keys and
+        positions (last axis) may run past ``length``; only the first
+        ``length`` tokens are state. Prefix restores build these arrays at
+        ``restore_capacity(length)`` so consecutive requests ask the
+        allocator for one size and the suffix prefill appends in place.
+        """
+        length = int(length)
+        capacity = int(keys.shape[2])
+        if (
+            values.shape[2] != capacity
+            or index_keys.shape[1] != capacity
+            or index_position_ids.shape[-1] != capacity
+            or not 0 < length <= capacity
+        ):
+            raise ValueError("QSA capacity restore arrays are misaligned")
+        self.keys, self.values = keys, values
+        self.offset = length
+        self._geometric_capacity_managed = True
+        self._restore_indexer_state(index_keys, index_position_ids)
+        self._index_offset = length
 
     def trim(self, n):
         n = min(self.offset, n)

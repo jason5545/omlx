@@ -230,6 +230,24 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
     return keys, values
 
 
+def kv_capacity_bucket(needed: int, step: int) -> int:
+    """Token capacity for ``needed`` tokens on a fixed geometric ladder.
+
+    The ladder depends only on ``needed``: multiples of ``step`` up to
+    ``4 * step``, then a quarter of the largest power of two below
+    ``needed`` (consecutive rungs differ by at most 25%). MLX's buffer pool
+    hands a cached buffer back only when it is at most 32 KB larger than the
+    request, so caches that restore or grow to nearby lengths must ask for
+    the very same size to reuse the previous request's buffers. Doubling
+    the old capacity did not: at 200k tokens it allocated 400k-token
+    buffers that no later request could take.
+    """
+
+    needed = max(1, int(needed))
+    quantum = max(int(step), (1 << (needed.bit_length() - 1)) // 4)
+    return -(-needed // quantum) * quantum
+
+
 class QuantizedKVCache(_BaseCache):
     step = 256
     geometric_growth = False
@@ -250,11 +268,7 @@ class QuantizedKVCache(_BaseCache):
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
             el_per_int = 8 * mx.uint32.size // self.bits
             if self.geometric_growth:
-                old_capacity = 0 if self.keys is None else self.keys[0].shape[-2]
-                needed = prev + num_steps
-                capacity = ((needed + self.step - 1) // self.step) * self.step
-                if old_capacity and self._geometric_capacity_managed:
-                    capacity = max(capacity, 2 * old_capacity)
+                capacity = kv_capacity_bucket(prev + num_steps, self.step)
                 shape = (B, n_kv_heads, capacity)
             else:
                 new_steps = (self.step + num_steps - 1) // self.step * self.step
@@ -367,11 +381,7 @@ class KVCache(_BaseCache):
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
             if self.geometric_growth:
-                old_capacity = 0 if self.keys is None else self.keys.shape[2]
-                needed = prev + keys.shape[2]
-                capacity = ((needed + self.step - 1) // self.step) * self.step
-                if old_capacity and self._geometric_capacity_managed:
-                    capacity = max(capacity, 2 * old_capacity)
+                capacity = kv_capacity_bucket(prev + keys.shape[2], self.step)
             else:
                 n_steps = (self.step + keys.shape[2] - 1) // self.step
                 capacity = n_steps * self.step
