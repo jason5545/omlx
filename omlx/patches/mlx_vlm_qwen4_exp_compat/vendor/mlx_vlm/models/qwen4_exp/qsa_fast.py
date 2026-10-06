@@ -100,20 +100,8 @@ _DECODE_SELECT_DISABLED = os.environ.get(
     "OMLX_QWEN4_QSA_DECODE_SELECT", "1"
 ).strip().lower() in {"0", "false", "no", "off"}
 _DECODE_SELECT_THREADS = 1024
-# Keys held per thread in registers (banks up to 32768 blocks, 131072 tokens).
+# Keys held per thread; larger block banks keep the MLX ops.
 _DECODE_SELECT_MAX_PER_THREAD = 32
-# Larger banks (160k-token caches and up) used to fall back to the MLX ops
-# (maximum/sum/divide, argpartition, sort and a dozen small ops per row per
-# layer). They run the same kernel with each thread's keys in a device
-# scratch row instead of registers: every key is computed once, by the same
-# function, and read back only by the thread that wrote it, so the selection
-# is the register variant's. PER stays a power of two (few pipelines), up to
-# 256 x 1024 blocks (~1M tokens). OMLX_QWEN4_QSA_DECODE_SELECT_STREAM=0 keeps
-# the MLX ops for those banks.
-_DECODE_SELECT_MAX_STREAM_PER = 256
-_DECODE_SELECT_STREAM = os.environ.get(
-    "OMLX_QWEN4_QSA_DECODE_SELECT_STREAM", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
 _DECODE_SELECT_KERNELS: dict[str, object] = {}
 _DECODE_SELECT_VALIDATED: set[tuple] = set()
 # Failed template signatures and their errors. Register use grows with PER, so
@@ -317,41 +305,6 @@ _DECODE_SELECT_TOKENS_EPILOGUE = r"""
 """
 
 
-_DECODE_SELECT_REGISTER_KEYS = r"""
-    // Thread tid holds blocks tid, tid + TG, ... (slots past n are never counted).
-    uint keys[PER];
-    for (uint j = 0; j < PER; ++j) {
-        const uint e = j * TG + tid;
-        keys[j] = e < n
-            ? qsa_order_key(qsa_decode_block_score(head_scores, n, e, H, div))
-            : 0u;
-    }
-"""
-
-_DECODE_SELECT_SCRATCH_KEYS = r"""
-    // Thread tid's blocks tid, tid + TG, ... keep their keys in scratch; only
-    // this thread writes or reads them.
-    for (uint j = 0; j < PER; ++j) {
-        const uint e = j * TG + tid;
-        if (e < n) {
-            scratch[e] = qsa_order_key(qsa_decode_block_score(head_scores, n, e, H, div));
-        }
-    }
-"""
-
-
-def _decode_select_source(epilogue: str, scratch: bool) -> str:
-    """The selection kernel body, with keys in registers or in a scratch row."""
-    source = _DECODE_SELECT_SOURCE + epilogue
-    if not scratch:
-        return source
-    if source.count(_DECODE_SELECT_REGISTER_KEYS) != 1:
-        raise RuntimeError("decode selection source no longer has its register key block")
-    source = source.replace(_DECODE_SELECT_REGISTER_KEYS, _DECODE_SELECT_SCRATCH_KEYS)
-    # Every remaining keys[j] read sits behind an `e < n` guard.
-    return source.replace("keys[j]", "scratch[j * TG + tid]")
-
-
 def _decode_block_selection(
     head_scores: mx.array,
     head_dim: int,
@@ -377,32 +330,26 @@ def _decode_block_selection(
     per_thread = 8
     while per_thread * _DECODE_SELECT_THREADS < blocks:
         per_thread *= 2
-    scratch = per_thread > _DECODE_SELECT_MAX_PER_THREAD
-    if scratch and (
-        not _DECODE_SELECT_STREAM or per_thread > _DECODE_SELECT_MAX_STREAM_PER
-    ):
+    if per_thread > _DECODE_SELECT_MAX_PER_THREAD:
         return None
     heads = int(head_scores.shape[1] * head_scores.shape[2])
     output = "tokens" if tokens else "mask"
-    variant = f"{output}_scratch" if scratch else output
-    signature = (variant, heads, block_topk, compress_ratio, tail, per_thread)
+    signature = (output, heads, block_topk, compress_ratio, tail, per_thread)
     if signature in _DECODE_SELECT_FAILED:
         return None
     try:
-        kernel = _DECODE_SELECT_KERNELS.get(variant)
+        kernel = _DECODE_SELECT_KERNELS.get(output)
         if kernel is None:
             kernel = mx.fast.metal_kernel(
-                name=f"omlx_qwen4_qsa_decode_select_{variant}",
+                name=f"omlx_qwen4_qsa_decode_select_{output}",
                 input_names=["head_scores", "divisor"],
-                output_names=[output, "scratch"] if scratch else [output],
+                output_names=[output],
                 header=_DECODE_SELECT_HEADER,
-                source=_decode_select_source(
-                    _DECODE_SELECT_TOKENS_EPILOGUE if tokens else _DECODE_SELECT_MASK_EPILOGUE,
-                    scratch,
-                ),
+                source=_DECODE_SELECT_SOURCE
+                + (_DECODE_SELECT_TOKENS_EPILOGUE if tokens else _DECODE_SELECT_MASK_EPILOGUE),
                 ensure_row_contiguous=True,
             )
-            _DECODE_SELECT_KERNELS[variant] = kernel
+            _DECODE_SELECT_KERNELS[output] = kernel
         divisor = _DECODE_SELECT_DIVISORS.get(head_dim)
         if divisor is None:
             # The FP32 value MLX makes of the Python float in `scores / sqrt(d)`.
@@ -422,10 +369,8 @@ def _decode_block_selection(
             threadgroup=(_DECODE_SELECT_THREADS, 1, 1),
             output_shapes=[
                 (1, block_topk * compress_ratio + tail) if tokens else (1, 1, 1, key_tokens)
-            ]
-            + ([(blocks,)] if scratch else []),
-            output_dtypes=[mx.int32 if tokens else mx.bool_]
-            + ([mx.uint32] if scratch else []),
+            ],
+            output_dtypes=[mx.int32 if tokens else mx.bool_],
         )[0]
         if signature not in _DECODE_SELECT_VALIDATED:
             # Surface a pipeline failure while the MLX ops can still take over.
