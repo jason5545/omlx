@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for psutil_compat memory telemetry."""
 
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -123,3 +124,17 @@ def test_vm_stats_rejects_oversized_kernel_requirement():
         patch.object(psutil_compat, "_MACH_HOST", 123),
     ):
         assert psutil_compat.get_macos_vm_stats() is None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sysctls")
+def test_swap_and_pressure_level_readers_match_sysctl():
+    import re
+    import subprocess
+
+    out = subprocess.check_output(["/usr/sbin/sysctl", "-n", "vm.swapusage"], text=True)
+    used_mb = float(re.search(r"used = ([\d.]+)M", out).group(1))
+    swap = psutil_compat.get_swap_used_bytes()
+    assert swap is not None and abs(swap / 2**20 - used_mb) < 256
+    level = psutil_compat.get_vm_pressure_level()
+    assert level in (1, 2, 4)
+

@@ -8330,3 +8330,27 @@ def test_first_image_boundary_reached_during_decode(mock_model, mock_tokenizer, 
         _, layers = scheduler._boundary_cache_snapshots[request.request_id][8]
         assert layers[0]["pooling_delta_ranges"]["1"] == [0, 2]
         assert layers[0]["state"][1][2].shape[1] == 2
+
+
+def test_memory_snapshot_line_names_process_and_mac_state(caplog):
+    """The per-completion memory line carries every number a slow stretch
+    is lined up against: footprint, MLX active and pool, the Mac's
+    reclaimable memory, compressed memory, swap and the pressure level."""
+    holder = SimpleNamespace()
+    stats = {"free": 2 * 1024**3, "inactive": 3 * 1024**3, "speculative": 0, "compressed": 4 * 1024**3}
+    with (
+        patch.object(scheduler_module.mx, "get_active_memory", return_value=80 * 1024**3),
+        patch.object(scheduler_module.mx, "get_cache_memory", return_value=23 * 1024**3),
+        patch.object(scheduler_module, "get_phys_footprint", return_value=110 * 1024**3),
+        patch.object(scheduler_module.psutil_compat, "get_macos_vm_stats", return_value=stats),
+        patch.object(scheduler_module.psutil_compat, "get_swap_used_bytes", return_value=11 * 1024**3),
+        patch.object(scheduler_module.psutil_compat, "get_vm_pressure_level", return_value=2),
+        caplog.at_level("INFO", logger="omlx.scheduler"),
+    ):
+        scheduler_module.Scheduler._log_memory_snapshot(holder)
+    line = next(r.message for r in caplog.records if r.message.startswith("Memory:"))
+    assert line == (
+        "Memory: footprint=110.0GB mlx_active=80.0GB pool=23.0GB "
+        "mac_available=5.0GB compressed=4.0GB swap_used=11.0GB vm_pressure=2"
+    )
+    assert holder._last_memory_log_at > 0

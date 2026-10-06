@@ -2917,6 +2917,77 @@ class TestPressureCacheReclaim:
         assert requested == 0
 
 
+class TestMacHeadroomPoolReturn:
+    """The pool goes back to the OS when the Mac runs short, even at ok."""
+
+    GB = 1024**3
+
+    def _run(self, *, free, inactive, level=1, pool=6, env=None, enforcer=None):
+        scheduler = MagicMock()
+        if enforcer is None:
+            pool_entries = MagicMock()
+            pool_entries._entries = {"m": SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler))}
+            enforcer = _make_enforcer(engine_pool=pool_entries)
+        stats = {"free": free * self.GB, "active": 0, "inactive": inactive * self.GB, "wired": 0, "speculative": 0}
+        with (
+            patch.object(pme, "get_macos_vm_stats", return_value=stats),
+            patch.object(psutil_compat, "get_vm_pressure_level", return_value=level),
+            patch.object(pme.mx, "get_cache_memory", return_value=pool * self.GB),
+            patch.dict("os.environ", env or {}, clear=False),
+        ):
+            requested = enforcer._maybe_return_pool_for_mac_headroom()
+        return requested, enforcer
+
+    def test_returns_the_pool_when_mac_available_is_low(self, caplog):
+        with caplog.at_level("INFO", logger="omlx.process_memory_enforcer"):
+            requested, _ = self._run(free=2, inactive=3)
+        assert requested == 1
+        assert any("Mac memory headroom low" in r.message for r in caplog.records)
+
+    def test_keeps_the_pool_while_the_mac_has_room(self):
+        requested, _ = self._run(free=6, inactive=10)
+        assert requested == 0
+
+    def test_kernel_warn_level_returns_the_pool(self):
+        requested, _ = self._run(free=6, inactive=10, level=2)
+        assert requested == 1
+
+    def test_small_pool_is_not_worth_a_clear(self):
+        requested, _ = self._run(free=1, inactive=1, pool=1)
+        assert requested == 0
+
+    def test_rate_limited_between_returns(self):
+        requested, enforcer = self._run(free=1, inactive=1)
+        assert requested == 1
+        again, _ = self._run(free=1, inactive=1, enforcer=enforcer)
+        assert again == 0
+        enforcer._last_mac_headroom_reclaim_at -= enforcer._MAC_HEADROOM_RECLAIM_INTERVAL_S
+        later, _ = self._run(free=1, inactive=1, enforcer=enforcer)
+        assert later == 1
+
+    def test_env_gate_disables_it(self):
+        requested, _ = self._run(free=1, inactive=1, env={"OMLX_DISABLE_PRESSURE_RECLAIM": "1"})
+        assert requested == 0
+
+    @pytest.mark.asyncio
+    async def test_ok_level_tick_returns_the_pool(self):
+        scheduler = MagicMock()
+        pool_entries = MagicMock()
+        pool_entries._lock = asyncio.Lock()
+        pool_entries._entries = {"m": SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler))}
+        enforcer = _make_enforcer(engine_pool=pool_entries, ceiling=100 * self.GB, soft_threshold=0.9, hard_threshold=0.95)
+        enforcer._current_usage_bytes = lambda: 50 * self.GB
+        stats = {"free": 1 * self.GB, "active": 0, "inactive": 2 * self.GB, "wired": 0, "speculative": 0}
+        with (
+            patch.object(pme, "get_macos_vm_stats", return_value=stats),
+            patch.object(psutil_compat, "get_vm_pressure_level", return_value=1),
+            patch.object(pme.mx, "get_cache_memory", return_value=5 * self.GB),
+        ):
+            await enforcer._check_and_enforce()
+        assert enforcer.get_pressure_level() == "ok"
+        scheduler.request_pressure_reclaim.assert_called_once()
+
+
 class TestPublicCeilingBreakdown:
     """`get_ceiling_breakdown()` is what the engine pool reads to name the
     ceiling that refused a load, so it has to describe the same computation

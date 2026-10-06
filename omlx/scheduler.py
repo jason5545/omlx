@@ -93,6 +93,7 @@ from .utils.metal_sync import (
     set_chunk_memory_limit,
     unreleased_graphics_bytes,
 )
+from .utils import psutil_compat
 from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.tokenizer import create_streaming_detokenizer
@@ -12950,6 +12951,45 @@ class Scheduler:
         # Schedule deferred Metal cache cleanup after request completion.
         if finished_ids:
             self._schedule_deferred_metal_clear()
+            self._log_memory_snapshot()
+
+    # Seconds between memory lines while a long generation runs.
+    _MEMORY_LOG_INTERVAL_S = 30.0
+
+    def _log_memory_snapshot(self) -> None:
+        """One INFO line on where the process and the Mac stand.
+
+        Logged at every request completion and every
+        ``_MEMORY_LOG_INTERVAL_S`` while requests run, so a slow stretch can
+        be lined up with footprint, pooled Metal buffers, the Mac's
+        reclaimable memory, swap and the kernel pressure level. Engine
+        thread only (reads MLX's active and pool counters).
+        """
+        self._last_memory_log_at = time.monotonic()
+        try:
+            active = int(mx.get_active_memory())
+            pool = int(mx.get_cache_memory())
+            footprint = int(get_phys_footprint())
+            stats = psutil_compat.get_macos_vm_stats() or {}
+            swap = psutil_compat.get_swap_used_bytes()
+            level = psutil_compat.get_vm_pressure_level()
+        except Exception:  # noqa: BLE001
+            return
+        available = (
+            stats.get("free", 0) + stats.get("inactive", 0) + stats.get("speculative", 0)
+        )
+        gb = 1024**3
+        logger.info(
+            "Memory: footprint=%.1fGB mlx_active=%.1fGB pool=%.1fGB "
+            "mac_available=%.1fGB compressed=%.1fGB swap_used=%s vm_pressure=%s",
+            footprint / gb,
+            active / gb,
+            pool / gb,
+            available / gb,
+            stats.get("compressed", 0) / gb,
+            f"{swap / gb:.1f}GB" if swap is not None else "?",
+            level if level is not None else "?",
+        )
 
     def _schedule_deferred_metal_clear(self) -> None:
         """Schedule the deferred Metal cache clear for a just-ended request.
@@ -13658,6 +13698,12 @@ class Scheduler:
             and self._step_counter % self.config.gc_cleanup_interval == 0
         ):
             gc.collect()
+        if (
+            self.running
+            and time.monotonic() - getattr(self, "_last_memory_log_at", 0.0)
+            >= self._MEMORY_LOG_INTERVAL_S
+        ):
+            self._log_memory_snapshot()
 
         self._publish_admin_snapshot()
 

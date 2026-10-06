@@ -462,6 +462,8 @@ class ProcessMemoryEnforcer:
         # prefill chunk / step boundary. See the grace check in
         # _check_and_enforce.
         self._pressure_reclaim_grace_polls: int = 0
+        # monotonic() of the last Mac-headroom pool return (rate limit).
+        self._last_mac_headroom_reclaim_at: float = float("-inf")
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -1193,6 +1195,53 @@ class ProcessMemoryEnforcer:
     # size, so 5 one-second polls cover at least one chunk boundary.
     _PRESSURE_RECLAIM_GRACE_POLLS_MAX = 5
 
+    # Mac-wide headroom under which pooled Metal buffers go back to the OS
+    # while oMLX's own watermarks still read ok. A custom ceiling is pinned
+    # near RAM and ignores other apps, so oMLX can stay "ok" while the Mac
+    # swaps around it; the pool is memory oMLX has already freed. 2026-10-06:
+    # a 220k-token agent session ran 110 GB with 23 GB pooled, decode and
+    # prefill ran 2x slower for minutes and a cache store hit a GPU timeout.
+    _MAC_HEADROOM_RECLAIM_BYTES = 8 * 1024**3
+    _MAC_HEADROOM_RECLAIM_INTERVAL_S = 5.0
+    _VM_PRESSURE_WARN = 2
+
+    def _maybe_return_pool_for_mac_headroom(self) -> int:
+        """Return the MLX pool when the Mac, not oMLX's ceiling, runs short.
+
+        Free + inactive + speculative under ``_MAC_HEADROOM_RECLAIM_BYTES``,
+        or the kernel's pressure level at warn or above, asks the schedulers
+        for the same step-boundary clear the soft/hard path uses. Gated on a
+        pool above ``_POOL_RECLAIM_FLOOR`` and at most once per
+        ``_MAC_HEADROOM_RECLAIM_INTERVAL_S``.
+        """
+        if os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") == "1":
+            return 0
+        now = time.monotonic()
+        last = getattr(self, "_last_mac_headroom_reclaim_at", float("-inf"))
+        if now - last < self._MAC_HEADROOM_RECLAIM_INTERVAL_S:
+            return 0
+        stats = get_macos_vm_stats()
+        if stats is None:
+            return 0
+        available = stats["free"] + stats["inactive"] + stats.get("speculative", 0)
+        level = psutil_compat.get_vm_pressure_level() or 0
+        if available >= self._MAC_HEADROOM_RECLAIM_BYTES and level < self._VM_PRESSURE_WARN:
+            return 0
+        pool = self._pool_bytes()
+        if pool <= self._POOL_RECLAIM_FLOOR:
+            return 0
+        self._last_mac_headroom_reclaim_at = now
+        requested = self._request_scheduler_cache_reclaim(0)
+        if requested:
+            logger.info(
+                "Mac memory headroom low (available=%s, vm pressure level %d): "
+                "returning %s of pooled Metal buffers",
+                _format_gb(available),
+                level,
+                _format_gb(pool),
+            )
+        return requested
+
     def _pool_bytes(self) -> int:
         """MLX buffer-pool size, 0 when unreadable (mocked mx in tests)."""
         try:
@@ -1717,6 +1766,7 @@ class ProcessMemoryEnforcer:
                     self._propagate_memory_limit()
 
         if new_level == "ok":
+            self._maybe_return_pool_for_mac_headroom()
             # Still walk the store-cache cap so it can recover toward
             # max_num_seqs while pressure stays low (#1383).
             self._walk_store_cache_caps()

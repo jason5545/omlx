@@ -146,6 +146,52 @@ def get_macos_vm_stats() -> dict[str, int] | None:
         return None
 
 
+class _XswUsage(ctypes.Structure):
+    """``struct xsw_usage`` behind the ``vm.swapusage`` sysctl."""
+
+    _fields_ = [
+        ("xsu_total", ctypes.c_uint64),
+        ("xsu_avail", ctypes.c_uint64),
+        ("xsu_used", ctypes.c_uint64),
+        ("xsu_pagesize", ctypes.c_uint32),
+        ("xsu_encrypted", ctypes.c_bool),
+    ]
+
+
+def get_swap_used_bytes() -> int | None:
+    """Bytes of swap in use on macOS, or None when unreadable."""
+    if _libc is None:
+        return None
+    try:
+        usage = _XswUsage()
+        size = ctypes.c_size_t(ctypes.sizeof(usage))
+        rc = _libc.sysctlbyname(
+            b"vm.swapusage", ctypes.byref(usage), ctypes.byref(size), None, 0
+        )
+        return int(usage.xsu_used) if rc == 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_vm_pressure_level() -> int | None:
+    """macOS memory pressure level (1 normal, 2 warn, 4 critical), or None."""
+    if _libc is None:
+        return None
+    try:
+        level = ctypes.c_int(0)
+        size = ctypes.c_size_t(ctypes.sizeof(level))
+        rc = _libc.sysctlbyname(
+            b"kern.memorystatus_vm_pressure_level",
+            ctypes.byref(level),
+            ctypes.byref(size),
+            None,
+            0,
+        )
+        return int(level.value) if rc == 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _build_svmem(stats: dict[str, int], total: int | None = None) -> Any:
     free = max(0, int(stats.get("free", 0) or 0))
     active = max(0, int(stats.get("active", 0) or 0))
