@@ -1936,7 +1936,6 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
-        text_only: bool = False,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -1948,7 +1947,6 @@ class VLMBatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
-            text_only=text_only,
         )
 
     @property
@@ -2303,10 +2301,15 @@ class VLMBatchedEngine(BaseEngine):
         # engine. Same sequence as batched.py: wrap on the MLX executor
         # BEFORE materialize so non-resident experts never load.
         moe_offload_wrapped = 0
+        offload_stats = offload_release = offload_restore = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
+                moe_offload_caches,
+                moe_offload_stats,
+                release_moe_offload_slots,
+                restore_moe_offload_slots,
             )
 
             fraction = float(
@@ -2344,6 +2347,10 @@ class VLMBatchedEngine(BaseEngine):
                     materialize_offload_state,
                     self._vlm_model,
                 )
+                caches = moe_offload_caches(self._vlm_model)
+                offload_stats = functools.partial(moe_offload_stats, caches=caches)
+                offload_release = functools.partial(release_moe_offload_slots, caches)
+                offload_restore = functools.partial(restore_moe_offload_slots, caches)
         self._moe_offload_wrapped = moe_offload_wrapped
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
@@ -2607,6 +2614,7 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
         if (
             self._adapter.model_type == "deepseek_v41"
             and self._adapter.config.ced_prefill
@@ -2637,6 +2645,9 @@ class VLMBatchedEngine(BaseEngine):
 
         # TurboQuant KV cache
         scheduler = self._engine.engine.scheduler
+        scheduler.moe_offload_stats = offload_stats
+        scheduler.moe_offload_release = offload_release
+        scheduler.moe_offload_restore = offload_restore
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled and self.model_type == "glm5_next":
@@ -4268,13 +4279,32 @@ class VLMBatchedEngine(BaseEngine):
                 fast_cached_features = fast.pop("cached_image_features", None)
                 inputs = fast
         if inputs is None:
+            prompts = [prompt] if isinstance(prompt, str) else prompt
+            # A text-only chat template renders images as prose, and the
+            # processor then fails with a misleading image-count error.
+            image_token = getattr(self._processor, "image_token", None)
+            texts = [item for item in prompts if isinstance(item, str)]
+            if (
+                num_images
+                and isinstance(image_token, str)
+                and image_token
+                and texts
+                and not any(image_token in text for text in texts)
+            ):
+                raise InvalidRequestError(
+                    "The chat template did not emit image tokens for the "
+                    "attached images. This checkpoint likely ships a text-only "
+                    "chat template; use the vision template from the upstream "
+                    "model repository.",
+                    field="messages",
+                )
             # Tokenize text and preprocess images and audio
             inputs = prepare_inputs(
                 self._processor,
                 images=images if images else None,
                 audio=audio if audio else None,
                 videos=videos if videos else None,
-                prompts=[prompt] if isinstance(prompt, str) else prompt,
+                prompts=prompts,
             )
 
         input_ids = inputs["input_ids"]
@@ -5270,7 +5300,6 @@ class VLMBatchedEngine(BaseEngine):
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
-            text_only=image_tokens == 0 and video_tokens == 0,
         )
 
     async def preflight_completion(
@@ -5306,7 +5335,6 @@ class VLMBatchedEngine(BaseEngine):
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
-            text_only=True,
         )
 
     async def stream_chat(

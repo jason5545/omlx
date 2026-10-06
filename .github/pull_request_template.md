@@ -10,3 +10,4 @@
 
 - [ ] I read [CONTRIBUTING.md](https://github.com/jundot/omlx/blob/main/docs/CONTRIBUTING.md).
 - [ ] I understand every change in this PR and can explain it in review.
+- [ ] For UI or UX changes, I attached before and after screenshots.

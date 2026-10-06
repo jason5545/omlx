@@ -220,53 +220,60 @@ def _concat_state_batch(states):
     raise TypeError(f"Unsupported state type: {type(first)!r}")
 
 
-def _roll_state_tokens(state, shifts):
-    """Roll every per-token array of a state along the token axis (axis 2).
-
-    ``shifts`` is (B, 1): one right-shift per batch row, like the
-    ``dynamic_roll`` BatchKVCache.finalize applies to dense keys.
-    """
-    if state is None:
-        return None
-
-    def roll(array):
-        return dynamic_roll(array, shifts, axis=2)
-
-    if isinstance(state, TurboQuantMSEState):
-        return TurboQuantMSEState(roll(state.norms), roll(state.indices))
-    if isinstance(state, TurboQuantProdState):
-        return TurboQuantProdState(
-            roll(state.norms),
-            roll(state.mse_indices),
-            roll(state.residual_norms),
-            roll(state.qjl_signs),
-        )
-    if isinstance(state, TurboQuantPolarState):
-        return TurboQuantPolarState(
-            roll(state.radii),
-            tuple(roll(level) for level in state.level_indices),
-        )
-    if isinstance(state, TurboQuantPolarProdState):
-        return TurboQuantPolarProdState(
-            roll(state.norms),
-            _roll_state_tokens(state.polar_state, shifts),
-            roll(state.residual_norms),
-            roll(state.qjl_signs),
-        )
-    if isinstance(state, TurboQuantSplitState):
-        return TurboQuantSplitState(
-            _roll_state_tokens(state.low, shifts),
-            _roll_state_tokens(state.high, shifts),
-        )
-    raise TypeError(f"Unsupported state type: {type(state)!r}")
-
-
 def _pad_state_left(state, pad_length: int):
     """Prepend zeros along the token dimension (axis 2) of a state."""
     if state is None or pad_length <= 0:
         return state
     pad = _allocate_state_like(state, pad_length)
     return _concat_state(pad, state)
+
+
+def _roll_state_tokens(state, shifts, axis: int = 2):
+    """Roll a quantized state along its token axis by per-row ``shifts``.
+
+    Mirrors dynamic_roll's per-batch-row dynamic shift (same axis/shifts
+    convention as _slice_state/_concat_state above), applied directly to the
+    packed representation instead of dequantize -> roll -> requantize: roll
+    is pure reindexing along the token axis, so applying it independently to
+    every field that shares that axis (norms, packed indices, radii, ...)
+    preserves their per-token pairing exactly, with no fp16 materialization
+    and no re-rounding through the codec on the way back in.
+    """
+    if state is None:
+        return None
+    if isinstance(state, TurboQuantMSEState):
+        return TurboQuantMSEState(
+            dynamic_roll(state.norms, shifts, axis=axis),
+            dynamic_roll(state.indices, shifts, axis=axis),
+        )
+    if isinstance(state, TurboQuantProdState):
+        return TurboQuantProdState(
+            dynamic_roll(state.norms, shifts, axis=axis),
+            dynamic_roll(state.mse_indices, shifts, axis=axis),
+            dynamic_roll(state.residual_norms, shifts, axis=axis),
+            dynamic_roll(state.qjl_signs, shifts, axis=axis),
+        )
+    if isinstance(state, TurboQuantPolarState):
+        return TurboQuantPolarState(
+            dynamic_roll(state.radii, shifts, axis=axis),
+            tuple(
+                dynamic_roll(level, shifts, axis=axis)
+                for level in state.level_indices
+            ),
+        )
+    if isinstance(state, TurboQuantPolarProdState):
+        return TurboQuantPolarProdState(
+            dynamic_roll(state.norms, shifts, axis=axis),
+            _roll_state_tokens(state.polar_state, shifts, axis=axis),
+            dynamic_roll(state.residual_norms, shifts, axis=axis),
+            dynamic_roll(state.qjl_signs, shifts, axis=axis),
+        )
+    if isinstance(state, TurboQuantSplitState):
+        return TurboQuantSplitState(
+            _roll_state_tokens(state.low, shifts, axis=axis),
+            _roll_state_tokens(state.high, shifts, axis=axis),
+        )
+    raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
 
 
 def _empty_state_batch_like(state, batch_size: int):
@@ -435,14 +442,14 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             return
         padding = self._right_padding
         if self.keys is not None:
-            # Quantized states are per token, so rolling them equals the
-            # dequantize -> roll -> requantize round trip without a second
-            # quantization pass. Batched MTP rollback lands here on every
-            # ragged commit (mlx-vlm _trim_append_caches), where the round
-            # trip materialized the whole batch cache as float32 per layer.
-            ks, vs = self._attention_states()
-            self.keys = _roll_state_tokens(self._unwrap(ks), padding[:, None])
-            self.values = _roll_state_tokens(self._unwrap(vs), padding[:, None])
+            # Roll the already-quantized state directly with
+            # _roll_state_tokens, rather than dequantize -> dynamic_roll ->
+            # requantize: roll only reindexes along the token axis, so it is
+            # exact on the packed representation and skips fp16 materializing
+            # and the codec's re-rounding of an already-quantized value.
+            shifts = padding[:, None]
+            self.keys = _roll_state_tokens(self.keys, shifts, axis=2)
+            self.values = _roll_state_tokens(self.values, shifts, axis=2)
             self._cached_state = None
             self._cached_state_offset = -1
         self.offset -= (

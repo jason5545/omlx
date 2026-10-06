@@ -60,6 +60,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 from omlx._version import __version__
 
@@ -177,6 +178,7 @@ from .api.utils import (
     detect_and_strip_partial,
     extract_multimodal_content,
     extract_text_content,
+    find_lone_surrogate,
     has_nonleading_system_message,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
@@ -185,6 +187,7 @@ from .api.utils import (
 )
 from .engine import BaseEngine, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
+from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -535,6 +538,7 @@ def _apply_request_chat_template_overrides(
     merged_ct_kwargs["enable_thinking"] = enable_thinking
     if enable_thinking is False:
         merged_ct_kwargs.pop("preserve_thinking", None)
+        merged_ct_kwargs.pop("thinking_mode", None)
 
 
 def allows_unauthenticated_inference() -> bool:
@@ -1683,6 +1687,17 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
     if isinstance(engine, RerankerEngine):
         return "Use /v1/rerank for reranker models."
     return "Use the model's dedicated endpoint (see /v1/models)."
+
+
+def _reject_lone_surrogates(request: BaseModel) -> None:
+    # JSON allows lone surrogate escapes, but the tokenizer cannot encode them.
+    field = find_lone_surrogate(request.model_dump(exclude_none=True))
+    if field:
+        raise InvalidRequestError(
+            f"Invalid string in '{field}': unpaired UTF-16 surrogate "
+            "(text was likely truncated through an emoji)",
+            field=field,
+        )
 
 
 @dataclass
@@ -4017,11 +4032,11 @@ async def create_completion(
     _: bool = Depends(verify_inference_api_key),
 ):
     """Create a text completion."""
+    _reject_lone_surrogates(request)
     request_policy = _build_request_policy(
         http_request, request_user=getattr(request, "user", None)
     )
     _log_request_policy(request_policy, request.model)
-
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -4271,6 +4286,7 @@ async def create_chat_completion(
     }
     ```
     """
+    _reject_lone_surrogates(request)
     # Log incoming request summary at debug, message content at trace
     logger.debug(
         f"Chat completion request received: model={request.model}, "
@@ -4327,6 +4343,19 @@ async def create_chat_completion(
             ),
         )
         _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
+
+        # Auto-set enable_thinking in chat template kwargs when a positive thinking
+        # budget is active (from request or model settings).  Some chat
+        # templates (e.g. Gemma 4) explicitly suppress thinking unless this
+        # kwarg is True.  Set it before grammar compilation, which reads the
+        # thinking state to build the reasoning phase.
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
+            merged_ct_kwargs["enable_thinking"] = True
 
         # Extract messages - different engines need different content handling.
         # Templates that expose message.reasoning_content natively (Qwen 3.6+)
@@ -4562,17 +4591,6 @@ async def create_chat_completion(
         )
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
-
-        # Auto-set enable_thinking in chat template kwargs when a positive thinking
-        # budget is active (from request or model settings).  Some chat
-        # templates (e.g. Gemma 4) explicitly suppress thinking unless this
-        # kwarg is True.
-        if (
-            thinking_budget is not None
-            and thinking_budget > 0
-            and "enable_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs
@@ -5020,6 +5038,51 @@ def _patch_output_format(tag_dict: dict, user_grammar: dict) -> bool:
     return False
 
 
+def _minimax_m3_reasoning_mode(chat_template_kwargs: dict) -> str:
+    """Return the xgrammar reasoning mode that matches the M3 generation prompt.
+
+    Uses the same precedence as the M3 ``thinking_mode`` translator. The
+    template renders a missing or unknown mode as adaptive, which leaves no
+    ``<mm:think>`` opener in the prompt; xgrammar calls that mode "auto".
+    """
+    if "thinking_mode" in chat_template_kwargs:
+        mode = chat_template_kwargs["thinking_mode"]
+    elif chat_template_kwargs.get("enable_thinking") is True:
+        mode = "enabled"
+    elif chat_template_kwargs.get("enable_thinking") is False:
+        mode = "disabled"
+    else:
+        mode = None
+    return mode if mode in ("enabled", "disabled") else "auto"
+
+
+def _allow_reasoning_opener(tag_dict: dict) -> None:
+    """Let an already-open reasoning block start with its own opener.
+
+    The grammar is compiled before the prompt is rendered, so the opener may be
+    in the prompt (Qwen3.5) or left to the model (Qwen3). xgrammar 0.2.8
+    excludes it from the reasoning body, which masks the model's first token in
+    the second case.
+    """
+    fmt = tag_dict.get("format", tag_dict)
+    if fmt.get("type") != "sequence" or not fmt.get("elements"):
+        return
+    prefix = fmt["elements"][0]
+    if prefix.get("type") == "sequence" and prefix.get("elements"):
+        prefix = prefix["elements"][0]
+    end = prefix.get("end", "")
+    if (
+        prefix.get("type") != "tag"
+        or prefix.get("begin") != ""
+        or not end.startswith("</")
+    ):
+        return
+    opener = "<" + end[2:]
+    content = prefix.get("content") or {}
+    if opener in (content.get("excludes") or []):
+        content["excludes"] = [x for x in content["excludes"] if x != opener]
+
+
 def _compile_with_structural_tag(
     compiler, fmt: dict, reasoning_parser: str, chat_template_kwargs: dict | None
 ):
@@ -5034,21 +5097,27 @@ def _compile_with_structural_tag(
     _install_torch_stub()
     import xgrammar as xgr
 
-    reasoning = not (
-        chat_template_kwargs and chat_template_kwargs.get("enable_thinking") is False
-    )
+    ct_kwargs = chat_template_kwargs or {}
+    if reasoning_parser == "minimax_m3":
+        reasoning = _minimax_m3_reasoning_mode(ct_kwargs)
+    else:
+        reasoning = ct_kwargs.get("enable_thinking") is not False
     tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
     tag_dict = tag.model_dump()
+    _allow_reasoning_opener(tag_dict)
+    # Compiling the tag without the user grammar would leave the answer
+    # unconstrained, so fail and let the caller report it.
     if not _patch_output_format(tag_dict, fmt):
-        logger.warning(
-            "Could not patch output format for reasoning_parser=%s, "
-            "compiling structural tag as-is",
-            reasoning_parser,
+        raise ValueError(
+            f"reasoning_parser={reasoning_parser!r} has no output slot for "
+            "the requested format"
         )
     from .api.grammar import mark_grammar_thinking_phase
 
     return mark_grammar_thinking_phase(
-        compiler.compile_structural_tag(tag_dict), enabled=reasoning
+        compiler.compile_structural_tag(tag_dict),
+        enabled=reasoning not in (False, "disabled"),
+        optional=reasoning == "auto",
     )
 
 
@@ -6757,6 +6826,7 @@ async def create_anthropic_message(
 
     Streaming is supported with `stream: true`.
     """
+    _reject_lone_surrogates(request)
     logger.debug(
         f"Anthropic Messages request: model={request.model}, "
         f"messages={len(request.messages)}, stream={request.stream}, "
@@ -6791,6 +6861,7 @@ async def create_anthropic_message(
             request.chat_template_kwargs,
         )
         forced_keys = forced_ct_keys(ms)
+        _entry = get_engine_pool().get_entry(resolved_model)
 
         # Pass Anthropic thinking config to chat template (except forced keys)
         if hasattr(request, "thinking") and request.thinking:
@@ -6800,9 +6871,15 @@ async def create_anthropic_message(
                     merged_ct_kwargs["enable_thinking"] = True
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
+                # MiniMax M3 templates have a separate adaptive thinking_mode.
+                if (
+                    thinking_type == "adaptive"
+                    and "thinking_mode" not in forced_keys
+                    and getattr(_entry, "config_model_type", None)
+                    in MINIMAX_M3_MODEL_TYPES
+                ):
+                    merged_ct_kwargs.setdefault("thinking_mode", "adaptive")
         _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
-
-        _entry = get_engine_pool().get_entry(resolved_model)
 
         logger.debug(
             f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
@@ -7169,6 +7246,7 @@ async def count_anthropic_tokens(
 
     This is compatible with Anthropic's token counting API.
     """
+    _reject_lone_surrogates(request)
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -7289,6 +7367,7 @@ async def create_response(
     _: bool = Depends(verify_inference_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
+    _reject_lone_surrogates(request)
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -7373,6 +7452,16 @@ async def create_response(
             ),
         )
         _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
+
+        # Auto-set enable_thinking when a positive thinking budget is active.
+        # Set it before grammar compilation, which reads the thinking state.
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
+            merged_ct_kwargs["enable_thinking"] = True
 
         _entry = get_engine_pool().get_entry(resolved_model)
 
@@ -7536,14 +7625,6 @@ async def create_response(
         )
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
-
-        # Auto-set enable_thinking when a positive thinking budget is active.
-        if (
-            thinking_budget is not None
-            and thinking_budget > 0
-            and "enable_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Gated on detection so other templates don't
@@ -7860,8 +7941,8 @@ async def stream_responses_api(
         output=[],
         tools=request.tools or [],
         tool_choice=request.tool_choice or "auto",
-        temperature=request.temperature,
-        top_p=request.top_p,
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
         max_output_tokens=request.max_output_tokens,
         previous_response_id=request.previous_response_id,
     )
@@ -8554,8 +8635,8 @@ async def stream_responses_api(
             if request.tools
             else []
         ),
-        "temperature": request.temperature,
-        "top_p": request.top_p,
+        "temperature": kwargs.get("temperature"),
+        "top_p": kwargs.get("top_p"),
         "max_output_tokens": request.max_output_tokens,
     }
     if truncated:
