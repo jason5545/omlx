@@ -2316,9 +2316,10 @@ def test_ple_host_window_falls_back_when_the_cache_slot_is_replaced(tmp_path):
 
 
 def test_disk_backed_ple_advises_every_shard_tensor_of_a_small_gather(tmp_path, monkeypatch):
-    """Weight, scales and biases of every touched shard are advised before any row is copied."""
+    """Per-shard path: weight, scales and biases of every touched shard are advised before any copy."""
     from mlx_vlm.models.qwen4_exp import language
 
+    monkeypatch.setattr(language, "_PLE_FAST_GATHER", False)
     embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=5)
     prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
     events = []
@@ -2353,6 +2354,132 @@ def test_disk_backed_ple_advises_every_shard_tensor_of_a_small_gather(tmp_path, 
         assert all(event[0] == "copy" for event in events)
     finally:
         embedding.close()
+
+
+def test_disk_backed_ple_fast_gather_advises_all_pages_before_copying(tmp_path, monkeypatch):
+    """Fast path: every page of every family is advised before the first byte gather."""
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, table = _disk_ple_files(tmp_path, shards=4, rows=8, dims=64, bits=[5, 5, 5, 5], files=2)
+    events = []
+    advise_pages, bytes_at = language._SafeTensorMMap.advise_pages, language._SafeTensorMMap.bytes_at
+
+    def record_pages(self, pages):
+        events.append(("advise", self.path.name, set(np.asarray(pages).tolist())))
+        return advise_pages(self, pages)
+
+    def record_bytes(self, offsets):
+        events.append(("copy", self.path.name, offsets))
+        return bytes_at(self, offsets)
+
+    monkeypatch.setattr(language._SafeTensorMMap, "advise_pages", record_pages)
+    monkeypatch.setattr(language._SafeTensorMMap, "bytes_at", record_bytes)
+    try:
+        indices = mx.array([[3, 17, 5, 30, 9]], dtype=mx.int32)
+        values = embedding(indices)
+        assert mx.array_equal(values, mx.take(table, indices.reshape(-1), axis=0)[None]).item()
+        first_copy = next(index for index, event in enumerate(events) if event[0] == "copy")
+        assert all(event[0] == "advise" for event in events[:first_copy])
+        assert all(event[0] == "copy" for event in events[first_copy:])
+        advised = {}
+        for _, name, pages in events[:first_copy]:
+            advised.setdefault(name, set()).update(pages)
+        for _, name, offsets in events[first_copy:]:
+            assert set((np.asarray(offsets) // language._PLE_PAGE_SIZE).reshape(-1).tolist()) <= advised[name]
+    finally:
+        embedding.close()
+
+
+@pytest.mark.parametrize("bits", [None, 4, 5])
+def test_disk_backed_ple_fast_gather_matches_per_shard_copy(tmp_path, monkeypatch, bits):
+    """The per-file byte gather returns the per-shard copy bit for bit, across files and duplicates."""
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, table = _disk_ple_files(tmp_path, shards=5, rows=8, dims=64, bits=[bits] * 5, files=3)
+    assert embedding._fast_layout() is not None
+    rng = np.random.default_rng(9)
+    try:
+        for trial in range(20):
+            host = rng.integers(0, 40, size=(1, int(rng.integers(1, 60)))).astype(np.int64)
+            host[0, 0] = 39 if trial % 2 else 0
+            if trial % 3 == 0:
+                host[0, 1:] = host[0, 0]
+            monkeypatch.setattr(language, "_PLE_FAST_GATHER", True)
+            fast = embedding.gather_host(host)
+            fast_stats = (embedding.rows_read, embedding.last_touched_shards, embedding.last_uploads)
+            monkeypatch.setattr(language, "_PLE_FAST_GATHER", False)
+            slow = embedding.gather_host(host)
+            slow_stats = (embedding.rows_read, embedding.last_touched_shards, embedding.last_uploads)
+            mx.eval(fast, slow)
+            assert fast.dtype == slow.dtype == mx.bfloat16
+            assert mx.array_equal(fast, slow).item()
+            assert mx.array_equal(fast, mx.take(table, mx.array(host.reshape(-1)), axis=0).reshape(*host.shape, 64)).item()
+            assert fast_stats == slow_stats
+    finally:
+        embedding.close()
+
+
+def test_disk_backed_ple_fast_gather_falls_back_on_mixed_layouts(tmp_path, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, table = _disk_ple_files(tmp_path, shards=3, rows=8, dims=64, bits=[4, 5, 4], files=1)
+    monkeypatch.setattr(
+        embedding, "_gather_fast", MagicMock(side_effect=AssertionError("mixed layout took the fast path"))
+    )
+    try:
+        assert embedding._fast_layout() is None
+        indices = mx.array([[1, 9, 17]], dtype=mx.int32)
+        assert mx.array_equal(embedding(indices), mx.take(table, indices.reshape(-1), axis=0)[None]).item()
+    finally:
+        embedding.close()
+
+
+def test_disk_backed_ple_large_gathers_keep_the_per_shard_copy(tmp_path, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import language
+
+    embedding, table = _disk_ple_files(tmp_path, shards=3, rows=8, dims=64, bits=[5, 5, 5], files=1)
+    monkeypatch.setattr(language, "_PLE_ADVISE_MAX_ROWS", 4)
+    monkeypatch.setattr(
+        embedding, "_gather_fast", MagicMock(side_effect=AssertionError("large gather took the fast path"))
+    )
+    try:
+        indices = mx.array([[1, 9, 17, 2, 3]], dtype=mx.int32)
+        assert mx.array_equal(embedding(indices), mx.take(table, indices.reshape(-1), axis=0)[None]).item()
+    finally:
+        embedding.close()
+
+
+def _disk_ple_files(tmp_path, *, shards, rows, dims, bits, files):
+    """``_disk_ple`` with per-shard bits (None = dense bf16) and shards spread over ``files`` safetensors files."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
+
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    per_file = [dict() for _ in range(files)]
+    dense_rows = []
+    mx.random.seed(21)
+    for shard_index in range(shards):
+        dense = (mx.random.normal((rows, dims)) * (shard_index + 1)).astype(mx.bfloat16)
+        base = f"{prefix}.shard_{shard_index}"
+        target = per_file[shard_index % files]
+        if bits[shard_index] is None:
+            target[f"{base}.weight"] = dense
+            dense_rows.append(dense)
+        else:
+            weight, scales, biases = mx.quantize(dense, group_size=32, bits=bits[shard_index], mode="affine")
+            target[f"{base}.weight"], target[f"{base}.scales"], target[f"{base}.biases"] = weight, scales, biases
+            dense_rows.append(
+                mx.dequantize(weight, scales, biases, group_size=32, bits=bits[shard_index], mode="affine").astype(mx.bfloat16)
+            )
+    weight_map = {}
+    for index, tensors in enumerate(per_file):
+        filename = f"model-{index + 1:05d}-of-{files:05d}.safetensors"
+        mx.eval(*tensors.values())
+        mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+        weight_map.update({key: filename for key in tensors})
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
+    table = mx.concatenate(dense_rows)
+    return DiskBackedShardedEmbedding(tmp_path, prefix, num_embeddings=shards * rows, dims=dims, num_shards=shards), table
 
 
 def test_ple_advise_rows_covers_straddling_pages(disk_ple_reader):

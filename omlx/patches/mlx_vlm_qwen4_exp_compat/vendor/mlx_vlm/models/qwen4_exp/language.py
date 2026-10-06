@@ -2761,6 +2761,14 @@ _PLE_REARM_MIN_INTERVAL_SECONDS = 60.0
 # ms. Prefill chunks keep the pool prefetch. OMLX_QWEN4_PLE_ADVISE=0 disables.
 _PLE_ADVISE = os.environ.get("OMLX_QWEN4_PLE_ADVISE", "1").strip() != "0"
 _PLE_ADVISE_MAX_ROWS = 1024
+# The per-shard loop then cost more host time than the reads: a 4-row verify
+# window touches ~57 of 128 shards, three tensors each, and every one went
+# through its own Python call and small numpy ops (0.75 ms warm, 2.7 ms with
+# cold pages, on the critical path after the drafts arrive). Gathers of up to
+# _PLE_ADVISE_MAX_ROWS rows instead copy each tensor family with one byte
+# gather per checkpoint file (9 files for Flash-Next), from a layout computed
+# once. OMLX_QWEN4_PLE_FAST_GATHER=0 keeps the per-shard copy.
+_PLE_FAST_GATHER = os.environ.get("OMLX_QWEN4_PLE_FAST_GATHER", "1").strip() != "0"
 # Hash the n-gram rows of an SSD-backed table on the host from the token ids
 # rather than in an MLX graph evaluated in the middle of the forward, which
 # cost a GPU round trip per step. OMLX_QWEN4_PLE_HOST_INDICES=0 disables.
@@ -2875,28 +2883,32 @@ class _SafeTensorMMap:
     def advise_rows(self, key: str, rows) -> None:
         """Start the kernel reading the pages of ``rows`` (MADV_WILLNEED) without waiting."""
         self._require_owner()
-        advice = getattr(mmap, "MADV_WILLNEED", None)
         row_indices = np.asarray(rows, dtype=np.int64)
-        if advice is None or row_indices.size == 0:
+        entry = self._header[key]
+        item_size = _PLE_ITEM_SIZES.get(entry["dtype"])
+        if row_indices.size == 0 or item_size is None or len(entry["shape"]) != 2:
             return
-        with self._resource_lock:
-            if self._mapping is None:
-                return
-            entry = self._header[key]
-            item_size = _PLE_ITEM_SIZES.get(entry["dtype"])
-            if item_size is None or len(entry["shape"]) != 2:
-                return
-            row_bytes = int(entry["shape"][1]) * item_size
-            offsets = (
-                self._data_start + entry["data_offsets"][0] + row_indices * row_bytes
-            )
-            pages = np.unique(
+        row_bytes = int(entry["shape"][1]) * item_size
+        offsets = self._data_start + entry["data_offsets"][0] + row_indices * row_bytes
+        self.advise_pages(
+            np.unique(
                 np.concatenate(
                     (offsets // _PLE_PAGE_SIZE, (offsets + row_bytes - 1) // _PLE_PAGE_SIZE)
                 )
             )
+        )
+
+    def advise_pages(self, pages) -> None:
+        """MADV_WILLNEED the given ascending file pages without waiting for them."""
+        self._require_owner()
+        advice = getattr(mmap, "MADV_WILLNEED", None)
+        if advice is None:
+            return
+        with self._resource_lock:
+            if self._mapping is None:
+                return
             size = len(self._mapping)
-            for page in pages.tolist():
+            for page in np.asarray(pages).tolist():
                 start = page * _PLE_PAGE_SIZE
                 if start >= size:
                     break
@@ -2904,6 +2916,18 @@ class _SafeTensorMMap:
                     self._mapping.madvise(advice, start, min(_PLE_PAGE_SIZE, size - start))
                 except (OSError, ValueError):
                     return
+
+    def bytes_at(self, offsets: np.ndarray) -> np.ndarray:
+        """The mapping's bytes at absolute file ``offsets`` (any shape), copied out."""
+        self._require_owner()
+        with self._resource_lock:
+            if self._mapping is None or self._file is None:
+                raise RuntimeError("SSD-backed Qwen4 PLE reader is closed")
+            view = np.frombuffer(self._mapping, dtype=np.uint8)
+            try:
+                return view[offsets]
+            finally:
+                del view
 
     def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
         """Prefetch unmarked pages; return whether all were already marked."""
@@ -3197,6 +3221,91 @@ class DiskBackedShardedEmbedding(nn.Module):
                 buffer[positions] = copied
         return buffers
 
+    def _fast_layout(self):
+        """Byte layout of every shard tensor, per family; None when shards differ in layout.
+
+        Computed once: (families, readers, [(reader index per shard, absolute
+        byte offset per shard, row bytes, numpy dtype, safetensors dtype)], bits,
+        group size).
+        """
+        cached = getattr(self, "_fast_layout_cache", None)
+        if cached is not None:
+            return cached or None
+        specs = [self._shard_specs[index] for index in range(len(self.shard_sizes))]
+        bits, group_size = specs[0][3], specs[0][4]
+        families = [0] if bits is None else [0, 1, 2]
+        numpy_dtypes = {"BF16": "<u2", "F16": "<f2", "F32": "<f4", "U32": "<u4", "F8_E4M3": "u1"}
+        readers: list[_SafeTensorMMap] = []
+        reader_index: dict[int, int] = {}
+        per_family = []
+        layout = None
+        if all(spec[3:] == (bits, group_size) for spec in specs):
+            layout = (families, readers, per_family, bits, group_size)
+            for family in families:
+                reader_of = np.empty(len(specs), dtype=np.int64)
+                base = np.empty(len(specs), dtype=np.int64)
+                row_bytes = dtype = None
+                for shard_index, spec in enumerate(specs):
+                    key = spec[family]
+                    reader = self._tensor_readers[key]
+                    entry = reader._header[key]
+                    item_size = _PLE_ITEM_SIZES.get(entry["dtype"])
+                    shape = tuple(entry["shape"])
+                    start, end = entry["data_offsets"]
+                    if (
+                        item_size is None
+                        or len(shape) != 2
+                        or end - start != math.prod(shape) * item_size
+                        or (row_bytes is not None and (shape[1] * item_size, entry["dtype"]) != (row_bytes, dtype))
+                    ):
+                        layout = None
+                        break
+                    row_bytes, dtype = shape[1] * item_size, entry["dtype"]
+                    if id(reader) not in reader_index:
+                        reader_index[id(reader)] = len(readers)
+                        readers.append(reader)
+                    reader_of[shard_index] = reader_index[id(reader)]
+                    base[shard_index] = reader._data_start + start
+                if layout is None:
+                    break
+                per_family.append((reader_of, base, row_bytes, np.dtype(numpy_dtypes[dtype]), dtype))
+        object.__setattr__(self, "_fast_layout_cache", layout or False)
+        return layout
+
+    def _gather_fast(self, host: np.ndarray, layout):
+        """``_plan`` + ``_assemble`` for a small gather, one byte gather per file and family."""
+        families, readers, per_family, bits, group_size = layout
+        offsets = np.asarray(self.shard_offsets, dtype=np.int64)
+        shard = np.searchsorted(offsets, host, side="right") - 1
+        local = host - offsets[shard]
+        jobs = []
+        for family, (reader_of, base, row_bytes, np_dtype, dtype) in zip(families, per_family):
+            jobs.append((family, reader_of[shard], base[shard] + local * row_bytes, row_bytes, np_dtype, dtype))
+        involved = np.unique(np.concatenate([job[1] for job in jobs])).tolist()
+        if _PLE_ADVISE:
+            # Every page of the gather is advised before any is copied, so the
+            # reads of all files and families overlap.
+            for index in involved:
+                spans = []
+                for _, reader_rows, starts, row_bytes, _, _ in jobs:
+                    mine = starts[reader_rows == index]
+                    spans.append(mine // _PLE_PAGE_SIZE)
+                    spans.append((mine + row_bytes - 1) // _PLE_PAGE_SIZE)
+                readers[index].advise_pages(np.unique(np.concatenate(spans)))
+        buffers: dict[int, np.ndarray] = {}
+        dtypes = {}
+        for family, reader_rows, starts, row_bytes, np_dtype, dtype in jobs:
+            out = np.empty((host.size, row_bytes), dtype=np.uint8)
+            columns = np.arange(row_bytes, dtype=np.int64)
+            for index in involved:
+                positions = np.flatnonzero(reader_rows == index)
+                if positions.size:
+                    out[positions] = readers[index].bytes_at(starts[positions, None] + columns)
+            buffers[family] = out.view(np_dtype)
+            dtypes[family] = dtype
+        touched = np.unique(shard).tolist()
+        return buffers, (shard, local, touched, None, families, dtypes, bits, group_size)
+
     def _require_owner(self):
         _ple_require_owner(self._owner_pid)
 
@@ -3263,10 +3372,18 @@ class DiskBackedShardedEmbedding(nn.Module):
             self.last_prefetch_hit = True
         else:
             self.last_prefetch_hit = False
-            plan = self._plan(host)
-            if plan is None:
-                return self._gather_per_shard([int(index) for index in host], shape)
-            buffers = self._assemble(host, plan)
+            layout = (
+                self._fast_layout()
+                if _PLE_FAST_GATHER and host.size <= _PLE_ADVISE_MAX_ROWS
+                else None
+            )
+            if layout is not None:
+                buffers, plan = self._gather_fast(host, layout)
+            else:
+                plan = self._plan(host)
+                if plan is None:
+                    return self._gather_per_shard([int(index) for index in host], shape)
+                buffers = self._assemble(host, plan)
         _, _, touched, _, families, dtypes, bits, group_size = plan
         self.last_touched_shards = tuple(touched)
         self.rows_read = int(host.size)
