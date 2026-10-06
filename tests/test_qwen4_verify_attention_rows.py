@@ -289,3 +289,76 @@ def test_dense_verify_rows_equal_serial_decode_steps(context, rows):
         assert _bit_equal(verified, serial)
         for got, want in zip(verified_state, serial_state):
             assert _bit_equal(got, want)
+
+
+def _rank_two(start: int, length: int) -> mx.array:
+    return mx.arange(start, start + length, dtype=mx.int32)[None]
+
+
+def _bank_session(attn, context, positions):
+    """Serial decode, a verify window, a rollback across a block boundary and more decode."""
+    cache = _prefill(attn, context, seed=4)
+    outputs = []
+    mx.random.seed(40)
+    for _ in range(3):
+        x = (mx.random.normal((1, 1, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+        outputs.append(attn(x, mask=None, cache=cache, position_ids=positions(cache.offset, 1)))
+        mx.eval(outputs[-1])
+    for rows, rejected in ((4, 3), (3, 1)):
+        window = (mx.random.normal((1, rows, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+        try:
+            outputs.append(
+                attn(window, mask="causal", cache=cache, position_ids=positions(cache.offset, rows), target_verify=True)
+            )
+            mx.eval(outputs[-1])
+        finally:
+            qwen35_verify_qmm.set_verify_qmm_armed(False)
+        cache.trim(rejected)
+        x = (mx.random.normal((1, 1, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+        outputs.append(attn(x, mask=None, cache=cache, position_ids=positions(cache.offset, 1)))
+        mx.eval(outputs[-1])
+    return outputs, _state(cache), cache
+
+
+@pytest.mark.parametrize("rank_two", [False, True])
+@pytest.mark.parametrize("context", [2061, 24001])
+def test_float32_pooled_bank_keeps_every_row_bit_identical(monkeypatch, rank_two, context):
+    """Scoring against the cache's float32 bank changes no output or cache state."""
+    attn = _attention(seed=13)
+    positions = _rank_two if rank_two else _positions
+    monkeypatch.setattr(language, "_QSA_F32_BANK", False)
+    want, want_state, _ = _bank_session(attn, context, positions)
+    monkeypatch.setattr(language, "_QSA_F32_BANK", True)
+    got, got_state, cache = _bank_session(attn, context, positions)
+    assert len(got) == len(want)
+    for a, b in zip(got, want):
+        assert _bit_equal(a, b)
+    for a, b in zip(got_state, want_state):
+        assert _bit_equal(a, b)
+    bank = cache.pooled_indexer_keys(
+        attn.indexer.compress_ratio, attn.indexer.k_layernorm, attn.indexer._apply_rope, cache_tag=attn.indexer
+    )
+    mirror = cache.pooled_indexer_keys_f32(
+        attn.indexer.compress_ratio, attn.indexer.k_layernorm, attn.indexer._apply_rope, cache_tag=attn.indexer
+    )
+    assert mirror.dtype == mx.float32 and mirror.shape == bank.shape
+    assert _bit_equal(mirror, bank.astype(mx.float32))
+
+
+def test_float32_pooled_bank_follows_trim_and_regrowth():
+    """After a trim drops completed blocks and new tokens re-pool them, the mirror holds the new values."""
+    attn = _attention(seed=17)
+    cache = _prefill(attn, 4100, seed=18)
+    indexer = attn.indexer
+    args = (indexer.compress_ratio, indexer.k_layernorm, indexer._apply_rope)
+    first = cache.pooled_indexer_keys_f32(*args, cache_tag=indexer)
+    mx.eval(first)
+    cache.trim(9)  # drops two completed blocks
+    mx.random.seed(19)
+    x = (mx.random.normal((1, 9, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+    mx.eval(attn(x, mask="causal", cache=cache, position_ids=_positions(cache.offset, 9)))
+    bank = cache.pooled_indexer_keys(*args, cache_tag=indexer)
+    mirror = cache.pooled_indexer_keys_f32(*args, cache_tag=indexer)
+    assert _bit_equal(mirror, bank.astype(mx.float32))
+    assert not _bit_equal(mirror[:, -2:], first[:, -2:])

@@ -738,6 +738,9 @@ def _portable_indexer_head_scores(
     """FP32 query-head/block products ``[B, T, H, blocks]``."""
 
     batch, query_tokens, query_heads, _ = queries.shape
+    # A float32 bank (the cache's converted copy) is used as is; converting a
+    # bf16 bank here costs more than the GEMM at long context.
+    keys = pooled_keys if pooled_keys.dtype == mx.float32 else pooled_keys.astype(mx.float32)
     # Flatten the query-token and index-head axes so MLX emits one FP32 GEMM
     # for the chunk instead of a broadcasted batch of tiny matmuls.  Each
     # output dot product and the following head reduction are unchanged.
@@ -745,7 +748,7 @@ def _portable_indexer_head_scores(
         queries.astype(mx.float32).reshape(
             batch, query_tokens * query_heads, head_dim
         )
-        @ pooled_keys.astype(mx.float32).swapaxes(-1, -2)
+        @ keys.swapaxes(-1, -2)
     ).reshape(batch, query_tokens, query_heads, pooled_keys.shape[1])
 
 
@@ -1087,8 +1090,12 @@ def contiguous_causal_gathered_qsa_decode(
     indexer_head_dim: int,
     compress_ratio: int,
     token_budget: int,
+    pooled_index_keys_f32: mx.array | None = None,
 ) -> mx.array:
     """Run exact batch-one QSA decode over only the selected K/V rows.
+
+    ``pooled_index_keys_f32``, when given, is the same bank already converted
+    to float32 (exact); the FP32 block scores then skip the per-call cast.
 
     This is the singleton counterpart to :func:`contiguous_causal_gathered_qsa`.
     The query is the final visible token, so every completed compressed block
@@ -1130,6 +1137,11 @@ def contiguous_causal_gathered_qsa_decode(
         raise ValueError("gathered QSA decode requires a sparse block crossover")
     if pooled_index_keys.shape != (1, max_blocks, indexer_head_dim):
         raise ValueError("QSA decode pooled index-key cache has the wrong shape")
+    if pooled_index_keys_f32 is not None and (
+        pooled_index_keys_f32.shape != pooled_index_keys.shape
+        or pooled_index_keys_f32.dtype != mx.float32
+    ):
+        raise ValueError("QSA decode float32 bank does not match the pooled bank")
 
     block_scores = _native_indexer_scores(
         index_queries,
@@ -1142,7 +1154,7 @@ def contiguous_causal_gathered_qsa_decode(
     if block_scores is None:
         head_scores = _portable_indexer_head_scores(
             index_queries,
-            pooled_index_keys,
+            pooled_index_keys if pooled_index_keys_f32 is None else pooled_index_keys_f32,
             indexer_head_dim,
         )
         if index_queries.shape[1] < _native_topk_min_rows():

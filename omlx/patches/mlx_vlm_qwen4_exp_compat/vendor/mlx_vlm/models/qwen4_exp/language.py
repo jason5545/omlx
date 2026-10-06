@@ -419,6 +419,47 @@ class _QSAIndexerCache:
         self._pooled_index_offset = 0
         self._pooled_index_ratio = None
         self._pooled_index_tag = None
+        self._pooled_index_keys_f32 = None
+        self._pooled_f32_offset = 0
+
+    def pooled_indexer_keys_f32(
+        self,
+        compress_ratio: int,
+        index_key_norm,
+        apply_index_rope,
+        *,
+        cache_tag=None,
+    ) -> mx.array:
+        """The completed block bank in float32, converting only its new suffix.
+
+        Decode and verify rows score every block in FP32; converting the whole
+        bf16 bank per row per layer moved ~28 MB at 89k context (0.17 ms of a
+        0.18 ms row). bf16 -> fp32 is exact, so the cached copy holds the very
+        values the per-call ``astype`` produced. It follows the bf16 bank's
+        offset: invalidated with it, clipped with it on trim.
+        """
+
+        bank = self.pooled_indexer_keys(
+            compress_ratio, index_key_norm, apply_index_rope, cache_tag=cache_tag
+        )
+        blocks = int(bank.shape[1])
+        mirror = getattr(self, "_pooled_index_keys_f32", None)
+        start = min(getattr(self, "_pooled_f32_offset", 0), blocks)
+        if mirror is None or int(mirror.shape[1]) < blocks:
+            capacity = (
+                int(self._pooled_index_keys.shape[1])
+                if self._pooled_index_keys is not None
+                else blocks
+            )
+            grown = mx.zeros((bank.shape[0], max(capacity, blocks), bank.shape[-1]), dtype=mx.float32)
+            if mirror is not None and start:
+                grown[:, :start] = mirror[:, :start]
+            mirror = grown
+            self._pooled_index_keys_f32 = mirror
+        if start < blocks:
+            mirror[:, start:blocks] = bank[:, start:blocks].astype(mx.float32)
+        self._pooled_f32_offset = blocks
+        return mirror[:, :blocks]
 
     def pooled_indexer_keys(
         self,
@@ -494,6 +535,9 @@ class _QSAIndexerCache:
                 self._pooled_index_offset,
                 self._index_offset // self._pooled_index_ratio,
             )
+            self._pooled_f32_offset = min(
+                getattr(self, "_pooled_f32_offset", 0), self._pooled_index_offset
+            )
         else:
             self._invalidate_pooled_indexer()
 
@@ -504,6 +548,7 @@ class _QSAIndexerCache:
             self._index_keys,
             self._index_position_ids,
             self._pooled_index_keys,
+            getattr(self, "_pooled_index_keys_f32", None),
         ):
             if array is not None:
                 size += array.nbytes
@@ -1098,6 +1143,23 @@ def _eager_dispatch_every() -> int:
 
 _EAGER_DISPATCH_EVERY = _eager_dispatch_every()
 _EAGER_DISPATCH_WARMUP = 6
+# Decode and verify rows score blocks against the cache's float32 copy of the
+# pooled bank (exact, kept incrementally) rather than casting the whole bf16
+# bank per row per layer: 0.17 -> 0.014 ms per row per layer at 89k context,
+# 0.48 -> 0.028 ms at 160k, same bits. OMLX_QWEN4_QSA_F32_BANK=0 casts per call.
+_QSA_F32_BANK = os.environ.get("OMLX_QWEN4_QSA_F32_BANK", "1").strip() != "0"
+
+
+def _pooled_bank_f32(cache, indexer):
+    """The cache's float32 pooled bank for ``indexer``, or None to cast per call."""
+    if not _QSA_F32_BANK or not hasattr(cache, "pooled_indexer_keys_f32"):
+        return None
+    return cache.pooled_indexer_keys_f32(
+        indexer.compress_ratio,
+        indexer.k_layernorm,
+        indexer._apply_rope,
+        cache_tag=indexer,
+    )
 # Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
 _GATHERED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_GATHERED_VERIFY")
 # Row-exact Lightning MTP verify rows on the masked QSA arm score and select
@@ -1362,7 +1424,10 @@ class Qwen4ExpQSAIndexer(nn.Module):
             return None
 
         query = self._apply_rope(query, position_ids)
-        if cache is not None and hasattr(cache, "pooled_indexer_keys"):
+        pooled_f32 = _pooled_bank_f32(cache, self) if cache is not None else None
+        if pooled_f32 is not None:
+            pooled_keys = pooled_f32
+        elif cache is not None and hasattr(cache, "pooled_indexer_keys"):
             pooled_keys = cache.pooled_indexer_keys(
                 self.compress_ratio,
                 self.k_layernorm,
@@ -1381,9 +1446,9 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
         # Score in float32, as the reference does: which blocks win is a discrete
         # choice, and rounding the products flips the ones near the cut-off.
-        scores = query.astype(mx.float32) @ pooled_keys.astype(mx.float32).transpose(
-            0, 1, 3, 2
-        )
+        if pooled_keys.dtype != mx.float32:
+            pooled_keys = pooled_keys.astype(mx.float32)
+        scores = query.astype(mx.float32) @ pooled_keys.transpose(0, 1, 3, 2)
         if batch == 1 and seq_len == 1 and past_len == key_len - 1:
             return self.aligned_row_mask(scores, key_len)
         return self._selection_mask(scores, past_len, key_len, max_complete_blocks)
@@ -1804,6 +1869,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             indexer_head_dim=self.indexer.head_dim,
             compress_ratio=self.indexer.compress_ratio,
             token_budget=self.indexer.token_budget,
+            pooled_index_keys_f32=_pooled_bank_f32(cache, self.indexer),
         )
         output = output.reshape(batch, length, -1)
         return self.o_proj(output * mx.sigmoid(gate))
@@ -1935,6 +2001,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                     indexer_head_dim=self.indexer.head_dim,
                     compress_ratio=self.indexer.compress_ratio,
                     token_budget=self.indexer.token_budget,
+                    pooled_index_keys_f32=_pooled_bank_f32(cache, self.indexer),
                 )
             else:
                 output = q35_language.scaled_dot_product_attention(
@@ -2032,15 +2099,19 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         )
         cache.update_indexer(projected[:, :, indexer.n_heads :].squeeze(2), index_positions)
         index_queries = indexer._apply_rope(index_queries, index_positions)
-        pooled_keys = mx.expand_dims(
-            cache.pooled_indexer_keys(
-                indexer.compress_ratio,
-                indexer.k_layernorm,
-                indexer._apply_rope,
-                cache_tag=indexer,
-            ),
-            axis=1,
-        ).astype(mx.float32)
+        pooled_f32 = _pooled_bank_f32(cache, indexer)
+        if pooled_f32 is not None:
+            pooled_keys = mx.expand_dims(pooled_f32, axis=1)
+        else:
+            pooled_keys = mx.expand_dims(
+                cache.pooled_indexer_keys(
+                    indexer.compress_ratio,
+                    indexer.k_layernorm,
+                    indexer._apply_rope,
+                    cache_tag=indexer,
+                ),
+                axis=1,
+            ).astype(mx.float32)
 
         if fused:
             values = v_out.reshape(batch, length, self.num_key_value_heads, -1).transpose(
