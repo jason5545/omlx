@@ -291,7 +291,7 @@ def test_qwen4_decode_gather_eligibility_fails_closed_for_general_paths():
     )
 
 
-@pytest.mark.parametrize("key_tokens", [4097, 32769])
+@pytest.mark.parametrize("key_tokens", [4097, 32769, 131077])
 def test_qwen4_decode_gather_stays_budget_bounded_at_long_cache(
     monkeypatch,
     key_tokens,
@@ -929,6 +929,8 @@ def _require_selection(result):
         24003,  # 24K decode
         32768,  # 8192 blocks: largest bank held 8 per thread
         32773,  # 8193 blocks, one-token tail: 16 per thread
+        131077,  # 32769 blocks: first bank past the register keys (scratch)
+        160003,  # 40000 blocks, three-token tail: a 160K cache
     ],
 )
 @pytest.mark.parametrize("kind", ["normal", "magnitudes", "cutoff_ties", "specials"])
@@ -1194,8 +1196,8 @@ def _official_gathered_tokens(head_scores: mx.array, key_len: int) -> mx.array:
     return tokens
 
 
-@pytest.mark.parametrize("key_len", [2052, 32770, 65539])
-@pytest.mark.parametrize("kind", ["normal", "cutoff_ties", "specials"])
+@pytest.mark.parametrize("key_len", [2052, 32770, 65539, 131076, 160003, 218001])
+@pytest.mark.parametrize("kind", ["normal", "magnitudes", "cutoff_ties", "specials"])
 def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
     blocks = key_len // RATIO
     head_scores = mx.array(_head_scores(blocks, kind, key_len).reshape(1, 1, 4, blocks))
@@ -1212,3 +1214,27 @@ def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
     _require_selection(actual)
     assert actual.dtype == expected.dtype and actual.shape == expected.shape
     assert mx.array_equal(actual, expected).item()
+
+
+def test_banks_past_the_register_keys_use_the_scratch_kernel(monkeypatch):
+    """Past 32768 blocks the selection runs with scratch keys; the kill switch keeps the MLX ops."""
+    key_len = 160003
+    blocks = key_len // RATIO
+    scores = mx.array(_head_scores(blocks, "normal", key_len).reshape(1, 1, 4, blocks))
+    kwargs = dict(head_dim=HEAD_DIM, key_tokens=key_len, compress_ratio=RATIO, block_topk=TOPK)
+    tokens = _require_selection(qsa_fast.decode_block_selection_tokens(scores, **kwargs))
+    assert "tokens_scratch" in qsa_fast._DECODE_SELECT_KERNELS
+    assert mx.array_equal(tokens, _official_gathered_tokens(scores, key_len)).item()
+
+    monkeypatch.setattr(qsa_fast, "_DECODE_SELECT_STREAM", False)
+    assert qsa_fast.decode_block_selection_tokens(scores, **kwargs) is None
+    monkeypatch.setattr(qsa_fast, "_DECODE_SELECT_STREAM", True)
+    monkeypatch.setattr(qsa_fast, "_DECODE_SELECT_MAX_STREAM_PER", 32)
+    assert qsa_fast.decode_block_selection_tokens(scores, **kwargs) is None
+
+
+def test_scratch_source_replaces_every_register_key():
+    source = qsa_fast._decode_select_source(qsa_fast._DECODE_SELECT_TOKENS_EPILOGUE, True)
+    assert "keys[" not in source and "uint keys[PER]" not in source
+    assert "scratch[e] = " in source
+    assert qsa_fast._decode_select_source(qsa_fast._DECODE_SELECT_MASK_EPILOGUE, False).count("uint keys[PER]") == 1
