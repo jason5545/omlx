@@ -103,17 +103,19 @@ fi
 # 5. 替換 /Applications/oMLX.app：先關 app（否則 rm 會留下跑著已刪檔案的程序），
 #    先複製到旁邊再換名字，縮短 app 不存在的時間。關 app 不會停 attach 的 brew service。
 OWNER_BEFORE=$(listener)
+#    直接 pkill（Jason 2026-10-06 定）：osascript 的 quit 每次都被 app 的確認框擋下，
+#    白等 20 秒才 pkill。SIGTERM 5 秒內沒結束才送 SIGKILL。
 if pgrep -x oMLX >/dev/null; then
-  say "關閉 oMLX app"
-  osascript -e 'tell application "oMLX" to quit' >/dev/null 2>&1 || true
-  for _ in $(seq 20); do
+  say "關閉 oMLX app（pkill）"
+  pkill -x oMLX || true
+  for _ in $(seq 10); do
     pgrep -x oMLX >/dev/null || break
-    sleep 1
+    sleep 0.5
   done
   if pgrep -x oMLX >/dev/null; then
-    say "20 秒內沒結束（可能跳了確認框），改用 pkill"
-    pkill -x oMLX || true
-    sleep 2
+    say "SIGTERM 5 秒內沒結束，改送 SIGKILL"
+    pkill -9 -x oMLX || true
+    sleep 1
   fi
   ! pgrep -x oMLX >/dev/null || die "oMLX 關不掉，沒有替換 ${DEST}"
 fi

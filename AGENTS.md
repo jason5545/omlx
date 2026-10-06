@@ -226,11 +226,10 @@ security find-identity -v -p codesigning
 
    看到 `valid on disk` 加 `satisfies its Designated Requirement` 就算過。Jason 講的「macho sign fault」指的就是過程中的 `No such file or directory`；那只是簽名器對某個檔案路徑的抱怨，verify 過了就不擋部署，但要在回報裡講明有沒有出現。Apple Development cert 未 notarize，`spctl --assess` 會 rejected，那不等於簽章失效。
 
-部署（先關 app，否則 `rm -rf` 會留下跑著「已刪檔案」的程序；`osascript` 的 quit 可能被 app 的確認框擋下、回「使用者取消操作」，等不到就 `pkill`，attach 的 brew service 不受影響）：
+部署（先關 app，否則 `rm -rf` 會留下跑著「已刪檔案」的程序；`osascript` 的 quit 會被 app 的確認框擋下、回「使用者取消操作」，所以 `deploy_app.sh` 直接 `pkill`，SIGTERM 5 秒內沒結束才 `pkill -9`（Jason 2026-10-06 定），attach 的 brew service 不受影響）：
 
 ```bash
-osascript -e 'tell application "oMLX" to quit'
-pkill -x oMLX   # 沒關掉的話
+pkill -x oMLX
 rm -rf /Applications/oMLX.app
 ditto apps/omlx-mac/build/Stage/oMLX.app /Applications/oMLX.app
 xattr -dr com.apple.quarantine /Applications/oMLX.app
