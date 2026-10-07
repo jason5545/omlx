@@ -216,21 +216,89 @@ def test_over_capacity_prefill_rounding_bounded(tmp_path, reference, kernels, we
     )
 
 
-def test_lru_eviction_and_counters(tmp_path, reference):
+def test_least_used_eviction_and_counters(tmp_path, reference):
     wrapped = _wrapped(tmp_path, reference, 0.25)  # 8 slots
     x = _x(1, 1, D)
-    first = mx.arange(8).reshape(1, 1, 8)
-    wrapped(x, first)
+    wrapped(x, mx.arange(8).reshape(1, 1, 8))
     assert (wrapped.cache.hits, wrapped.cache.misses) == (0, 8)
-    wrapped(x, first)
-    assert (wrapped.cache.hits, wrapped.cache.misses) == (8, 8)
-    wrapped(x, mx.array([[[8, 9]]]))  # evicts the two least recently used
+    for _ in range(2):
+        wrapped(x, mx.array([[[0, 1]]]))
+    # 0 and 1 are now the least recently used, but the most used
+    wrapped(x, mx.arange(2, 8).reshape(1, 1, 6))
+    assert (wrapped.cache.hits, wrapped.cache.misses) == (10, 8)
+    wrapped(x, mx.array([[[8, 9]]]))  # evicts two of the least used, 2..7
     assert wrapped.cache.misses == 10 and len(wrapped.cache.slot_of) == 8
-    assert 0 not in wrapped.cache.slot_of and 1 not in wrapped.cache.slot_of
+    assert 0 in wrapped.cache.slot_of and 1 in wrapped.cache.slot_of
+    assert len(set(range(2, 8)) - set(wrapped.cache.slot_of)) == 2
     got = wrapped(x, mx.array([[[0, 9]]]))
     ref = reference(x, mx.array([[[0, 9]]]))
     mx.eval(got, ref)
     assert bool(mx.array_equal(ref, got))
+
+
+def test_over_capacity_prefill_never_rereads_a_resident_expert(tmp_path, reference):
+    """Resident experts run first, so the call's installs evict only experts
+    it has already used. Sorting by expert id alone let the first chunk evict
+    the high-id residents, and the last chunk read them back."""
+    wrapped = _wrapped(tmp_path, reference, 0.25)  # 8 slots
+    warm = list(range(E - 8, E))  # the highest ids, as the id order hurts most
+    wrapped(_x(1, 1, D), mx.array(warm).reshape(1, 1, 8))
+    assert wrapped.cache.misses == 8
+    x = _x(2, 64, D)
+    i = _routes((2, 64, K))
+    distinct = set(i.reshape(-1).tolist())
+    assert set(warm) <= distinct  # the call needs every resident expert
+    s = _scores(i)
+    ref = reference(x, i, scores=s, weighted_sum=True)
+    got = wrapped(x, i, scores=s, weighted_sum=True)
+    mx.eval(ref, got)
+    assert float(mx.abs(ref - got).max()) < 2e-2
+    assert wrapped.cache.misses == 8 + len(distinct - set(warm))
+
+
+def test_decode_keeps_gpu_busy_while_reads_are_pending(
+    tmp_path, reference, monkeypatch
+):
+    """A decode step whose reads are slow keeps submitting GPU work while it
+    waits (the common adapter's keepalive); the output stays bit-identical,
+    and with the overlap off nothing is submitted."""
+    import time
+
+    import omlx.patches.moe_expert_offload as meo
+
+    x = _x(1, 1, D)
+    warm = mx.arange(K).reshape(1, 1, K)
+    idx = mx.array([[[0, 1, 2, 3, 20, 21]]])  # four hits, two misses
+    ref = reference(x, idx)
+    mx.eval(ref)
+    read = meo.CheckpointExpertStore.read
+
+    def slow_read(plan):
+        time.sleep(0.02)
+        return read(plan)
+
+    def run(overlap):
+        wrapped = _wrapped(tmp_path, reference, 0.25)
+        wrapped._overlap = overlap
+        mx.eval(wrapped(x, warm))
+        submitted = []
+        async_eval = mx.async_eval
+        with monkeypatch.context() as patch:
+            patch.setattr(meo.CheckpointExpertStore, "read", staticmethod(slow_read))
+            patch.setattr(
+                meo.mx,
+                "async_eval",
+                lambda *a: (submitted.append(1), async_eval(*a))[1],
+            )
+            out = wrapped(x, idx)
+            mx.eval(out)
+        return out, len(submitted)
+
+    on, n_on = run(True)
+    off, n_off = run(False)
+    assert bool(mx.array_equal(ref, on)) and bool(mx.array_equal(ref, off))
+    assert n_on > 5  # pulses while the two experts are read
+    assert n_off == 0
 
 
 def test_uncovered_checkpoint_is_skipped(tmp_path):

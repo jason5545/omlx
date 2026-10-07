@@ -3045,13 +3045,22 @@ class Scheduler:
         return 0
 
     def _detect_qwen4_wide_prefill_step(self) -> int:
-        """Return the wide Qwen4-Exp prefill step (0 when the host cannot use it)."""
+        """Return the wide Qwen4-Exp prefill step (0 when the host cannot use it).
+
+        Offloaded GLM-5.3 takes the same step: its experts also stream once
+        per prefill forward, and its wide chunks need the native sparse MLA
+        path that its prefill floor already requires.
+        """
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
+            if model_type.startswith("glm5_next"):
+                if self.config.moe_offload_active and _glm5_next_prefill_floor():
+                    return _QWEN4_WIDE_PREFILL_STEP
+                return 0
             if not model_type.startswith("qwen4_exp"):
                 return 0
             from .custom_kernels.glm_moe_dsa import fast
@@ -10824,6 +10833,10 @@ class Scheduler:
 
         if request_id in self.running:
             del self.running[request_id]
+
+        # Clients often stop a long decode; log its expert cache counters too.
+        if request.moe_offload_start is not None:
+            self._log_moe_offload_stats(request)
 
         # Restore RoPE if this was the active specprefill request. Aborted
         # requests never flow through _cleanup_finished, so without this the

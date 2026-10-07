@@ -1577,6 +1577,29 @@ class TestSchedulerAbortRequest:
         # Processing a non-existent abort is a no-op
         scheduler._process_pending_aborts()
 
+    def test_abort_logs_moe_offload_stats(self, mock_model, mock_tokenizer, caplog):
+        """A stopped request still logs the expert cache counters it accrued."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        counters = {"hits": 10, "misses": 5, "fetched_bytes": 5_000_000}
+        scheduler.moe_offload_stats = lambda: dict(counters)
+
+        request = Request(
+            request_id="test-001",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.add_request(request)
+        counters.update(hits=40, misses=15, fetched_bytes=15_000_000)
+
+        with caplog.at_level("INFO", logger="omlx.scheduler"):
+            scheduler.abort_request("test-001")
+            scheduler._process_pending_aborts()
+
+        assert (
+            "MoE offload: request=test-001 hit_rate=75.0% hits=30 misses=10 "
+            "fetched=10.0 MB" in caplog.text
+        )
+
     def test_abort_sets_finish_reason(self, mock_model, mock_tokenizer):
         """Test aborting sets correct finish reason."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
@@ -4358,6 +4381,52 @@ class TestSchedulerArraysCacheBlockAlignment:
             assert scheduler._qwen35_prefill_floor == expected
             assert scheduler._prefill_step_size_for_progress(0, 16384) == step
             assert scheduler.config.paged_cache_block_size == step
+        finally:
+            scheduler.shutdown()
+
+    @pytest.mark.parametrize(
+        ("offload", "nax_sparse_mla", "expected"),
+        [(True, True, 8192), (False, True, 4096), (True, False, 2048)],
+    )
+    def test_offloaded_glm5_next_takes_the_wide_prefill_step(
+        self, mock_tokenizer, tmp_path, offload, nax_sparse_mla, expected
+    ):
+        """Offloaded GLM-5.3 streams its experts once per prefill forward, so
+        it takes the wide 8192 step (and block grid), first chunk included;
+        without offload, or without the sparse MLA its floor needs, it keeps
+        the floor's step."""
+        fake = SimpleNamespace(nax_sparse_mla_available=lambda: nax_sparse_mla)
+        with (
+            patch.dict(
+                sys.modules, {"omlx.patches.glm_moe_dsa.sparse_mla_nax": fake}
+            ),
+            patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                    moe_offload_active=offload,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen4_wide_prefill_step == (
+                8192 if expected == 8192 else 0
+            )
+            assert scheduler._prefill_step_size_for_progress(0, 16384) == expected
+            assert scheduler.config.paged_cache_block_size == expected
         finally:
             scheduler.shutdown()
 
