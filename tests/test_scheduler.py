@@ -4386,15 +4386,14 @@ class TestSchedulerArraysCacheBlockAlignment:
 
     @pytest.mark.parametrize(
         ("offload", "nax_sparse_mla", "expected"),
-        [(True, True, 8192), (False, True, 4096), (True, False, 2048)],
+        [(True, True, 4096), (False, True, 4096), (True, False, 2048)],
     )
-    def test_offloaded_glm5_next_takes_the_wide_prefill_step(
+    def test_offloaded_glm5_next_keeps_its_prefill_floor(
         self, mock_tokenizer, tmp_path, offload, nax_sparse_mla, expected
     ):
-        """Offloaded GLM-5.3 streams its experts once per prefill forward, so
-        it takes the wide 8192 step (and block grid), first chunk included;
-        without offload, or without the sparse MLA its floor needs, it keeps
-        the floor's step."""
+        """Offload does not widen GLM-5.3 to the qwen4 8192 step: on a 128 GB
+        M5 Max at 80% residency its first 8192-token chunk pushed the Mac into
+        swap. It keeps its floor's step (and block grid) either way."""
         fake = SimpleNamespace(nax_sparse_mla_available=lambda: nax_sparse_mla)
         with (
             patch.dict(
@@ -4422,9 +4421,7 @@ class TestSchedulerArraysCacheBlockAlignment:
             )
 
         try:
-            assert scheduler._qwen4_wide_prefill_step == (
-                8192 if expected == 8192 else 0
-            )
+            assert scheduler._qwen4_wide_prefill_step == 0
             assert scheduler._prefill_step_size_for_progress(0, 16384) == expected
             assert scheduler.config.paged_cache_block_size == expected
         finally:

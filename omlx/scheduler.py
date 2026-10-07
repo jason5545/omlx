@@ -3047,9 +3047,9 @@ class Scheduler:
     def _detect_qwen4_wide_prefill_step(self) -> int:
         """Return the wide Qwen4-Exp prefill step (0 when the host cannot use it).
 
-        Offloaded GLM-5.3 takes the same step: its experts also stream once
-        per prefill forward, and its wide chunks need the native sparse MLA
-        path that its prefill floor already requires.
+        Not for offloaded GLM-5.3: its first 8192-token chunk took ~4 minutes
+        on a 128 GB M5 Max at 80% residency, the transient pushing the Mac
+        into swap (2026-10-08); it keeps its 4096 floor.
         """
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
@@ -3057,10 +3057,6 @@ class Scheduler:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            if model_type.startswith("glm5_next"):
-                if self.config.moe_offload_active and _glm5_next_prefill_floor():
-                    return _QWEN4_WIDE_PREFILL_STEP
-                return 0
             if not model_type.startswith("qwen4_exp"):
                 return 0
             from .custom_kernels.glm_moe_dsa import fast
