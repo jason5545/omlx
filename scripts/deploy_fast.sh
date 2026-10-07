@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 快速部署：只改 omlx/ 的 Python 時，把指定 commit 的 omlx 套件重裝進 Homebrew venv，
 # 不動依賴，再重啟 brew service。什麼時候能用、什麼時候要整套重裝，見 AGENTS.md「快速部署」。
+# 一律連 custom kernel（ANE prefill、INT8 prefill 等的 native extension）一起編（Jason 2026-10-07 定）。
 # brew service 和 Mac app 一律同步部署：成功後接著跑 scripts/deploy_app.sh。
 #
 #   scripts/deploy_fast.sh             部署 origin/main（再部署 Mac app）
@@ -26,6 +27,8 @@ PY=${CELLAR}/libexec/bin/python
 # 用 venv 自己的 pip（shebang 是 Cellar 的 python3.11），重新產生的 bin/omlx 才跟 brew 裝的一樣。
 PIP=${CELLAR}/libexec/bin/pip
 RECEIPT=${CELLAR}/INSTALL_RECEIPT.json
+# 跟 Formula/omlx.rb 的 CUSTOM_KERNELS 同一份清單。
+CUSTOM_KERNELS="bonsai decode_fast glm_moe_dsa minimax_m3 qwen35_prefill"
 
 T0=$(date +%s)
 say() { printf '[deploy_fast +%ds] %s\n' "$(($(date +%s) - T0))" "$*"; }
@@ -158,9 +161,6 @@ fi
 
 # 2. 只能在依賴沒變時走快速路徑：跟 venv 依賴基準（brew 整套安裝的 commit）比。
 BASE=$(jq -r .source.scm_revision "${RECEIPT}")
-if jq -e '.used_options | index("--with-custom-kernel") != null' "${RECEIPT}" >/dev/null; then
-  die "這份安裝帶 --with-custom-kernel，重裝純 Python wheel 會蓋掉編譯好的 kernel，要整套重裝"
-fi
 CHANGED=$(git -C "${REPO}" diff --name-only "${BASE}" "${SHA}" -- pyproject.toml setup.py)
 # Formula 只有 url／sha256（release tarball）變不算：HEAD 安裝不用它們，每次 upstream 發版都會動。
 FORMULA_REAL=$(git -C "${REPO}" diff -U0 "${BASE}" "${SHA}" -- Formula \
@@ -169,12 +169,37 @@ FORMULA_REAL=$(git -C "${REPO}" diff -U0 "${BASE}" "${SHA}" -- Formula \
 [[ -z ${CHANGED} ]] || die "跟 venv 依賴基準 ${BASE:0:8} 比，改到下列檔案，要整套重裝：
 ${CHANGED}"
 
-# 3. 先建一次 wheel：確認建得起來，也把建置依賴（setuptools、cmake、nanobind、mlx）
-#    抓進 pip 快取。第一次要下載，之後幾秒就好。這一步不動正式 venv。
-say "預先建置 wheel"
-"${PIP}" wheel -q --no-deps -w "${TMP}" "git+file://${REPO}@${SHA}"
+# 3. custom kernel 一律一起編，跟 brew --with-custom-kernel 同一套環境變數（setup.py 看
+#    OMLX_WITH_CUSTOM_KERNEL）。pip 的 wheel 快取每次換一個空目錄：舊的純 Python wheel 是
+#    py3-none-any，同一個 commit 以前建過就會被直接拿來裝，kernel 就悄悄不見；下載快取
+#    （http、http-v2）照樣共用，建置依賴不用重抓。帶 kernel 的 wheel 是 macosx_27_0 tag，
+#    pip 不會從快取拿它，所以停 service 後的安裝還是會重編一次（2026-10-07 實測停機 70 秒）。
+xcrun -f metal >/dev/null 2>&1 \
+  || die "找不到 Metal 編譯器（xcrun -f metal），編不了 custom kernel。先跑 xcodebuild -downloadComponent MetalToolchain"
+export OMLX_WITH_CUSTOM_KERNEL=1
+export CMAKE_ARGS="${CMAKE_ARGS:+${CMAKE_ARGS} }-DPython_EXECUTABLE=${PY}"
+REAL_PIP_CACHE=$("${PIP}" cache dir)
+export PIP_CACHE_DIR=${TMP}/pip-cache
+mkdir -p "${PIP_CACHE_DIR}"
+for d in http http-v2; do
+  [[ -d ${REAL_PIP_CACHE}/${d} ]] && ln -s "${REAL_PIP_CACHE}/${d}" "${PIP_CACHE_DIR}/${d}"
+done
 
-# 4. 等沒有進行中的請求。
+# 4. 先建一次 wheel：確認建得起來、kernel 都在，也把建置依賴（setuptools、cmake、nanobind、
+#    mlx）抓進下載快取。第一次要下載，之後約 35～95 秒（多半是編 kernel）。這一步不動正式 venv。
+say "預先建置 wheel（含 custom kernel）"
+"${PIP}" wheel -q --no-deps -w "${TMP}/wheel" "git+file://${REPO}@${SHA}"
+"${PY}" -I - "${TMP}"/wheel/omlx-*.whl ${CUSTOM_KERNELS} <<'PY' || die "預建的 wheel 缺 custom kernel，沒有重啟"
+import sys, zipfile
+names = zipfile.ZipFile(sys.argv[1]).namelist()
+missing = [k for k in sys.argv[2:]
+           if not any(n.startswith(f"omlx/custom_kernels/{k}/_ext") and n.endswith(".so") for n in names)]
+if missing:
+    print("缺：" + " ".join(missing))
+    sys.exit(1)
+PY
+
+# 5. 等沒有進行中的請求。
 say "檢查進行中的請求（最多等 $((WAIT_IDLE_MAX / 60)) 分鐘）"
 deadline=$(($(date +%s) + WAIT_IDLE_MAX))
 while :; do
@@ -186,7 +211,7 @@ while :; do
   sleep 15
 done
 
-# 5. 先停 service 再換檔案：避免舊程序在換檔中途 lazy import 到新舊混雜的模組。
+# 6. 先停 service 再換檔案：避免舊程序在換檔中途 lazy import 到新舊混雜的模組。
 T_STOP=$(date +%s)
 PID=$(brew services info --json "${FORMULA}" | jq -r '.[0].pid // empty')
 say "停止 service（pid ${PID:-無}）"
@@ -204,11 +229,25 @@ say "安裝 omlx @ ${SHA}（--no-deps --force-reinstall）"
 T_INSTALL=$(date +%s)
 "${PIP}" install -q --no-deps --force-reinstall "git+file://${REPO}@${SHA}"
 say "安裝完成，花 $(($(date +%s) - T_INSTALL)) 秒"
+# 跟 Formula/omlx.rb 的 verify_custom_kernels 同一套檢查：載得起來、ABI 對得上。
+# 失敗時 cleanup 會把 service 開回來（跑的是新版但沒有 kernel），照訊息回滾。
+"${PY}" -I - ${CUSTOM_KERNELS} <<'PY' || die "custom kernel 載入失敗，service 會以沒有 kernel 的狀態開回來；回滾：scripts/deploy_fast.sh ${PREV}"
+import importlib, sys
+failed = {}
+for package in sys.argv[1:]:
+    fast = importlib.import_module(f"omlx.custom_kernels.{package}.fast")
+    if not fast.is_native_available():
+        failed[package] = str(fast.import_error())
+if failed:
+    print(failed)
+    sys.exit(1)
+PY
+say "custom kernel 驗證通過（${CUSTOM_KERNELS}）"
 
 brew services start "${FORMULA}" >/dev/null
 STARTED=1
 
-# 6. 等 /health 回 healthy（載入中是 503 + "loading"）。
+# 7. 等 /health 回 healthy（載入中是 503 + "loading"）。
 say "等 /health 回 healthy"
 body=
 while (($(date +%s) - T_STOP < HEALTH_MAX)); do
@@ -225,7 +264,7 @@ IFS=$'\t' read -r NOW_SHA NOW_SOURCE _ < <(deployed_commit)
 say "完成：部署 ${NOW_SHA}（${NOW_SOURCE}），停 service 到 healthy $(($(date +%s) - T_STOP)) 秒"
 say "回滾：scripts/deploy_fast.sh ${PREV}"
 
-# 7. Mac app 同步部署。app 從 working tree 建，所以 HEAD 的 omlx/ 要跟剛部署的 commit 相同。
+# 8. Mac app 同步部署。app 從 working tree 建，所以 HEAD 的 omlx/ 要跟剛部署的 commit 相同。
 if ((WITH_APP)); then
   say "接著部署 Mac app（scripts/deploy_app.sh）"
   "${REPO}/scripts/deploy_app.sh" \

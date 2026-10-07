@@ -41,12 +41,14 @@ jason5545/omlx
 ```bash
 brew services stop jason5545/omlx/omlx
 brew uninstall jason5545/omlx/omlx
-brew install --HEAD --with-grammar jason5545/omlx/omlx
+brew install --HEAD --with-grammar --with-custom-kernel jason5545/omlx/omlx
 brew services start jason5545/omlx/omlx
 scripts/deploy_app.sh      # Mac app 同步部署（brew 裝的是 origin/main，repo 要先在同一個 commit）
 ```
 
 Homebrew 5.1 的 `brew reinstall` 不接受 `--HEAD`，所以需要明確 uninstall/install 時，用上面的方式最穩。
+
+一律帶 `--with-custom-kernel`（Jason 2026-10-07 定）：ANE prefill、INT8 activation prefill（`qwen35_oq_a8`）等功能要靠 `omlx/custom_kernels/*/_ext*.so` 這些 native extension，沒編進去時 admin 的 ANE tuning 會回「the private ANE runtime is unavailable on this machine」，直接建議純 GPU。需要 Metal 編譯器（`xcrun -f metal`），沒有就先 `xcodebuild -downloadComponent MetalToolchain`。
 
 確認安裝來源：
 
@@ -62,7 +64,7 @@ https://github.com/jason5545/omlx.git
 
 ## 快速部署（只改 omlx/ 的 Python）
 
-上面的整套重裝 2026-09-23 實測約 64 分鐘：主套件那步 pip 47 分鐘、mlx-audio 16 分鐘。Formula 帶 `--no-cache-dir`，每次都重建 venv、重新下載全部 wheel 和 git 依賴；Rust 套件（tokenizers、pydantic-core 等）的原始碼編譯只佔一兩分鐘。omlx 本身是純 Python wheel（`py3-none-any`；沒帶 `--with-custom-kernel` 時沒有 native extension），只改 omlx 程式時不必重建 venv，把 omlx 套件從 commit 重裝進現有 venv，再重啟 service 就好。
+上面的整套重裝 2026-09-23 實測約 64 分鐘：主套件那步 pip 47 分鐘、mlx-audio 16 分鐘。Formula 帶 `--no-cache-dir`，每次都重建 venv、重新下載全部 wheel 和 git 依賴；Rust 套件（tokenizers、pydantic-core 等）的原始碼編譯只佔一兩分鐘。omlx 的依賴不必重建：只改 omlx 程式時，把 omlx 套件（連同 custom kernel 一起編）從 commit 重裝進現有 venv，再重啟 service 就好。
 
 可以走快速路徑：
 
@@ -71,7 +73,7 @@ https://github.com/jason5545/omlx.git
 一定要整套重裝：
 
 - 改到 `pyproject.toml`（依賴、extras、版本 pin、build-system）、`setup.py`、`Formula/omlx.rb`。Formula 只動 `url`／`sha256`（upstream 發版換 release tarball）不算：`--HEAD` 安裝不用這兩行，腳本會略過它們。
-- 要升級或新增依賴、有需要編譯的東西（custom kernel），或這份安裝帶 `--with-custom-kernel`：重裝純 Python wheel 會把編譯好的 kernel 蓋掉。
+- 要升級或新增依賴。custom kernel 不在此列：`deploy_fast.sh` 每次都會跟 omlx 一起重編（見下面「細節」）。
 - 快速路徑失敗、`/health` 回不到 `healthy`，或模型載入失敗。
 
 判斷依賴有沒有變，是跟「venv 依賴基準」比：brew 整套安裝時的 commit（`INSTALL_RECEIPT.json` 的 `source.scm_revision`），不是上一次快速部署的 commit。腳本會自動比對，上面列的檔案有變就拒絕。
@@ -96,6 +98,8 @@ cd /Users/jianruicheng/GitHub/omlx
 git fetch origin
 SHA=$(git rev-parse origin/main)                    # 或要部署的 commit；必須在 origin/main 上
 PIP=$(readlink -f /opt/homebrew/opt/omlx)/libexec/bin/pip
+export OMLX_WITH_CUSTOM_KERNEL=1 CMAKE_ARGS="-DPython_EXECUTABLE=$(dirname "$PIP")/python"   # custom kernel 一律一起編
+export PIP_CACHE_DIR=$(mktemp -d)                  # 空的 wheel 快取：不撿同 commit 的舊純 Python wheel（腳本另外把下載快取連回來）
 BASE=$(jq -r .source.scm_revision /opt/homebrew/opt/omlx/INSTALL_RECEIPT.json)
 git diff --name-only "$BASE" "$SHA" -- pyproject.toml setup.py Formula             # 有輸出就改走整套重裝（Formula 只動 url／sha256 除外，要人工看 diff）
 "$PIP" wheel --no-deps -w "$(mktemp -d)" "git+file://$PWD@$SHA"                   # 預先建置，不動正式 venv
@@ -110,7 +114,9 @@ scripts/deploy_app.sh                                                           
 細節：
 
 - 用 venv 自己的 `pip`（shebang 是 Cellar 的 `python3.11`），重新產生的 `bin/omlx` 才會跟 brew 裝的一樣。
-- 預先建置確認 wheel 建得起來，也把建置依賴（`pyproject.toml` build-system 的 mlx 0.32.2、cmake、nanobind）抓進 pip 快取。第一次要下載，這台實測 224 秒；之後約 6 秒。
+- 預先建置確認 wheel 建得起來、5 組 custom kernel（bonsai、decode_fast、glm_moe_dsa、minimax_m3、qwen35_prefill，跟 Formula 的 `CUSTOM_KERNELS` 同一份）的 `_ext*.so` 都在，也把建置依賴（`pyproject.toml` build-system 的 mlx、cmake、nanobind）抓進下載快取。第一次要下載，這台實測 224 秒；之後主要是編 kernel，約 35～95 秒。
+- custom kernel 的處理：腳本 export `OMLX_WITH_CUSTOM_KERNEL=1` 和 `CMAKE_ARGS=-DPython_EXECUTABLE=<venv python>`（跟 formula `--with-custom-kernel` 同一套），找不到 Metal 編譯器就停。pip 的 wheel 快取每次換一個空目錄、`http`／`http-v2` 下載快取連回原本的：舊的純 Python wheel 是 `py3-none-any`，同一個 commit 以前建過會被直接拿來裝，kernel 就悄悄不見。帶 kernel 的 wheel 是 `macosx_27_0` tag，pip 不會從快取拿，所以停 service 後的安裝會再編一次。裝完用 formula `verify_custom_kernels` 同一套檢查（`fast.is_native_available()`），失敗就停、service 開回來（沒有 kernel），照訊息回滾。
+- 2026-10-07 實測帶 kernel 部署 248acc2a：預建 93 秒（那次關了全部快取，含下載），install 65 秒，停 service 到 healthy 70 秒（不帶 kernel 時約 12 秒）。
 - 2026-09-23 實測部署 0a34f284：整支腳本 18.6 秒，其中 install 7 秒，停 service 到 `/health` healthy 11 秒。healthy 時模型還沒載入（`loaded_count: 0`），第一個請求才載入 Ornith（`model_load_duration` 5.83 秒）。所以部署後要送一題短請求，確認模型真的載得起來。
 - 先停 service 再換檔案：pip 會先移除舊檔再放新檔，舊程序在這段時間 lazy import 會拿到新舊混雜的模組，甚至找不到模組。停掉之後任何一步失敗，腳本都會把 service 開回來；pip 安裝失敗會自動還原舊版。
 - 從 commit 安裝，不用 editable install（`pip install -e`）。`git+file` 會 clone repo 再建 wheel，只看 commit 內容：working tree 沒 commit 的改動和沒追蹤的檔案（例如本地建出的 `.so`，package-data 會收）都不會帶上線。editable install 會讓正式 server 跟著 working tree 變，查不到跑的是哪個 commit。
@@ -264,7 +270,7 @@ git merge upstream/main
 git push origin main
 brew update
 brew uninstall jason5545/omlx/omlx
-brew install --HEAD --with-grammar jason5545/omlx/omlx
+brew install --HEAD --with-grammar --with-custom-kernel jason5545/omlx/omlx
 brew services restart jason5545/omlx/omlx
 scripts/deploy_app.sh      # Mac app 同步部署
 ```
