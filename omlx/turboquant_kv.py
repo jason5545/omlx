@@ -447,6 +447,10 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             # requantize: roll only reindexes along the token axis, so it is
             # exact on the packed representation and skips fp16 materializing
             # and the codec's re-rounding of an already-quantized value.
+            # Like BatchKVCache.finalize, roll the whole step-allocated buffer:
+            # the columns that wrap in front land inside the new left padding,
+            # while slicing to the written end first would drop the spare
+            # capacity and make the next append reallocate the buffer.
             shifts = padding[:, None]
             self.keys = _roll_state_tokens(self.keys, shifts, axis=2)
             self.values = _roll_state_tokens(self.values, shifts, axis=2)

@@ -1977,9 +1977,18 @@ def test_batch_tq_ragged_commit_rolls_quantized_state(monkeypatch, bits):
     place of the dequantize -> roll -> requantize round trip: that one
     materialized the whole batch cache as float32 per layer per commit, and
     each requantization shrank every cached vector's norm (~0.5% per trip
-    at 4 bits), compounding across commits."""
+    at 4 bits), compounding across commits.
+
+    Like BatchKVCache.finalize, the roll covers the whole step-allocated
+    buffer, so the columns that wrap in front hold its spare tail instead of
+    the rejected drafts. They land inside the new left padding, where every
+    attention path masks them, so only the columns from each row's left
+    padding on are compared. Rolling just the written prefix would empty
+    the spare capacity and make the next append reallocate the buffer."""
     from mlx_lm.models.cache import dynamic_roll
     from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    from omlx.turboquant_kv import _state_length
 
     tq = BatchTurboQuantKVCache([0, 1, 2], bits=bits)
     mx.random.seed(3767)
@@ -1997,17 +2006,22 @@ def test_batch_tq_ragged_commit_rolls_quantized_state(monkeypatch, bits):
         tq.update_and_fetch(new, new * 0.5)
         before_k, before_v = tq.dequantize()
         offset, left_padding = tq.offset.tolist(), tq.left_padding.tolist()
+        capacity = _state_length(tq.keys)
         with monkeypatch.context() as patch:
             patch.setattr(BatchTurboQuantKVCache, "dequantize", fail)
             patch.setattr(type(tq.key_codec), "quantize", fail)
             transaction.commit(retained)
-        got_k, got_v = tq.dequantize()
-        assert mx.array_equal(got_k, dynamic_roll(before_k, right_padding, axis=2))
-        assert mx.array_equal(got_v, dynamic_roll(before_v, right_padding, axis=2))
         assert tq.offset.tolist() == [o - (3 - r) for o, r in zip(offset, retained)]
         assert tq.left_padding.tolist() == [
             p + (3 - r) for p, r in zip(left_padding, retained)
         ]
+        assert _state_length(tq.keys) == capacity
+        got_k, got_v = tq.dequantize()
+        want_k = dynamic_roll(before_k, right_padding, axis=2)
+        want_v = dynamic_roll(before_v, right_padding, axis=2)
+        for row, pad in enumerate(tq.left_padding.tolist()):
+            assert mx.array_equal(got_k[row, :, pad:], want_k[row, :, pad:])
+            assert mx.array_equal(got_v[row, :, pad:], want_v[row, :, pad:])
 
 
 @pytest.mark.parametrize("advance", [0, 3])
