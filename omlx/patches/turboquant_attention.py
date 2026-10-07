@@ -13,8 +13,10 @@ When TurboQuantKVCache is detected, routes attention to:
     codecs' decode kernels apply, with the causal tail mask injected between
     key scoring and the value weighted sum — one lazy pass over the KV, no
     dequantize
-  - Prefill (L>1): tiled quantized attention first for long contexts;
-    cache.prefill_attention() first for short contexts; then dequantized SDPA
+  - Prefill (L>1): on M5 and later, chunks of at least 128 rows dequantize
+    the cache once and run MLX's fused SDPA (``_dequantized_prefill_attention``);
+    otherwise tiled quantized attention first for long contexts,
+    cache.prefill_attention() first for short contexts, then dequantized SDPA
 
 mlx-vlm's qwen3_5 left-padded helper (B>1 decode and MTP verify) is patched
 separately onto the same multi-row routes, with each row's left padding
@@ -34,6 +36,22 @@ _PATCHED = False
 _LONG_PREFILL_QUANTIZED_THRESHOLD = 8192
 _LONG_PREFILL_QUERY_BLOCK_SIZE = 256
 _LONG_PREFILL_KEY_CHUNK_SIZE = 16384
+# Prefill chunks of at least this many query rows dequantize the cache once
+# and run MLX's fused SDPA on the matrix units instead of the tiled quantized
+# scan (Python loop over 256-row x 16384-key blocks with an eval each).
+# Measured on M5 Max, SAQ shape (24q/4kv, D=256, 4-bit MSE), per layer:
+# 100k keys L=2048 639 -> 164 ms, L=512 156 -> 57, L=128 49 -> 33; 32k
+# L=2048 221 -> 52. At L=64 both take 32 ms and the dequantized copy is pure
+# memory cost, so shorter chunks keep the tiled scan.
+_DEQUANT_PREFILL_MIN_Q_LEN = 128
+# Ceiling for the per-call dequantized copy (float32 K+V plus the cast to the
+# query dtype). B=1 at 262k tokens with 4 kv heads x 256 needs 3 GiB; a wider
+# batch above the ceiling keeps the bounded tiled scan.
+_DEQUANT_PREFILL_MAX_BYTES = 4 * 1024**3
+_DEQUANT_PREFILL_ENABLED = True
+# MLX < 0.32.2 has no force_fused=; without it MLX may pick the unfused fp32
+# score matrix, so such a runtime keeps the tiled scan. Latched on first use.
+_NATIVE_FORCE_FUSED = True
 # MTP verify is a decode-shaped multi-row call (q_len = 1 + draft depth <= 9).
 # Above this floor a multi-row call is genuine (chunked) prefill.
 _DECODE_MULTIROW_MAX_Q_LEN = 15
@@ -1384,6 +1402,54 @@ def _patch_vlm_target_verify_attention() -> None:
     q35_lang._omlx_tq_target_verify_patched = True
 
 
+def _dequantized_prefill_attention(real_cache, queries, keys, values, scale, mask):
+    """Dequantize the cache once and run MLX's fused SDPA, or return None.
+
+    TurboQuant's own long-prefill route scans the packed states in Python
+    blocks and reaches about 4 TFLOPS on M5 Max; the fused kernel over the
+    dequantized states runs on the matrix units (about 24-31 TFLOPS). The
+    states are the same quantized values either way: against an unquantized
+    cache both routes sit about 21.8% off (random 32k-token states), within
+    0.02 points of each other; the bf16 operands add about 0.2% mean
+    relative error over the float32 scan, the precision class of any
+    unquantized bf16 cache.
+    """
+    global _NATIVE_FORCE_FUSED
+
+    if not (_DEQUANT_PREFILL_ENABLED and _NATIVE_FORCE_FUSED):
+        return None
+    if queries.shape[-2] < _DEQUANT_PREFILL_MIN_Q_LEN or not _nax_available():
+        return None
+    # Lazy: nothing is materialized unless the fused call below is evaluated.
+    dequantized_keys, dequantized_values = real_cache.dequantize(
+        keys_state=keys,
+        values_state=values,
+    )
+    elements = dequantized_keys.size + dequantized_values.size
+    if elements * (4 + queries.dtype.size) > _DEQUANT_PREFILL_MAX_BYTES:
+        return None
+    try:
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dequantized_keys.astype(queries.dtype),
+            dequantized_values.astype(queries.dtype),
+            scale=scale,
+            mask=mask,
+            force_fused=True,
+        )
+    except TypeError:
+        _NATIVE_FORCE_FUSED = False
+        logger.warning(
+            "TurboQuant: mlx %s has no force_fused= (0.32.2+); long prefill "
+            "keeps the tiled quantized scan",
+            getattr(mx, "__version__", "?"),
+        )
+    except ValueError:
+        # A layout the fused kernel rejects; the tiled scan covers it.
+        pass
+    return None
+
+
 def apply_turboquant_attention_patch() -> bool:
     """Monkey-patch mlx-lm's scaled_dot_product_attention for TurboQuant."""
     global _PATCHED
@@ -1477,6 +1543,11 @@ def apply_turboquant_attention_patch() -> bool:
                         "falling back to prefill paths",
                         exc_info=True,
                     )
+            result = _dequantized_prefill_attention(
+                real_cache, queries, keys, values, scale, mask
+            )
+            if result is not None:
+                return result
             keys_state = getattr(keys, "_state", keys)
             try:
                 total_tokens = _state_length(keys_state)

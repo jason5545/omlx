@@ -628,6 +628,118 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
     assert dequant_kwargs == {"keys_state": ks, "values_state": vs}
 
 
+def _long_prefill_tq_call(q_len, total=2304, seed=0):
+    """SAQ-shaped TurboQuant cache (24q/4kv, D=256, bf16) ending in a causal
+    prefill chunk of ``q_len`` rows."""
+    mx.random.seed(seed)
+    n_kv, D = 4, 256
+    tq = TurboQuantKVCache(bits=4.0)
+    tq.update_and_fetch(
+        mx.random.normal((1, n_kv, total - q_len, D)).astype(mx.bfloat16),
+        mx.random.normal((1, n_kv, total - q_len, D)).astype(mx.bfloat16),
+    )
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((1, n_kv, q_len, D)).astype(mx.bfloat16),
+        mx.random.normal((1, n_kv, q_len, D)).astype(mx.bfloat16),
+    )
+    queries = (mx.random.normal((1, 24, q_len, D)) * 2).astype(mx.bfloat16)
+    return tq, ks, vs, queries, D**-0.5
+
+
+def _spy_tiled_scan(monkeypatch):
+    calls = []
+    original = TurboQuantKVCache.quantized_attention
+
+    def spy(self, *args, **kwargs):
+        calls.append(self.prefill_query_block_size)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(TurboQuantKVCache, "quantized_attention", spy)
+    return calls
+
+
+@pytest.mark.skipif(
+    not __import__(
+        "omlx.patches.turboquant_attention", fromlist=["_nax_available"]
+    )._nax_available(),
+    reason="dequantized prefill route is gated to GPUs with matrix units",
+)
+def test_long_prefill_dequantized_route_matches_tiled_scan(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    # Without the dequantized route this call would take the tiled scan.
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4)
+    tq, ks, vs, queries, scale = _long_prefill_tq_call(q_len=256)
+    tiled = tq.quantized_attention(
+        queries, keys_state=ks, values_state=vs, scale=scale, mask="causal"
+    ).astype(mx.float32)
+    calls = _spy_tiled_scan(monkeypatch)
+
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=scale, mask="causal"
+    )
+    mx.eval(out)
+
+    assert calls == []
+    assert out.shape == queries.shape and out.dtype == queries.dtype
+    dk, dv = tq.dequantize(keys_state=ks, values_state=vs)
+    ref = mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, mask="causal"
+    )
+    norm = mx.abs(ref).mean().item()
+    err_new = mx.abs(out.astype(mx.float32) - ref).mean().item() / norm
+    err_tiled = mx.abs(tiled - ref).mean().item() / norm
+    # bf16 operands: measured 4.2-4.5e-3 against the float32 scan's 2.0-2.2e-3.
+    assert err_new < 8e-3
+    assert err_tiled < 8e-3
+
+
+def test_long_prefill_short_chunk_keeps_tiled_scan(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4)
+    tq, ks, vs, queries, scale = _long_prefill_tq_call(
+        q_len=tq_attention._DEQUANT_PREFILL_MIN_Q_LEN - 1
+    )
+    calls = _spy_tiled_scan(monkeypatch)
+
+    mx.eval(
+        mlx_base.scaled_dot_product_attention(
+            queries, ks, vs, tq, scale=scale, mask="causal"
+        )
+    )
+
+    assert calls == [256]
+
+
+def test_long_prefill_over_byte_ceiling_keeps_tiled_scan(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4)
+    # Exactly one byte short of what the 2304-token copy needs.
+    need = 2 * 4 * 2304 * 256 * (4 + 2)
+    monkeypatch.setattr(tq_attention, "_DEQUANT_PREFILL_MAX_BYTES", need - 1)
+    tq, ks, vs, queries, scale = _long_prefill_tq_call(q_len=256)
+    calls = _spy_tiled_scan(monkeypatch)
+
+    mx.eval(
+        mlx_base.scaled_dot_product_attention(
+            queries, ks, vs, tq, scale=scale, mask="causal"
+        )
+    )
+
+    assert calls == [256]
+
+
 @pytest.mark.parametrize("q_len", [2, 4, 9])
 def test_decode_multirow_matches_dequantize_reference(q_len):
     """MTP-verify-shaped attention (fold path at small q_len, single-chunk
