@@ -256,6 +256,71 @@ def test_over_capacity_prefill_never_rereads_a_resident_expert(tmp_path, referen
     assert wrapped.cache.misses == 8 + len(distinct - set(warm))
 
 
+@pytest.mark.parametrize("group,ring", [(16, 4), (3, 2)])
+def test_streamed_prefill_leaves_resident_experts_in_place(
+    tmp_path, reference, kernels, monkeypatch, group, ring
+):
+    """An over-capacity prefill reads the experts the cache does not hold
+    into temporary weights: the resident experts keep their slots, every
+    non-resident expert is read once, and the output matches the module
+    within the rounding the installing path already allows. Groups of 3 in
+    a ring of 2 reuse each group's weights several times."""
+    monkeypatch.setattr(dsv4, "_STREAM_GROUP", group)
+    monkeypatch.setattr(dsv4, "_STREAM_RING", ring)
+    wrapped = _wrapped(tmp_path, reference, 0.25)  # 8 slots
+    warm = list(range(E - 8, E))
+    wrapped(_x(1, 1, D), mx.array(warm).reshape(1, 1, 8))
+    c = wrapped.cache
+    before = dict(c.slot_of)
+    x = _x(2, 64, D)
+    i = _routes((2, 64, K))
+    distinct = set(i.reshape(-1).tolist())
+    s = _scores(i)
+    ref = reference(x, i, scores=s, weighted_sum=True)
+    got = wrapped(x, i, scores=s, weighted_sum=True)
+    mx.eval(ref, got)
+    assert ref.shape == got.shape
+    assert float(mx.abs(ref - got).max()) < 2e-2
+    assert c.slot_of == before  # nothing evicted, nothing moved
+    assert c.misses == 8 + len(distinct - set(warm))
+    assert c.fetched_bytes == c.misses * c.expert_bytes
+    # the cache still serves its experts bit-exactly afterwards
+    idx = mx.array(warm[:K]).reshape(1, 1, K)
+    x1 = _x(1, 1, D)
+    after_ref, after = reference(x1, idx), wrapped(x1, idx)
+    mx.eval(after_ref, after)
+    assert bool(mx.array_equal(after_ref, after))
+
+
+def test_streamed_prefill_fills_a_cold_cache_with_its_most_routed_experts(
+    tmp_path, reference
+):
+    wrapped = _wrapped(tmp_path, reference, 0.25)  # 8 empty slots
+    x = _x(1, 120, D)
+    i = _routes((1, 120, K))
+    flat = i.reshape(-1).tolist()
+    counts = {e: flat.count(e) for e in set(flat)}
+    top = sorted(counts, key=lambda e: (-counts[e], e))[:8]
+    ref = reference(x, i)
+    got = wrapped(x, i)
+    mx.eval(ref, got)
+    assert float(mx.abs(ref - got).max()) < 2e-2
+    assert sorted(wrapped.cache.slot_of) == sorted(top)
+    assert wrapped.cache.misses == len(counts)
+
+
+def test_installing_prefill_stays_behind_the_switch(tmp_path, reference, monkeypatch):
+    """OMLX_MOE_OFFLOAD_STREAM_PREFILL=0 keeps the installing path: the last
+    chunk's experts end up resident."""
+    monkeypatch.setattr(dsv4, "_STREAM", False)
+    wrapped = _wrapped(tmp_path, reference, 0.25)
+    warm = list(range(E - 8, E))
+    wrapped(_x(1, 1, D), mx.array(warm).reshape(1, 1, 8))
+    i = _routes((2, 64, K))
+    mx.eval(wrapped(_x(2, 64, D), i))
+    assert set(wrapped.cache.slot_of) != set(warm)
+
+
 def test_decode_keeps_gpu_busy_while_reads_are_pending(
     tmp_path, reference, monkeypatch
 ):

@@ -35,9 +35,10 @@ is unavailable.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from pathlib import Path
 
 import mlx.core as mx
@@ -48,10 +49,13 @@ from ...custom_kernels.glm_moe_dsa import fast as glm_fast
 from ...scheduler import _sync_and_clear_cache
 from ..moe_expert_offload import (
     _DTYPES,
+    _SCORE_DECAY,
+    _SCORE_DECAY_EVERY,
     _SORT_MIN_ROUTES,
     CheckpointExpertStore,
     ExpertCache,
     _drain,
+    _env_int,
     _GLUStoreView,
     _io_batch,
     _io_pool,
@@ -71,6 +75,18 @@ _PROJS = ("gate_proj", "up_proj", "down_proj")
 # it off; at most _PREFETCH_MAX experts are read ahead per layer.
 _PREFETCH = os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH", "1") != "0"
 _PREFETCH_MAX = 8
+
+# Over-capacity prefill reads the experts the cache does not hold into
+# temporary weights and computes them group by group while the next groups
+# are read, instead of installing them over resident experts (see
+# OffloadedSwitchGLU._forward_streamed). _STREAM_GROUP experts per group,
+# _STREAM_RING groups' weights allocated at once (the read-ahead depth and
+# the extra memory: 4 x 16 experts of ~13 MB on GLM-5.3 oQ3.5e).
+# OMLX_MOE_OFFLOAD_STREAM_PREFILL=0 keeps the installing expert-major path.
+_STREAM = os.environ.get("OMLX_MOE_OFFLOAD_STREAM_PREFILL", "1") != "0"
+_STREAM_GROUP = max(1, _env_int("OMLX_MOE_OFFLOAD_STREAM_GROUP", 16, 16))
+_STREAM_RING = max(2, _env_int("OMLX_MOE_OFFLOAD_STREAM_RING", 4, 4))
+_FIELDS = ("weight", "scales", "biases")
 
 
 def is_deepseek_v4_switch_glu(obj) -> bool:
@@ -148,6 +164,19 @@ class _SlotCache(ExpertCache):
         # keeps its full size, as it always has.
         return 0
 
+    def note_streamed(self, ids, hits: int, streamed: int) -> None:
+        """Count a streamed prefill call (``OffloadedSwitchGLU._forward_streamed``):
+        the decayed routing counts move as for one ``_ensure_ids`` over its
+        distinct experts ``ids``; ``streamed`` experts were read, none was
+        installed or evicted."""
+        np.add.at(self.score, np.asarray(ids, dtype=np.int64), 1.0)
+        self._calls += 1
+        if self._calls % _SCORE_DECAY_EVERY == 0:
+            self.score *= _SCORE_DECAY
+        self.hits += hits
+        self.misses += streamed
+        self.fetched_bytes += streamed * self.expert_bytes
+
 
 class _Prefetch:
     """Read-ahead state of one wrapper, kept out of the module tree.
@@ -198,6 +227,24 @@ def _flat_ids(a: mx.array) -> list:
     while out and isinstance(out[0], list):
         out = [v for row in out for v in row]
     return out
+
+
+def _plan_dtype(plan):
+    """The mlx dtype a plan's bytes hold."""
+    return plan.mx_view if plan.mx_view is not None else mx.array(
+        np.zeros(0, dtype=plan.np_dtype)
+    ).dtype
+
+
+def _pread_into(store_view, plan, view) -> None:
+    """Read a plan's bytes straight into ``view`` (positional; any thread).
+    ``store_view`` is only held, so the shard descriptors stay open."""
+    got = 0
+    while got < plan.nbytes:
+        n = os.preadv(plan.fd, [view[got : plan.nbytes]], plan.offset + got)
+        if n <= 0:
+            raise OSError(f"short read of {plan.nbytes} bytes at {plan.offset}")
+        got += n
 
 
 def _cancel_reads(reads) -> None:
@@ -333,6 +380,138 @@ class OffloadedSwitchGLU(nn.Module):
         inverse = mx.array(np.argsort(order, kind="stable"), dtype=mx.int32)
         return mx.take(out, inverse, axis=0).reshape(-1, k, d_model)
 
+    def _ring(self, n_groups: int):
+        """Temporary weights for streamed expert groups: per group, every
+        projection field as a ``[_STREAM_GROUP, ...]`` array of the slot
+        dtype, evaluated, with a writable byte view of its buffer. ``None``
+        when a field's checkpoint bytes are not the slot's layout (the
+        caller then installs, as before)."""
+        c = self.cache
+        fields = []
+        for name, fi, plan in c._plans(0):
+            shape, dtype = c._slot_specs[name][fi]
+            row = int(np.prod(shape)) * dtype.size
+            if plan.nbytes != row or _plan_dtype(plan) != dtype:
+                return None
+            fields.append((name, fi, shape, dtype, row))
+        ring = []
+        for _ in range(min(_STREAM_RING, n_groups)):
+            arrays = {
+                (name, fi): mx.zeros((_STREAM_GROUP,) + tuple(shape), dtype=dtype)
+                for name, fi, shape, dtype, _ in fields
+            }
+            mx.eval(*arrays.values())
+            views = {key: memoryview(a).cast("B") for key, a in arrays.items()}
+            ring.append((arrays, views))
+        return ring, {(name, fi): row for name, fi, _, _, row in fields}
+
+    def _forward_streamed(self, flat_x: mx.array, ids: list[int], k: int):
+        """Over-capacity prefill that leaves the resident experts in place.
+
+        The routes are grouped by expert, resident experts first, as in
+        :meth:`_forward_expert_major`. Free slots (a cold cache) take the
+        call's most-routed experts. The resident routes run on the slots;
+        every other expert is read straight into temporary weights, in groups
+        of ``_STREAM_GROUP``, and its routes run on them through a copy of the
+        module that shares everything but those weights, while the next
+        groups are read. Nothing is evicted, so the experts the decode keeps
+        hot survive the prompt, and no slot is written while the GPU reads
+        the slots. Each route still runs once, one route per row, under the
+        module's own forward (rounding may differ from the installing path,
+        as between residencies).
+        """
+        c = self.cache
+        d_model = flat_x.shape[-1]
+        ids_np = np.asarray(ids, dtype=np.int64)
+        used, counts = np.unique(ids_np, return_counts=True)
+        fill = []
+        if c.free:
+            new = used[[int(e) not in c.slot_of for e in used]]
+            if len(new):
+                top = np.argsort(-counts[np.searchsorted(used, new)], kind="stable")
+                fill = [int(e) for e in new[top[: len(c.free)]]]
+                c._ensure_ids(fill)
+        resident = np.zeros(c.n_experts, dtype=np.bool_)
+        resident[c.slot_expert[c.slot_expert >= 0]] = True
+        stream = used[~resident[used]]
+        groups = [
+            stream[i : i + _STREAM_GROUP] for i in range(0, len(stream), _STREAM_GROUP)
+        ]
+        ring = self._ring(len(groups)) if groups else ([], {})
+        if ring is None:
+            return self._forward_expert_major(flat_x, ids, k)
+        ring, row_bytes = ring
+        filled = set(fill)
+        rest = [int(e) for e in used if int(e) not in filled]
+        c.note_streamed(rest, int(resident[used].sum()) - len(fill), len(stream))
+
+        rank = ids_np + (~resident[ids_np]) * c.n_experts
+        order = np.argsort(rank, kind="stable")  # resident first, then by id
+        sorted_ids = ids_np[order]
+        n_res = int(resident[ids_np].sum())
+        tail = sorted_ids[n_res:]
+        pool = _io_pool()
+        reads: dict[int, list] = {}
+
+        def start(g: int) -> None:
+            _, views = ring[g % len(ring)]
+            futures = []
+            for j, e in enumerate(groups[g]):
+                for name, fi, plan in c._plans(int(e)):
+                    row = row_bytes[(name, fi)]
+                    view = views[(name, fi)][j * row : (j + 1) * row]
+                    if pool is None:
+                        _pread_into(c.disk, plan, view)
+                    else:
+                        futures.append(pool.submit(_pread_into, c.disk, plan, view))
+            reads[g] = futures
+
+        def run(glu, a: int, b: int, slots: mx.array) -> mx.array:
+            t_idx = mx.array(order[a:b] // k, dtype=mx.int32)
+            xe = mx.take(flat_x, t_idx, axis=0)
+            return glu(xe, slots.reshape(-1, 1))[:, 0, :]
+
+        outs = []
+        try:
+            for g in range(len(ring)):
+                start(g)
+            if n_res:
+                chunk = mx.array(sorted_ids[:n_res], dtype=mx.int32)
+                o = run(c.glu, 0, n_res, mx.take(c.map, chunk))
+                mx.async_eval(o)
+                outs.append(o)
+            if groups:
+                glu = copy.copy(c.glu)
+                for name in _PROJS:
+                    glu[name] = copy.copy(c.glu[name])
+            for g, group in enumerate(groups):
+                futures = reads.pop(g)
+                wait(futures)
+                for f in futures:
+                    f.result()
+                arrays, _ = ring[g % len(ring)]
+                for (name, fi), a in arrays.items():
+                    glu[name][_FIELDS[fi]] = a
+                a = n_res + int(np.searchsorted(tail, group[0], side="left"))
+                b = n_res + int(np.searchsorted(tail, group[-1], side="right"))
+                local = np.searchsorted(group, sorted_ids[a:b])
+                o = run(glu, a, b, mx.array(local, dtype=mx.int32))
+                mx.async_eval(o)
+                outs.append(o)
+                if g + len(ring) < len(groups):
+                    mx.eval(o)  # its weights take the group read next
+                    start(g + len(ring))
+            mx.eval(outs)
+        finally:
+            pending = [f for futures in reads.values() for f in futures]
+            for f in pending:
+                f.cancel()
+            if pending:
+                wait(pending)
+        out = mx.concatenate(outs, axis=0)
+        inverse = mx.array(np.argsort(order, kind="stable"), dtype=mx.int32)
+        return mx.take(out, inverse, axis=0).reshape(-1, k, d_model)
+
     def __call__(self, x: mx.array, indices: mx.array, scores=None, weighted_sum=False):
         c = self.cache
         flat_i = indices.reshape(-1, indices.shape[-1])
@@ -387,7 +566,8 @@ class OffloadedSwitchGLU(nn.Module):
             route_trace.record(
                 trace, self._layer, c, ids, n_tok, k, route_trace.EXPERT_MAJOR
             )
-        y = self._forward_expert_major(x.reshape(-1, x.shape[-1]), ids, k)
+        forward = self._forward_streamed if _STREAM else self._forward_expert_major
+        y = forward(x.reshape(-1, x.shape[-1]), ids, k)
         y = y.reshape(indices.shape + (x.shape[-1],))
         # Sum exactly when the module's own forward would have: it returns the
         # routes unsummed unless the call is sorted, carries float32 scores of
