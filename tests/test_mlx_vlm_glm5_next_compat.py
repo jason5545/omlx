@@ -3499,7 +3499,10 @@ def test_offloaded_moe_decode_starts_router_then_shared_expert(
     the routed experts, so the read-back waits for the router only. Same bits
     as the untouched blocks through decode and verify widths, with misses;
     with the overlap off nothing is started early."""
+    from omlx.patches.deepseek_v4 import moe_offload
+
     language = _language()
+    monkeypatch.setattr(moe_offload, "_PREFETCH", True)  # off by default
     offloaded, reference = _offloaded_moe_layers(tmp_path)
     for m in offloaded:
         m.switch_mlp._overlap = overlap

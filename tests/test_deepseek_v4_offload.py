@@ -118,6 +118,27 @@ def _scores(indices):
     return s / s.sum(axis=-1, keepdims=True)
 
 
+def _slow_reads(patch, seconds=0.02):
+    """Slow every checkpoint read, into bytes or straight into a slot."""
+    import time
+
+    import omlx.patches.moe_expert_offload as meo
+
+    read = meo.CheckpointExpertStore.read
+    read_into = dsv4._pread_into
+
+    def slow_read(plan):
+        time.sleep(seconds)
+        return read(plan)
+
+    def slow_read_into(*args):
+        time.sleep(seconds)
+        return read_into(*args)
+
+    patch.setattr(meo.CheckpointExpertStore, "read", staticmethod(slow_read))
+    patch.setattr(dsv4, "_pread_into", slow_read_into)
+
+
 @pytest.fixture(params=["native", "fallback"])
 def kernels(request, monkeypatch):
     """With the native GLM/DSv4 kernels, or without them as on a CI runner:
@@ -327,8 +348,6 @@ def test_decode_keeps_gpu_busy_while_reads_are_pending(
     """A decode step whose reads are slow keeps submitting GPU work while it
     waits (the common adapter's keepalive); the output stays bit-identical,
     and with the overlap off nothing is submitted."""
-    import time
-
     import omlx.patches.moe_expert_offload as meo
 
     x = _x(1, 1, D)
@@ -336,11 +355,6 @@ def test_decode_keeps_gpu_busy_while_reads_are_pending(
     idx = mx.array([[[0, 1, 2, 3, 20, 21]]])  # four hits, two misses
     ref = reference(x, idx)
     mx.eval(ref)
-    read = meo.CheckpointExpertStore.read
-
-    def slow_read(plan):
-        time.sleep(0.02)
-        return read(plan)
 
     def run(overlap):
         wrapped = _wrapped(tmp_path, reference, 0.25)
@@ -349,7 +363,7 @@ def test_decode_keeps_gpu_busy_while_reads_are_pending(
         submitted = []
         async_eval = mx.async_eval
         with monkeypatch.context() as patch:
-            patch.setattr(meo.CheckpointExpertStore, "read", staticmethod(slow_read))
+            _slow_reads(patch)
             patch.setattr(
                 meo.mx,
                 "async_eval",
@@ -393,6 +407,112 @@ def test_decode_starts_the_routed_experts_it_returns(tmp_path, reference, monkey
     off, started_off = run(False)
     assert bool(mx.array_equal(ref, on)) and bool(mx.array_equal(ref, off))
     assert started_on and not started_off
+
+
+def _decode_steps(n=24, seed=3):
+    """Decode and verify blocks of 1-4 tokens over all experts."""
+    mx.random.seed(seed)
+    steps = []
+    for length in ([1, 3, 2, 4] * n)[:n]:
+        i = mx.random.randint(0, E, (1, length, K))
+        steps.append((_x(1, length, D), i))
+    return steps
+
+
+def _cache_state(c):
+    return (
+        c.hits,
+        c.misses,
+        c.fetched_bytes,
+        c.slot_expert.tolist(),
+        sorted(c.slot_of.items()),
+        sorted(c.free),
+        c.map.tolist(),
+        c.score.tolist(),
+    )
+
+
+def test_decode_reads_misses_into_their_slots(tmp_path, reference, monkeypatch):
+    """Decode misses are read straight into the slots the installing path
+    would have given them: no bytes turned into arrays, no MLX slot write,
+    the same outputs bit for bit and the same cache state, with slow reads
+    (the wait keeps the GPU clocked) or fast ones."""
+    import omlx.patches.moe_expert_offload as meo
+
+    steps = _decode_steps()
+    refs = [reference(x, i) for x, i in steps]
+    mx.eval(refs)
+    to_mx = meo.CheckpointExpertStore.to_mx
+
+    def run(into, slow):
+        wrapped = _wrapped(tmp_path, reference, 0.75)  # 4-token blocks fit
+        converted = []
+        outs = []
+        with monkeypatch.context() as patch:
+            patch.setattr(dsv4, "_INTO_SLOT", into)
+            patch.setattr(
+                meo.CheckpointExpertStore,
+                "to_mx",
+                staticmethod(lambda *a: (converted.append(1), to_mx(*a))[1]),
+            )
+            if slow:
+                _slow_reads(patch, 0.002)
+            for x, i in steps:
+                assert wrapped.overlaps_decode(i.size)
+                out = wrapped(x, i)
+                mx.eval(out)
+                outs.append(out)
+        return outs, _cache_state(wrapped.cache), len(converted)
+
+    for slow in (False, True):
+        into, state_into, converted_into = run(True, slow)
+        installed, state_installed, converted_installed = run(False, slow)
+        assert all(bool(mx.array_equal(r, o)) for r, o in zip(refs, into))
+        assert all(bool(mx.array_equal(r, o)) for r, o in zip(refs, installed))
+        assert state_into == state_installed
+        assert state_into[1] > 10  # misses
+        assert converted_into == 0 and converted_installed > 0
+
+
+def test_decode_read_failure_gives_the_claimed_slots_back(
+    tmp_path, reference, monkeypatch
+):
+    """A read that fails mid-call raises, waits out the other reads, and
+    leaves no expert resident on a slot its bytes never reached: the misses
+    after the failed one give their claimed slots back, the cache stays
+    consistent, and the next call reads them again and matches the module."""
+    x = _x(1, 2, D)
+    idx = mx.array([[[0, 1, 2, 3, 20, 21], [4, 5, 0, 1, 22, 2]]])  # misses 20, 21, 22
+    ref = reference(x, idx)
+    mx.eval(ref)
+    wrapped = _wrapped(tmp_path, reference, 0.5)
+    c = wrapped.cache
+    for first in (0, 6, 10):  # fill all 16 slots, so the misses evict
+        mx.eval(wrapped(_x(1, 1, D), mx.arange(first, first + K).reshape(1, 1, K)))
+    assert not c.free
+    read_into = dsv4._pread_into
+    bad = [plan for _, _, plan in c._plans(21)]
+
+    def failing(store_view, plan, view):
+        if plan in bad:
+            raise OSError("injected")
+        return read_into(store_view, plan, view)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dsv4, "_pread_into", failing)
+        with pytest.raises(OSError, match="injected"):
+            wrapped(x, idx)
+    assert 20 in c.slot_of and {21, 22}.isdisjoint(c.slot_of)
+    assert len(c.free) == 2
+    assert len(c.slot_of) + len(c.free) == c.capacity
+    for e, slot in c.slot_of.items():
+        assert c.slot_expert[slot] == e
+    for slot in c.free:
+        assert c.slot_expert[slot] == -1
+    mapped = c.map.tolist()
+    assert all(mapped[e] == c.slot_of.get(e, -1) for e in range(E))
+    out = wrapped(x, idx)
+    assert bool(mx.array_equal(ref, out))
 
 
 def test_route_trace_records_calls_and_changes_nothing(

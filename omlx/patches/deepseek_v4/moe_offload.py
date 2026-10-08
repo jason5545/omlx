@@ -56,6 +56,7 @@ from ..moe_expert_offload import (
     ExpertCache,
     _drain,
     _env_int,
+    _gpu_keepalive,
     _GLUStoreView,
     _io_batch,
     _io_pool,
@@ -70,11 +71,21 @@ logger = logging.getLogger(__name__)
 
 _PROJS = ("gate_proj", "up_proj", "down_proj")
 
-# glm5_next decode reads the next layer's predicted misses ahead (see
-# OffloadedSwitchGLU.stage_next_routes). OMLX_MOE_OFFLOAD_PREFETCH=0 turns
-# it off; at most _PREFETCH_MAX experts are read ahead per layer.
-_PREFETCH = os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH", "1") != "0"
+# glm5_next decode can read the next layer's predicted misses ahead (see
+# OffloadedSwitchGLU.stage_next_routes); at most _PREFETCH_MAX experts per
+# layer. Off unless OMLX_MOE_OFFLOAD_PREFETCH=1: on GLM-5.3 oQ3.5e at 54%
+# residency (M5 Max) it made decode 12-20% slower per MTP cycle. Each read
+# ahead holds an IO worker for its expert's slabs in turn, and the next
+# layer's own misses queue behind them on the same pool, while about half
+# the reads go unused.
+_PREFETCH = os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH", "0") == "1"
 _PREFETCH_MAX = 8
+# Decode misses are read straight into their slots (_SlotCache._ensure_decode).
+# OMLX_MOE_OFFLOAD_READ_INTO_SLOT=0 keeps the read-then-install path.
+_INTO_SLOT = os.environ.get("OMLX_MOE_OFFLOAD_READ_INTO_SLOT", "1") != "0"
+# How long those reads may run before the wait keeps the GPU clocked (the
+# common adapter waits 0.5 ms; this path was measured at 0).
+_KEEPALIVE_GRACE_S = _env_int("OMLX_MOE_OFFLOAD_KEEPALIVE_GRACE_US", 0, 0) * 1e-6
 
 # Over-capacity prefill reads the experts the cache does not hold into
 # temporary weights and computes them group by group while the next groups
@@ -150,6 +161,117 @@ class _SlotCache(ExpertCache):
     def __init__(self, glu, capacity: int, view: _GLUStoreView):
         self.glu = glu  # read by _allocate, which the base constructor calls
         super().__init__(glu, capacity, view)
+        self.rows = self._row_layout()
+
+    def _row_layout(self):
+        """Per projection field ``(name, fi)``: ``(shape, dtype, row bytes)``
+        of one slot row, or ``None`` when a field's checkpoint bytes are not
+        that row's layout (then nothing may be read straight into a slot)."""
+        rows = {}
+        for name, fi, plan in self._plans(0):
+            shape, dtype = self._slot_specs[name][fi]
+            row = int(np.prod(shape)) * dtype.size
+            if plan.nbytes != row or _plan_dtype(plan) != dtype:
+                return None
+            rows[(name, fi)] = (shape, dtype, row)
+        return rows
+
+    def _ensure_decode(self, ids, pending=None) -> None:
+        """:meth:`_ensure_ids` for a decode step, reading misses into their slots.
+
+        The slots are claimed before the reads start, in miss order and by
+        the installing path's rule (a free slot, else the lowest decayed
+        count outside the call's experts), so the cache ends in the same
+        state. Each slab is then read with ``os.preadv`` straight into its
+        slot row, one IO task per slab, instead of into bytes the main thread
+        turns into an array and the GPU copies into the slot (on GLM-5.3
+        oQ3.5e expert shapes, M5 Max: 0.3-0.38 ms less per miss, from the SSD
+        and from page cache alike). Once a read is still running
+        ``_KEEPALIVE_GRACE_S`` after they start, the rest of the wait keeps
+        the GPU clocked. A read started ahead (``pending``) holds bytes,
+        copied into the slot once done. A failed read waits out the others
+        and gives back the slots whose expert did not arrive. Falls back to
+        :meth:`_ensure_ids` (with the keepalive) when reads are serial or a
+        slab's checkpoint bytes are not its slot row's layout.
+        """
+        pool = _io_pool()
+        if not _INTO_SLOT or pool is None or self.rows is None:
+            self._ensure_ids(ids, lambda: None, pending=pending)
+            return
+        pending = dict(pending or {})
+        needed = list(dict.fromkeys(int(e) for e in ids))
+        if len(needed) > self.capacity:
+            _drain(pending)
+            raise ValueError("Expert cache capacity is smaller than the call's routes")
+        np.add.at(self.score, np.asarray(ids, dtype=np.int64), 1.0)
+        self._calls += 1
+        if self._calls % _SCORE_DECAY_EVERY == 0:
+            self.score *= _SCORE_DECAY
+        misses = [e for e in needed if e not in self.slot_of]
+        self.hits += len(needed) - len(misses)
+        if not misses:
+            _drain(pending)
+            return
+        protected = frozenset(needed)
+        claimed = []  # (expert, slot); resident once its reads are done
+        groups = []  # per claimed expert: [(slot row view, future, copy bytes)]
+        done = 0
+        try:
+            for e in misses:
+                slot = self._reserve(protected)
+                # Owned from now on, so the next claim cannot take it back.
+                self.slot_of[e] = slot
+                self.slot_expert[slot] = e
+                claimed.append((e, slot))
+            # A write to a slot tensor still pending lands before the reads.
+            mx.eval(*(self.resident[name][fi] for name, fi in self.rows))
+            views = {
+                key: memoryview(self.resident[key[0]][key[1]]).cast("B")
+                for key in self.rows
+            }
+            for e, slot in claimed:
+                ahead = pending.pop(e, None)
+                group = []
+                for n, (name, fi, plan) in enumerate(self._plans(e)):
+                    row = self.rows[(name, fi)][2]
+                    dst = views[(name, fi)][slot * row : (slot + 1) * row]
+                    if ahead is not None:
+                        group.append((dst, ahead[n][3], True))
+                    else:
+                        future = pool.submit(_pread_into, self.disk, plan, dst)
+                        group.append((dst, future, False))
+                groups.append(group)
+            keepalive = None
+            reads = [f for group in groups for _, f, _ in group]
+            if wait(reads, timeout=_KEEPALIVE_GRACE_S).not_done:
+                keepalive = _gpu_keepalive()
+            for (e, slot), group in zip(claimed, groups):
+                futures = [f for _, f, _ in group]
+                if keepalive is not None:
+                    keepalive.wait(futures)
+                else:
+                    wait(futures)
+                for dst, future, copy_bytes in group:
+                    raw = future.result()
+                    if copy_bytes:
+                        dst[:] = raw
+                self.map[e] = slot
+                self.misses += 1
+                self.fetched_bytes += self.expert_bytes
+                done += 1
+        finally:
+            if done < len(claimed):
+                # Nothing may write a slot once it is given back.
+                futures = [f for group in groups for _, f, _ in group]
+                for future in futures:
+                    future.cancel()
+                wait(futures)
+                for e, slot in claimed[done:]:
+                    del self.slot_of[e]
+                    self.slot_expert[slot] = -1
+                    self.free.append(slot)
+            _drain(pending)
+        self.warm = len(self.slot_of) == self.n_experts
 
     def _allocate(self, capacity: int) -> None:
         super()._allocate(capacity)
@@ -386,24 +508,19 @@ class OffloadedSwitchGLU(nn.Module):
         dtype, evaluated, with a writable byte view of its buffer. ``None``
         when a field's checkpoint bytes are not the slot's layout (the
         caller then installs, as before)."""
-        c = self.cache
-        fields = []
-        for name, fi, plan in c._plans(0):
-            shape, dtype = c._slot_specs[name][fi]
-            row = int(np.prod(shape)) * dtype.size
-            if plan.nbytes != row or _plan_dtype(plan) != dtype:
-                return None
-            fields.append((name, fi, shape, dtype, row))
+        rows = self.cache.rows
+        if rows is None:
+            return None
         ring = []
         for _ in range(min(_STREAM_RING, n_groups)):
             arrays = {
-                (name, fi): mx.zeros((_STREAM_GROUP,) + tuple(shape), dtype=dtype)
-                for name, fi, shape, dtype, _ in fields
+                key: mx.zeros((_STREAM_GROUP,) + tuple(shape), dtype=dtype)
+                for key, (shape, dtype, _) in rows.items()
             }
             mx.eval(*arrays.values())
             views = {key: memoryview(a).cast("B") for key, a in arrays.items()}
             ring.append((arrays, views))
-        return ring, {(name, fi): row for name, fi, _, _, row in fields}
+        return ring, {key: row for key, (_, _, row) in rows.items()}
 
     def _forward_streamed(self, flat_x: mx.array, ids: list[int], k: int):
         """Over-capacity prefill that leaves the resident experts in place.
@@ -530,8 +647,8 @@ class OffloadedSwitchGLU(nn.Module):
         if fits:
             decode = self.overlaps_decode(indices.size)
             if decode:
-                # Decode: when the first miss is still being read after the
-                # grace period, the rest of the wait keeps the GPU clocked.
+                # Decode: misses are read straight into their slots, and a
+                # wait on them keeps the GPU clocked.
                 ids = _flat_ids(indices)
                 if trace is not None:
                     route_trace.record(
@@ -539,7 +656,7 @@ class OffloadedSwitchGLU(nn.Module):
                         decode=True, x=x,
                     )
                 pending = self._claim_reads(incoming, ids)
-                c._ensure_ids(ids, lambda: None, pending=pending)
+                c._ensure_decode(ids, pending=pending)
             else:
                 if trace is not None:
                     route_trace.record(
