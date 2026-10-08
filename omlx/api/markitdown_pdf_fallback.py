@@ -183,6 +183,7 @@ async def stream_pdf_with_ocr_engine(
                 data_uris,
                 global_settings=global_settings,
                 chat_kwargs=chat_kwargs,
+                max_concurrent=_pool_concurrency_cap(engine_pool, model_id),
             ):
                 text = text.strip()
                 if not text:
@@ -211,15 +212,26 @@ async def stream_pdf_with_ocr_engine(
         )
 
 
+def _pool_concurrency_cap(engine_pool: Any, model_id: str) -> int | None:
+    """Pool's cap for the OCR model: wider while it is the only resident one."""
+    cap_for = getattr(engine_pool, "max_concurrent_requests_for", None)
+    if not callable(cap_for):
+        return None
+    cap = cap_for(model_id)
+    return cap if isinstance(cap, int) and cap > 0 else None
+
+
 async def _stream_pages_with_ocr(
     engine: Any,
     data_uris: list[str],
     *,
     global_settings: Any | None,
     chat_kwargs: dict[str, Any],
+    max_concurrent: int | None = None,
 ):
-    scheduler = getattr(global_settings, "scheduler", None)
-    max_concurrent = int(getattr(scheduler, "max_concurrent_requests", 1) or 1)
+    if max_concurrent is None:
+        scheduler = getattr(global_settings, "scheduler", None)
+        max_concurrent = int(getattr(scheduler, "max_concurrent_requests", 1) or 1)
     semaphore = asyncio.Semaphore(max(1, max_concurrent))
     queue: asyncio.Queue[tuple[int, str, Exception | None]] = asyncio.Queue()
 

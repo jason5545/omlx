@@ -233,6 +233,19 @@ def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
     return False
 
 
+# An OCR model may stay resident beside one other model. While it is the only
+# resident model it gets this wider concurrency cap; otherwise it shares the
+# configured max_concurrent_requests like every other engine.
+_OCR_SOLO_MAX_CONCURRENT_REQUESTS = 8
+
+
+def _is_ocr_entry(entry: "EngineEntry") -> bool:
+    """Same OCR test the MarkItDown PDF path applies to a model."""
+    return entry.engine_type == "vlm" and "ocr" in (
+        entry.config_model_type or ""
+    ).lower()
+
+
 def _set_concurrency_limits(config: object, value: int) -> None:
     config.max_num_seqs = value
     config.completion_batch_size = value
@@ -1278,17 +1291,55 @@ class EnginePool:
                     config = getattr(host, "_scheduler_config", None)
                     if config is not None:
                         _set_concurrency_limits(config, value)
-                    core = getattr(getattr(host, "_engine", None), "engine", None)
-                    scheduler = getattr(core, "scheduler", None)
-                    if scheduler is None:
-                        continue
-                    _set_concurrency_limits(scheduler.config, value)
-                    executor = getattr(core, "_mlx_executor", None)
-                    if executor is None:
-                        continue
-                    # A shut-down executor means the engine is stopping.
-                    with suppress(RuntimeError):
-                        executor.submit(_set_decode_cap, scheduler, value)
+                    self._set_host_scheduler_concurrency(host, value)
+            self._apply_ocr_solo_concurrency()
+
+    def max_concurrent_requests_for(self, model_id: str) -> int:
+        """Concurrency cap for ``model_id`` given the current resident set."""
+        configured = max(1, int(self._scheduler_config.max_num_seqs))
+        loaded = [mid for mid, e in self._entries.items() if e.engine is not None]
+        entry = self._entries.get(model_id)
+        if entry is not None and _is_ocr_entry(entry) and loaded in ([], [model_id]):
+            return max(configured, _OCR_SOLO_MAX_CONCURRENT_REQUESTS)
+        return configured
+
+    @staticmethod
+    def _set_host_scheduler_concurrency(host: object, value: int) -> None:
+        """Set one engine's live scheduler admission and decode caps."""
+        core = getattr(getattr(host, "_engine", None), "engine", None)
+        scheduler = getattr(core, "scheduler", None)
+        if scheduler is None:
+            return
+        _set_concurrency_limits(scheduler.config, value)
+        executor = getattr(core, "_mlx_executor", None)
+        if executor is None:
+            return
+        # A shut-down executor means the engine is stopping.
+        with suppress(RuntimeError):
+            executor.submit(_set_decode_cap, scheduler, value)
+
+    def _apply_ocr_solo_concurrency(self) -> None:
+        """Re-cap resident OCR engines after the resident set changed.
+
+        A VLM scheduler runs on its own copy of the pool scheduler config, so
+        this widens only the OCR engine's cap and never the shared config.
+        """
+        for mid, entry in self._entries.items():
+            if entry.engine is None or not _is_ocr_entry(entry):
+                continue
+            value = self.max_concurrent_requests_for(mid)
+            core = getattr(getattr(entry.engine, "_engine", None), "engine", None)
+            scheduler = getattr(core, "scheduler", None)
+            if scheduler is None or scheduler.config.max_num_seqs == value:
+                continue
+            logger.info(
+                "OCR model '%s' concurrency cap -> %d (%s)",
+                mid,
+                value,
+                "only resident model" if value != self._scheduler_config.max_num_seqs
+                else "shared residency",
+            )
+            self._set_host_scheduler_concurrency(entry.engine, value)
 
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
@@ -2577,6 +2628,12 @@ class EnginePool:
         ceiling while leaving the first model's weights, caches, and runtime
         state alive. Keep the pool's resident set to one model instead.
 
+        The one exception is an OCR model: it may stay resident beside one
+        non-OCR model, so a PDF OCR pass does not evict the chat model (and
+        the chat model does not evict the OCR model). Only models of the same
+        kind as ``model_id`` are unloaded, which caps residency at one OCR
+        plus one non-OCR model.
+
         Caller must hold ``self._lock``. Do not partially switch when another
         model is active; first inspect all victims and fail with a useful busy
         error if any of them still owns a lease or scheduler work.
@@ -2585,10 +2642,14 @@ class EnginePool:
         uses this to distinguish reclaimable residue from unrelated process
         memory when it rechecks the memory ceiling.
         """
+        target = self._entries.get(model_id)
+        target_is_ocr = target is not None and _is_ocr_entry(target)
         victims: list[str] = []
         blocked: list[str] = []
         for mid, entry in list(self._entries.items()):
             if mid == model_id or entry.engine is None:
+                continue
+            if _is_ocr_entry(entry) != target_is_ocr:
                 continue
             if entry.is_loading or self._entry_is_busy(entry):
                 blocked.append(mid)
@@ -3262,6 +3323,7 @@ class EnginePool:
 
         # Clear engine reference before settle barrier
         entry.engine = None
+        self._apply_ocr_solo_concurrency()
         entry.last_access = 0.0
         entry.actual_size = None
         entry.abort_requested = False
@@ -3915,6 +3977,7 @@ class EnginePool:
             entry.last_access = time.time()
             self._current_model_memory += resident_size
             load_completed = True
+            self._apply_ocr_solo_concurrency()
             self._clear_load_failure(entry)
             self._ensure_gpu_keep_warm_task()
 

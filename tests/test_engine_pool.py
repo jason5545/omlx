@@ -2714,6 +2714,92 @@ class TestGuardOffBestEffortAdmission:
         mock_engine.stop.assert_awaited_once()
 
 
+class TestEnginePoolOcrResidency:
+    """An OCR model may share residency with one other model."""
+
+    @staticmethod
+    def _engine():
+        scheduler = SimpleNamespace(
+            config=SimpleNamespace(max_num_seqs=3, completion_batch_size=3),
+            batch_generator=None,
+        )
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine._engine = SimpleNamespace(
+            engine=SimpleNamespace(scheduler=scheduler, _mlx_executor=None)
+        )
+        return engine
+
+    @staticmethod
+    def _pool() -> EnginePool:
+        pool = _make_pool(ceiling=None)
+        pool._scheduler_config.max_num_seqs = 3
+        for model_id, model_type, engine_type, config_type in (
+            ("chat", "llm", "batched", "qwen3_5"),
+            ("vision", "vlm", "vlm", "qwen3_vl"),
+            ("ocr-a", "vlm", "vlm", "glm_ocr"),
+            ("ocr-b", "vlm", "vlm", "unlimited-ocr"),
+        ):
+            pool._entries[model_id] = EngineEntry(
+                model_id=model_id,
+                model_path=f"/models/{model_id}",
+                model_type=model_type,
+                engine_type=engine_type,
+                estimated_size=1,
+                config_model_type=config_type,
+            )
+        unloaded: list[str] = []
+
+        async def _unload(model_id, **_kwargs):
+            unloaded.append(model_id)
+            pool._entries[model_id].engine = None
+            pool._apply_ocr_solo_concurrency()
+
+        pool._unload_engine = _unload
+        pool.unloaded = unloaded
+        return pool
+
+    async def _load(self, pool: EnginePool, model_id: str) -> None:
+        await pool._unload_other_models_for_single_model(model_id)
+        pool._entries[model_id].engine = self._engine()
+        pool._apply_ocr_solo_concurrency()
+
+    @staticmethod
+    def _caps(pool: EnginePool) -> dict[str, int]:
+        return {
+            mid: e.engine._engine.engine.scheduler.config.max_num_seqs
+            for mid, e in pool._entries.items()
+            if e.engine is not None
+        }
+
+    @pytest.mark.asyncio
+    async def test_ocr_stays_resident_beside_one_other_model(self):
+        pool = self._pool()
+        await self._load(pool, "ocr-a")
+        await self._load(pool, "chat")
+        assert pool.unloaded == []
+        await self._load(pool, "vision")
+        assert pool.unloaded == ["chat"]
+        await self._load(pool, "ocr-b")
+        assert pool.unloaded == ["chat", "ocr-a"]
+        assert set(self._caps(pool)) == {"vision", "ocr-b"}
+
+    @pytest.mark.asyncio
+    async def test_ocr_alone_gets_wider_concurrency_cap(self):
+        pool = self._pool()
+        await self._load(pool, "ocr-a")
+        assert self._caps(pool) == {"ocr-a": 8}
+        assert pool.max_concurrent_requests_for("ocr-a") == 8
+
+        await self._load(pool, "chat")
+        assert self._caps(pool) == {"ocr-a": 3, "chat": 3}
+        assert pool.max_concurrent_requests_for("ocr-a") == 3
+        assert pool.max_concurrent_requests_for("chat") == 3
+
+        await pool._unload_engine("chat")
+        assert self._caps(pool) == {"ocr-a": 8}
+
+
 class TestEnginePoolPrefillEviction:
     """Tests for request-time idle LRU eviction before prefill throttling."""
 
