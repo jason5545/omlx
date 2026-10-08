@@ -47,6 +47,19 @@ security find-identity -v -p codesigning 2>/dev/null | grep -q "${IDENTITY}" \
   || die "這個 shell 看不到簽章憑證 ${IDENTITY:0:8}…（多半是 sandbox 讀不到 Keychain）。換一個看得到憑證的 shell 再跑，不要重新登入或重建憑證"
 
 # 3. build：donor 指紋沒變時會沿用 packaging/_export，只重貼 framework-mlx-base 和 omlx。
+# build.sh 用 PYTHON_BIN 編 custom kernel，ABI 必須跟 app 內附的 CPython 相同；沒指定時它抓
+# PATH 上的 python3，Homebrew 把 python3 升到 3.14 後就對不上 app 的 3.11（2026-10-08）。
+# 沒指定 PYTHON_BIN 就照 packaging/venvstacks.toml 的版本找同版的 python。這支 Python 還要
+# import 得到 nanobind，版本照 pyproject 的 build pin（build.sh 會檢查並印出安裝指令）。
+if [[ -z ${PYTHON_BIN:-} ]]; then
+  PY_MM=$(sed -n 's/^python_implementation = "cpython@\([0-9]*\.[0-9]*\)\..*/\1/p' \
+    "${REPO}/packaging/venvstacks.toml" | head -1)
+  [[ -n ${PY_MM} ]] || die "讀不到 packaging/venvstacks.toml 的 CPython 版本，用 PYTHON_BIN 指定編 kernel 的 Python"
+  PYTHON_BIN=$(command -v "python${PY_MM}" || true)
+  [[ -n ${PYTHON_BIN} ]] || die "找不到 python${PY_MM}（app 內附 CPython ${PY_MM}，編 kernel 要同版）：brew install python@${PY_MM}，或用 PYTHON_BIN 指定"
+fi
+export PYTHON_BIN
+say "編 kernel 的 Python：${PYTHON_BIN}"
 say "build.sh release（log：${BUILD_LOG}）"
 mkdir -p "$(dirname "${BUILD_LOG}")"
 if ! "${APP_DIR}/Scripts/build.sh" release >"${BUILD_LOG}" 2>&1; then

@@ -183,6 +183,8 @@ donor 只在 `pyproject.toml`、`packaging/venvstacks.toml`、`uv.lock` 三個�
 
 部署 app 用 `scripts/deploy_app.sh`：build release、清 broken symlink（有才清）、重簽、驗證、關 app、替換 `/Applications/oMLX.app`、重開，最後確認 attach 成立，並在 `Contents/Resources/omlx-source-commit` 記下來源 commit（`deploy_fast.sh --status` 用它判斷兩邊是否同步）。`deploy_fast.sh` 會自動接著跑它；brew 整套重裝之後要手動跑。下面各段是它做的事，也是手動時的等價步驟。
 
+build 時編 custom kernel 的 Python 要跟 app 內附的 CPython 同版（`packaging/venvstacks.toml` 的 `python_implementation`，目前 3.11）：沒設 `PYTHON_BIN` 時腳本自己找 `python3.11`，不用 PATH 上的 `python3`（Homebrew 2026-10 已升到 3.14，ABI 對不上）。這支 Python 要 import 得到 nanobind，版本照 `pyproject.toml` 的 build pin；2026-10-08 用 `/opt/homebrew/bin/python3.11 -m pip install --user nanobind==3.0.1` 裝在 `~/Library/Python/3.11`，沒動 Homebrew 的 site-packages。
+
 要部署給 Jason 用時，必須再用 Jason 的 Apple Development cert 重簽 staged app：
 
 ```text
