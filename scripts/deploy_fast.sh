@@ -177,6 +177,7 @@ ${CHANGED}"
 xcrun -f metal >/dev/null 2>&1 \
   || die "找不到 Metal 編譯器（xcrun -f metal），編不了 custom kernel。先跑 xcodebuild -downloadComponent MetalToolchain"
 export OMLX_WITH_CUSTOM_KERNEL=1
+USER_CMAKE_ARGS=${CMAKE_ARGS-}
 export CMAKE_ARGS="${CMAKE_ARGS:+${CMAKE_ARGS} }-DPython_EXECUTABLE=${PY}"
 REAL_PIP_CACHE=$("${PIP}" cache dir)
 export PIP_CACHE_DIR=${TMP}/pip-cache
@@ -267,7 +268,10 @@ say "回滾：scripts/deploy_fast.sh ${PREV}"
 # 8. Mac app 同步部署。app 從 working tree 建，所以 HEAD 的 omlx/ 要跟剛部署的 commit 相同。
 if ((WITH_APP)); then
   say "接著部署 Mac app（scripts/deploy_app.sh）"
-  "${REPO}/scripts/deploy_app.sh" \
+  # 步驟 3 給 brew venv 的 CMAKE_ARGS 不能漏給 app：裡面的 Python_EXECUTABLE 會蓋掉
+  # deploy_app.sh 選的 Python，cmake 改去 brew venv 找 nanobind 而失敗（2026-10-08）。
+  env -u PIP_CACHE_DIR -u OMLX_WITH_CUSTOM_KERNEL CMAKE_ARGS="${USER_CMAKE_ARGS}" \
+    "${REPO}/scripts/deploy_app.sh" \
     || die "brew service 已部署 ${SHA:0:8}，但 Mac app 沒部署成功，兩邊不同步。照上面的原因處理後單獨跑 scripts/deploy_app.sh"
 else
   say "--no-app：沒有部署 Mac app，兩邊可能不同步（scripts/deploy_fast.sh --status 可查）"
