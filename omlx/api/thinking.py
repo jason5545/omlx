@@ -555,6 +555,45 @@ class ThinkingBudgetProcessor:
 
         return logits
 
+    # The MTP loop may pass a token history whose newest entries it already
+    # holds on the host (batch_generator._HostTokens): this processor only
+    # takes len() and int() of single positions, so no device read is needed.
+    host_token_view = True
+
+    def idle_for(self, n: int) -> bool:
+        """Whether the next ``n`` calls, each adding one token of any value,
+        return the logits unchanged.
+
+        A speculative drafter that rewinds this processor after its chain
+        may then skip those calls, and the device reads of their tokens.
+        A call changes the logits only while a sequence is forced (or about
+        to be, waiting for a UTF-8 boundary), once the answer loops, or when
+        a close or a reminder becomes due. Each is bounded from the current
+        state: the reasoning count grows by at most ``n`` (a reasoning that
+        reopens restarts from zero, at most ``n`` again), and the loop guard
+        gains at most ``n`` repeated n-grams.
+        """
+        if n <= 0:
+            return True
+        if not hasattr(self, "_accepted_up_to"):
+            return False
+        if self._loop_stop or self._forcing or self._waiting_utf8 or self._close_requested:
+            return False
+        reach = self._thinking_tokens + n
+        if self._budget is not None and reach >= self._budget:
+            return False
+        if (
+            self._nudged_at is not None
+            and reach - self._nudged_at > self._nudge_window
+        ):
+            return False
+        if self._nudge_after is not None and reach >= self._nudge_after:
+            # Due without a reminder yet, or after a reopened reasoning.
+            if self._nudged_at is None or n >= self._nudge_after:
+                return False
+        det = self._loop_detector
+        return det is None or det.looping or not det.may_trigger_within(n)
+
     def _start_forcing(self, kind: str, logits, mx):
         self._force_kind = kind
         self._recent_tokens = []

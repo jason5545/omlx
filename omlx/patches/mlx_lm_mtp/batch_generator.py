@@ -1608,6 +1608,49 @@ def _apply_processors(processors, prev_tokens, logits_2d):
     return logits_2d
 
 
+# Processors that only read single token ids (``host_token_view``) get the
+# ids the host already holds instead of reading each one back from the
+# device, a GPU round-trip per token. OMLX_MTP_PROCESSOR_HOST_TOKENS=0 keeps
+# the device reads.
+_PROCESSOR_HOST_TOKENS = (
+    os.environ.get("OMLX_MTP_PROCESSOR_HOST_TOKENS", "1").strip() != "0"
+)
+
+
+class _HostTokens:
+    """A token history whose positions from ``start`` on are host ints.
+
+    ``len()`` is the device history's; indexing a host position returns the
+    int, anything else indexes the device history (a device read, as before).
+    """
+
+    __slots__ = ("_dev", "_start", "_tail")
+
+    def __init__(self, dev, start: int, tail: List[int]):
+        self._dev = dev
+        self._start = start
+        self._tail = tail
+
+    def __len__(self) -> int:
+        return int(self._dev.shape[0])
+
+    def __getitem__(self, i):
+        if isinstance(i, int):
+            j = (i + len(self) if i < 0 else i) - self._start
+            if 0 <= j < len(self._tail):
+                return self._tail[j]
+        return self._dev[i]
+
+
+def _host_token_procs(procs) -> bool:
+    """Whether every processor reads the history through ``len``/``int`` only."""
+    return (
+        _PROCESSOR_HOST_TOKENS
+        and bool(procs)
+        and all(getattr(p, "host_token_view", False) for p in procs)
+    )
+
+
 def _snap_snapshotable(procs):
     """Checkpoint state of processors exposing ``snapshot_state`` (budget).
 
@@ -3036,6 +3079,7 @@ def _chain_next_drafts(
     committed: Any,
     prev_buf: Optional[Any],
     depth: Optional[int] = None,
+    committed_ids: Optional[List[int]] = None,
 ) -> None:
     """Rebuild committed MTP-head history and draft the next chain.
 
@@ -3055,6 +3099,12 @@ def _chain_next_drafts(
     advances ``state.hist_offset`` by n. All arrays are dispatched with
     ``mx.async_eval`` and stay lazy on the host; the next verify cycle's
     single sync resolves them.
+
+    ``committed_ids`` (the host ids of ``committed``) lets processors that
+    read ids on the host (``_host_token_procs``) skip the device read of the
+    first step's new token; when they are idle for the rest of the chain
+    (``idle_for``), those calls are skipped, since the processors are
+    rewound after the chain and would not change the draft logits.
     """
     import mlx.core as mx
 
@@ -3127,6 +3177,8 @@ def _chain_next_drafts(
 
     # Speculative draft shaping — see _dspark_next_drafts.
     snap = _snap_snapshotable(procs)
+    host_procs = committed_ids is not None and _host_token_procs(procs)
+    shaping = procs is not None and prev_buf is not None
 
     sparse_ids: List[Any] = []
     for j in range(depth):
@@ -3138,12 +3190,27 @@ def _chain_next_drafts(
             sparse_ids.append(mx.take(cand_ids.reshape(-1), ids))
         else:
             logits_2d = logits[:, -1, :]
-            if procs is not None and prev_buf is not None:
+            if shaping:
                 prev = mx.concatenate(
                     [prev_buf.astype(mx.int32), chain_prefix.astype(mx.int32)]
                     + [t.reshape(1).astype(mx.int32) for t in draft_toks]
                 )
+                if host_procs and j == 0:
+                    # The new token is the newest committed one, held here.
+                    prev = _HostTokens(
+                        prev, int(prev_buf.shape[0]), [int(committed_ids[-1])]
+                    )
                 logits_2d = _apply_processors(procs, prev, logits_2d)
+                if (
+                    host_procs
+                    and j == 0
+                    and depth > 1
+                    and all(p.idle_for(depth - 1) for p in procs)
+                ):
+                    # Unchanged logits for the rest of the chain whatever the
+                    # drafts are, and the rewind below undoes the state: skip
+                    # those calls and the device reads of the drafts.
+                    shaping = False
             lp_2d = _logprobs(logits_2d)
             if sparse_k:
                 tok, ids, accept_lp = _sample_draft_sparse(sampler, lp_2d, sparse_k)
@@ -4134,10 +4201,22 @@ def _run_verify_cycle_chain(
     rows = logits[0]  # (k+1, vocab)
     row_snaps: List[Optional[Any]] = [None] * (k + 1)
     if procs is not None:
+        row_tokens = prev_rows
+        if _host_token_procs(procs):
+            # The verify forward already evaluated [next_main, d1..dk], so
+            # their ids cost no GPU wait; each row's new token is then a host
+            # int. The buffer's pending appends, no longer read here, are
+            # dispatched so their lazy chain does not grow across cycles.
+            ids = [int(t) for t in inputs.tolist()]
+            start = int(prev_rows[0].shape[0]) - 1
+            row_tokens = [
+                _HostTokens(prev_rows[j], start, ids[: j + 1]) for j in range(k + 1)
+            ]
+            mx.async_eval(prev_rows[k])
         applied = []
         for j in range(k + 1):
             applied.append(
-                _apply_processors(procs, prev_rows[j], rows[j : j + 1]).squeeze(0)
+                _apply_processors(procs, row_tokens[j], rows[j : j + 1]).squeeze(0)
             )
             # Checkpoint after each row: rows 0..m correspond to the m+1
             # tokens actually emitted this cycle (m accepted drafts + the
@@ -4349,6 +4428,7 @@ def _run_verify_cycle_chain(
                 committed,
                 prev_buf,
                 depth=0 if copied else None,
+                committed_ids=committed_ids,
             )
             if copied:
                 state.drafts = mx.array(copied, dtype=mx.uint32)

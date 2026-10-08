@@ -111,6 +111,29 @@ class RepetitionDetector:
             self.looping = True
         return self.looping
 
+    def may_trigger_within(self, n: int) -> bool:
+        """Whether feeding ``n`` more tokens, whatever they are, could turn
+        ``looping`` on.
+
+        A feed adds at most one repeated n-gram (a new n-gram that matches
+        one in the window; an evicted one only removes a repeat or a unique
+        one) and never lowers the window's n-gram count, so after ``n``
+        feeds the share is at most ``(repeats + n) / grams``. ``reset()``
+        only lowers both counts and ``fed``. Exact enough to let a
+        speculative decoder skip rewound calls; never says no when a
+        trigger is possible.
+        """
+        if self.looping or n <= 0:
+            return False
+        if self._fed + n < self.min_tokens:
+            return False
+        total = len(self._grams)
+        if not total:
+            return True
+        repeats = total - len(self._counts)
+        # Margin against float rounding of ``ratio``.
+        return (repeats + n) / total + 1e-9 >= self.threshold
+
     def _discount(self, gram: int) -> None:
         left = self._counts[gram] - 1
         if left:

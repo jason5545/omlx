@@ -407,3 +407,107 @@ class TestSchedulerWiring:
         grammar._omlx_thinking_phase_optional = False
         procs = self._processors(monkeypatch, budget=None, grammar=grammar)
         assert procs == []
+
+
+# ---------------------------------------------------------------------------
+# Speculative skip bounds (RepetitionDetector.may_trigger_within,
+# ThinkingBudgetProcessor.idle_for): a "no" must hold for every token
+# sequence, so each is checked against adversarial continuations.
+# ---------------------------------------------------------------------------
+
+
+def _continuations(rng, history, h, vocab):
+    """Adversarial and random next-``h`` token sequences: recent spans
+    repeated (the fastest way to raise the repeat share), a constant
+    token, and random ones."""
+    seqs = [[vocab[0]] * h, [rng.choice(vocab) for _ in range(h)]]
+    for back in (1, 2, 3, 4, 5, 8, 13):
+        if len(history) >= back:
+            span = history[-back:]
+            seqs.append([span[i % back] for i in range(h)])
+    for _ in range(6):
+        seqs.append([rng.choice(vocab) for _ in range(h)])
+    return seqs
+
+
+def test_may_trigger_within_never_misses_a_trigger():
+    rng = random.Random(7)
+    checked = said_no = 0
+    for trial in range(300):
+        det = RepetitionDetector(n=4, window=24, min_tokens=8, threshold=0.4)
+        vocab = list(range(rng.choice((3, 5, 12, 40))))
+        history = []
+        for _ in range(rng.randrange(0, 60)):
+            t = rng.choice(vocab)
+            history.append(t)
+            det.feed(t)
+        if det.looping:
+            continue
+        for h in (1, 2, 3, 5):
+            if det.may_trigger_within(h):
+                continue
+            said_no += 1
+            snap = det.snapshot()
+            for seq in _continuations(rng, history, h, vocab):
+                assert not any(det.feed(t) for t in seq), (trial, h, seq)
+                det.restore(snap)
+                checked += 1
+    assert said_no > 100 and checked > 1000
+
+
+def _idle_proc(rng):
+    from omlx.api.thinking import ThinkingBudgetProcessor
+
+    pieces = {NL: b"\n", 50: b"\xe4\xb8", 51: b"\xad", 52: b".", 53: b"a"}
+    budget = rng.choice((None, None, 20, 45))
+    nudge_after = rng.choice((None, 15, 30))
+    return ThinkingBudgetProcessor(
+        think_end_token_ids=rng.choice(([END], [END, NL])),
+        budget=budget,
+        think_start_token_id=START,
+        start_in_thinking=rng.random() < 0.8,
+        token_to_piece=lambda t: pieces.get(t, b"x"),
+        wrapup_token_ids=WRAP if budget else None,
+        boundary_grace=rng.choice((0, 3)),
+        loop_detector=RepetitionDetector(n=4, window=24, min_tokens=8, threshold=0.4),
+        stop_token_id=rng.choice((None, EOS)),
+        nudge_after=nudge_after,
+        nudge_token_ids=NUDGE if nudge_after else None,
+        nudge_window=rng.choice((4, 10)),
+    )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+def test_idle_for_holds_for_every_continuation():
+    """Whenever the processor says it is idle for ``h`` calls, the next
+    ``h`` calls, each adding one token of any value, return the logits
+    untouched (the MTP drafter then skips them; it rewinds the processor
+    after its chain either way)."""
+    rng = random.Random(11)
+    vocab = [1, 3, 5, NL, 50, 51, 52, 53, END, START, 9, 9, 9, 1, 1]
+    logits = mx.zeros((1, 128))
+    idle = busy = checked = 0
+    for trial in range(250):
+        proc = _idle_proc(rng)
+        hist = [1, 2]
+        out = proc(list(hist), logits)
+        for step in range(rng.randrange(1, 90)):
+            forced = _forced(out) if out is not logits else None
+            hist.append(forced if forced is not None else rng.choice(vocab))
+            out = proc(list(hist), logits)
+            for h in (1, 2, 3):
+                if not proc.idle_for(h):
+                    busy += 1
+                    continue
+                idle += 1
+                snap = proc.snapshot_state()
+                for seq in _continuations(rng, hist, h, vocab):
+                    toks = list(hist)
+                    for t in seq:
+                        toks.append(t)
+                        assert proc(list(toks), logits) is logits, (trial, step, h, seq)
+                    proc.restore_state(snap)
+                    checked += 1
+    # Not vacuous: with these tight limits (budget 20, a reminder at 15, a
+    # 24-token loop window) most positions still are idle, and some are not.
+    assert idle > busy > 0 and checked > 10000
