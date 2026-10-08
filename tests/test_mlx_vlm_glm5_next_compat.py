@@ -3537,6 +3537,10 @@ def test_offloaded_moe_decode_starts_router_then_shared_expert(
     assert bad == 0
     misses = sum(m.switch_mlp.cache.misses for m in offloaded)
     assert misses > 8
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_multi_linear_declines_armed_verify_routes():
     """Armed MTP verify routes replace the reference multi-row qmm, which the
     fused projections replay, so multi-row blocks keep the reference call."""
     assert qwen35_verify_qmm.apply_verify_qmm_patch()
