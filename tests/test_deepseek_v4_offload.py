@@ -301,6 +301,35 @@ def test_decode_keeps_gpu_busy_while_reads_are_pending(
     assert n_off == 0
 
 
+def test_decode_starts_the_routed_experts_it_returns(tmp_path, reference, monkeypatch):
+    """A decode step hands its routed experts to the GPU before returning
+    them, so the host builds the next layer while they run. Scheduling only:
+    the bits stay the same, and with the overlap off nothing is started."""
+    x = _x(1, 1, D)
+    idx = mx.array([[[0, 1, 2, 3, 20, 21]]])
+    ref = reference(x, idx)
+    mx.eval(ref)
+
+    def run(overlap):
+        wrapped = _wrapped(tmp_path, reference, 0.25)
+        wrapped._overlap = overlap
+        assert wrapped.overlaps_decode(idx.size) == overlap
+        started = []
+        async_eval = mx.async_eval
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                dsv4.mx, "async_eval", lambda *a: (started.extend(a), async_eval(*a))[1]
+            )
+            out = wrapped(x, idx)
+        mx.eval(out)
+        return out, any(a is out for a in started)
+
+    on, started_on = run(True)
+    off, started_off = run(False)
+    assert bool(mx.array_equal(ref, on)) and bool(mx.array_equal(ref, off))
+    assert started_on and not started_off
+
+
 def test_uncovered_checkpoint_is_skipped(tmp_path):
     glu = _make_glu()
     tensors = _tensors(glu)

@@ -1638,11 +1638,29 @@ class Glm5NextMoE(nn.Module):
         y = self._decode_experts(x, indices, scores)
         if y is not None:
             return y
+        shared = None
+        overlaps = getattr(self.switch_mlp, "overlaps_decode", None)
+        if (
+            self.shared_experts is not None
+            and overlaps is not None
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and overlaps(indices.size)
+        ):
+            # Expert offload reads the routes back to the host before the
+            # experts run. Start the router alone, then the shared expert,
+            # which does not depend on the routes: the read-back waits for
+            # the router only, and the shared expert runs while the host
+            # resolves the routes. The same ops on the same input, added in
+            # the same order.
+            mx.async_eval(indices, scores)
+            shared = self.shared_experts(x)
+            mx.async_eval(shared)
         y = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)
         if y.ndim == x.ndim + 1:
             y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
         if self.shared_experts is not None:
-            y = y + self.shared_experts(x)
+            y = y + (self.shared_experts(x) if shared is None else shared)
         return y
 
     def _decode_select(self, x):

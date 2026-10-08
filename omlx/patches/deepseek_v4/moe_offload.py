@@ -154,6 +154,21 @@ class OffloadedSwitchGLU(nn.Module):
         # the plain wait.
         self._overlap = os.environ.get("OMLX_MOE_OFFLOAD_OVERLAP", "1") != "0"
 
+    def overlaps_decode(self, n_routes: int) -> bool:
+        """Whether a call of ``n_routes`` routes takes the decode branch.
+
+        That branch reads the routes back to the host before it computes, and
+        starts the routed experts on the GPU as soon as they are built, so
+        the host builds the rest of the layer while they run. glm5_next's MoE
+        block asks this to put its shared expert ahead of the read-back.
+        """
+        return (
+            self._overlap
+            and not self.cache.warm
+            and n_routes < _SORT_MIN_ROUTES
+            and _io_pool() is not None
+        )
+
     def _forward_expert_major(self, flat_x: mx.array, ids: list[int], k: int):
         """Routes grouped by expert, cut into chunks of ``capacity`` experts.
 
@@ -211,19 +226,24 @@ class OffloadedSwitchGLU(nn.Module):
             ids = flat_i.reshape(-1).tolist()
             fits = len(set(ids)) <= c.capacity
         if fits:
-            if (
-                self._overlap
-                and not c.warm
-                and indices.size < _SORT_MIN_ROUTES
-                and _io_pool() is not None
-            ):
+            decode = self.overlaps_decode(indices.size)
+            if decode:
                 # Decode: when the first miss is still being read after the
                 # grace period, the rest of the wait keeps the GPU clocked.
                 c._ensure_ids(indices.reshape(-1).tolist(), lambda: None)
             else:
                 c.ensure(indices)
             slots = mx.take(c.map, indices)
-            return c.glu(x, slots, scores=scores, weighted_sum=weighted_sum)
+            y = c.glu(x, slots, scores=scores, weighted_sum=weighted_sum)
+            if decode:
+                # Every layer reads its routes back, so nothing runs on the
+                # GPU between that read-back and the next layer's until it is
+                # started: start the routed experts now, and the host builds
+                # the rest of this layer and the next one's attention while
+                # they run. Scheduling only, same kernels on the same inputs
+                # (measured 5% less time per MTP cycle on GLM-5.3, M5 Max).
+                mx.async_eval(y)
+            return y
         y = self._forward_expert_major(x.reshape(-1, x.shape[-1]), ids, k)
         y = y.reshape(indices.shape + (x.shape[-1],))
         # Sum exactly when the module's own forward would have: it returns the

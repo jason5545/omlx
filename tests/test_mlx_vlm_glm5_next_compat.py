@@ -3448,8 +3448,95 @@ def test_decode_moe_declines_offloaded_experts(length, monkeypatch):
     assert _mismatches(moe(x), reference) == 0
 
 
-@pytest.mark.usefixtures("glm5_fused_decode")
-def test_multi_linear_declines_armed_verify_routes():
+def _offloaded_moe_layers(tmp_path, n_layers=2, experts=64):
+    """``n_layers`` 2-bit glm5_next MoE blocks (GLM-5.3's routed format)
+    behind the real expert offload adapter at 60% residency, and untouched
+    twins built from the same seeds."""
+    from omlx.patches.deepseek_v4 import moe_offload
+
+    def build():
+        return [
+            _moe(experts=experts, shared_bits=8, routed_bits=2, seed=40 + i)
+            for i in range(n_layers)
+        ]
+
+    offloaded, reference = build(), build()
+    tensors = {
+        f"model.layers.{i}.mlp.switch_mlp.{proj}.{field}": m.switch_mlp[proj][field]
+        for i, m in enumerate(offloaded)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+        for field in ("weight", "scales", "biases")
+    }
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)
+    (tmp_path / "config.json").write_text(json.dumps({"num_experts_per_tok": 8}))
+
+    class Layer(nn.Module):
+        def __init__(self, moe):
+            super().__init__()
+            self.mlp = moe
+
+    class Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Layer(m) for m in offloaded]
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Inner()
+
+    wrapped = moe_offload.apply_deepseek_v4_moe_expert_offload(Model(), tmp_path, 0.6)
+    assert wrapped == n_layers
+    return offloaded, reference
+
+
+@pytest.mark.parametrize("overlap", [True, False])
+def test_offloaded_moe_decode_starts_router_then_shared_expert(
+    tmp_path, monkeypatch, overlap
+):
+    """Offloaded experts read the routes back before they run: the block
+    starts the router alone, then the shared expert, then (in the adapter)
+    the routed experts, so the read-back waits for the router only. Same bits
+    as the untouched blocks through decode and verify widths, with misses;
+    with the overlap off nothing is started early."""
+    language = _language()
+    offloaded, reference = _offloaded_moe_layers(tmp_path)
+    for m in offloaded:
+        m.switch_mlp._overlap = overlap
+        # Every verify width fits (as at GLM-5.3's 245 of 288), yet misses.
+        assert 32 <= m.switch_mlp.cache.capacity < 64
+    started = []
+    async_eval = mx.async_eval
+    monkeypatch.setattr(
+        language.mx, "async_eval", lambda *a: (started.append(a), async_eval(*a))[1]
+    )
+    mx.random.seed(5)
+    lengths = [1, 3, 2, 4, 1, 3, 3, 1, 2, 4, 3, 1]
+    bad = 0
+    for length in lengths:
+        x = (mx.random.normal((1, length, 1024)) * 0.5).astype(mx.bfloat16)
+        h_off, h_ref = x, x
+        for m_off, m_ref in zip(offloaded, reference):
+            started.clear()
+            h_off = m_off(h_off)
+            h_ref = m_ref(h_ref)
+            mx.eval(h_off, h_ref)
+            # The read-back-free keepalive pulses are float32 [8] arrays.
+            calls = [a for a in started if a[0].shape != (8,)]
+            if overlap:
+                router, shared, routed = calls
+                assert router[0].shape == (1, length, 8)  # indices, scores
+                assert len(router) == 2
+                assert shared[0].shape == (1, length, 1024)
+                # The routed experts (unsummed, or summed by the module).
+                assert routed[0].shape[:2] == (1, length)
+                assert routed[0].shape[-1] == 1024
+            else:
+                assert calls == []
+        bad += _mismatches(h_off, h_ref)
+    assert bad == 0
+    misses = sum(m.switch_mlp.cache.misses for m in offloaded)
+    assert misses > 8
     """Armed MTP verify routes replace the reference multi-row qmm, which the
     fused projections replay, so multi-row blocks keep the reference call."""
     assert qwen35_verify_qmm.apply_verify_qmm_patch()
