@@ -424,6 +424,13 @@ class ThinkingBudgetProcessor:
     itself: in the reasoning it closes the reasoning the same way (with or
     without a budget), in the answer it forces ``stop_token_id``.
 
+    With ``nudge_after`` a reasoning that runs long without repeating gets a
+    reminder instead of a cut: past that many tokens (at a line or sentence
+    end, within ``boundary_grace``) ``nudge_token_ids`` are forced and the
+    model keeps reasoning, free to close on its own. If it has not closed
+    ``nudge_window`` tokens later, the reasoning is closed like a spent
+    budget.
+
     Args:
         think_end_token_ids: Token ID(s) for the close-think tag.
         budget: Maximum number of thinking tokens before forcing close, or
@@ -437,6 +444,10 @@ class ThinkingBudgetProcessor:
         loop_detector: Detector fed with every generated token of each phase.
         stop_token_id: Forced when the answer loops (an EOS id).
         label: Request id for log lines.
+        nudge_after: Reasoning tokens before the reminder, or ``None``.
+        nudge_token_ids: The reminder, forced inside the reasoning.
+        nudge_window: Tokens the model gets after the reminder to close the
+            reasoning itself.
     """
 
     def __init__(
@@ -453,6 +464,9 @@ class ThinkingBudgetProcessor:
         loop_detector: Optional["RepetitionDetector"] = None,
         stop_token_id: Optional[int] = None,
         label: Optional[str] = None,
+        nudge_after: Optional[int] = None,
+        nudge_token_ids: Optional[List[int]] = None,
+        nudge_window: int = 0,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: [wrap-up] + \n + </think> + \n\n (the part from
@@ -471,6 +485,15 @@ class ThinkingBudgetProcessor:
         self._stop_token_id = stop_token_id
         self._label = label or ""
         self._loop_logged = False  # not rewound: one log line per request
+        self._nudge_sequence = list(nudge_token_ids or [])
+        self._nudge_after = (
+            max(0, int(nudge_after))
+            if nudge_after is not None and self._nudge_sequence
+            else None
+        )
+        self._nudge_window = max(0, int(nudge_window))
+        self._nudge_logged = False  # not rewound, like _loop_logged
+        self._nudge_outcome_logged = False
 
         # State
         self._thinking_tokens: int = 0
@@ -490,6 +513,10 @@ class ThinkingBudgetProcessor:
         # Loop guard verdicts: close the reasoning / stop the answer.
         self._close_requested: bool = False
         self._loop_stop: bool = False
+        # What ``_forcing`` forces: "close" or "nudge" (the reminder).
+        self._force_kind: str = "close"
+        # Reasoning tokens counted when the reminder ended.
+        self._nudged_at: Optional[int] = None
 
     def __call__(self, tokens, logits):
         """mlx-lm logits processor: (tokens, logits) -> logits."""
@@ -521,28 +548,76 @@ class ThinkingBudgetProcessor:
         if self._in_thinking:
             self._thinking_tokens += 1
             if self._close_due():
-                if self._last_token_utf8_complete:
-                    self._forcing = True
-                    self._force_idx = 0
-                    self._recent_tokens = []
-                    return self._force_next_token(logits, mx)
-                self._waiting_utf8 = True
-                self._recent_tokens = []
+                return self._start_forcing("close", logits, mx)
+            if self._nudge_due():
+                self._log_nudge_start()
+                return self._start_forcing("nudge", logits, mx)
 
+        return logits
+
+    def _start_forcing(self, kind: str, logits, mx):
+        self._force_kind = kind
+        self._recent_tokens = []
+        if self._last_token_utf8_complete:
+            self._forcing = True
+            self._force_idx = 0
+            return self._force_next_token(logits, mx)
+        self._waiting_utf8 = True
         return logits
 
     def _close_due(self) -> bool:
         """Whether the reasoning should be closed at this position."""
         if self._close_requested:
             return True
-        if self._budget is None or self._thinking_tokens < self._budget:
+        budget_spent = self._budget is not None and self._thinking_tokens >= self._budget
+        nudge_ignored = (
+            self._nudged_at is not None
+            and self._thinking_tokens - self._nudged_at > self._nudge_window
+        )
+        if not (budget_spent or nudge_ignored):
             return False
+        if nudge_ignored and not budget_spent and not self._nudge_outcome_logged:
+            self._nudge_outcome_logged = True
+            logger.info(
+                "Thinking nudge%s: still reasoning %d tokens after the reminder; "
+                "closing the reasoning",
+                self._label_suffix(),
+                self._nudge_window,
+            )
+        return self._at_line_end()
+
+    def _nudge_due(self) -> bool:
+        """Whether the reminder should start at this position."""
+        if (
+            self._nudge_after is None
+            or self._nudged_at is not None
+            or self._thinking_tokens < self._nudge_after
+        ):
+            return False
+        return self._at_line_end()
+
+    def _at_line_end(self) -> bool:
+        """Past a limit: act at the first line or sentence end, or once the
+        grace runs out."""
         if not self._boundary_grace:
             return True
-        # Past the budget: close at the first line or sentence end, or once
-        # the grace runs out.
         self._grace_count += 1
         return self._at_boundary or self._grace_count > self._boundary_grace
+
+    def _label_suffix(self) -> str:
+        return f" [{self._label}]" if self._label else ""
+
+    def _log_nudge_start(self) -> None:
+        if self._nudge_logged:
+            return
+        self._nudge_logged = True
+        logger.info(
+            "Thinking nudge%s: reasoning reached %d tokens; reminding the model "
+            "to wrap up (closed if still reasoning %d tokens later)",
+            self._label_suffix(),
+            self._thinking_tokens,
+            self._nudge_window,
+        )
 
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""
@@ -566,9 +641,14 @@ class ThinkingBudgetProcessor:
 
         if self._forcing:
             self._force_idx += 1
-            if self._force_idx >= len(self._force_sequence):
-                self._in_thinking = False
+            if self._force_idx >= len(self._forced_sequence()):
                 self._forcing = False
+                if self._force_kind == "nudge":
+                    # Back to free reasoning; the close grace starts over.
+                    self._nudged_at = self._thinking_tokens
+                    self._grace_count = 0
+                    return
+                self._in_thinking = False
                 self._done = True
                 self._new_phase()
             return
@@ -576,18 +656,14 @@ class ThinkingBudgetProcessor:
         # Detect natural close-think via sliding window
         if len(self._think_end_ids) == 1:
             if token_id == self._think_end_ids[0]:
-                self._in_thinking = False
-                self._done = True
-                self._new_phase()
+                self._closed_naturally()
                 return
         else:
             self._recent_tokens.append(token_id)
             if len(self._recent_tokens) > len(self._think_end_ids):
                 self._recent_tokens.pop(0)
             if self._recent_tokens == self._think_end_ids:
-                self._in_thinking = False
-                self._done = True
-                self._new_phase()
+                self._closed_naturally()
                 return
 
         if self._waiting_utf8:
@@ -609,10 +685,25 @@ class ThinkingBudgetProcessor:
 
         self._feed_loop_guard(token_id)
 
+    def _closed_naturally(self) -> None:
+        if self._nudged_at is not None and not self._nudge_outcome_logged:
+            self._nudge_outcome_logged = True
+            logger.info(
+                "Thinking nudge%s: the model closed its reasoning %d tokens "
+                "after the reminder",
+                self._label_suffix(),
+                self._thinking_tokens - self._nudged_at,
+            )
+        self._in_thinking = False
+        self._done = True
+        self._new_phase()
+
     def _new_phase(self) -> None:
-        """Reasoning opened or closed: budget grace and loop window start over."""
+        """Reasoning opened or closed: grace, reminder and loop window start
+        over."""
         self._close_requested = False
         self._grace_count = 0
+        self._nudged_at = None
         if self._loop_detector is not None:
             self._loop_detector.reset()
 
@@ -633,7 +724,7 @@ class ThinkingBudgetProcessor:
             logger.warning(
                 "Loop guard%s: the %s repeats itself (%.0f%% of %d-token spans "
                 "repeat over the last %d tokens); %s",
-                f" [{self._label}]" if self._label else "",
+                self._label_suffix(),
                 "reasoning" if self._in_thinking else "answer",
                 100 * det.ratio,
                 det.n,
@@ -681,9 +772,14 @@ class ThinkingBudgetProcessor:
             self._pending_utf8 = b""
             return True
 
+    def _forced_sequence(self) -> List[int]:
+        if self._force_kind == "nudge":
+            return self._nudge_sequence
+        return self._force_sequence
+
     def _force_next_token(self, logits, mx):
-        """Force the next token in the close-think + trailing sequence."""
-        target_id = self._force_sequence[self._force_idx]
+        """Force the next token of the close (or reminder) sequence."""
+        target_id = self._forced_sequence()[self._force_idx]
         forced = mx.full(logits.shape, float("-inf"))
         forced[..., target_id] = 0.0
         return forced
@@ -722,6 +818,8 @@ class ThinkingBudgetProcessor:
         "_at_boundary",
         "_close_requested",
         "_loop_stop",
+        "_force_kind",
+        "_nudged_at",
     )
 
     def snapshot_state(self) -> dict:

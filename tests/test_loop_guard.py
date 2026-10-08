@@ -8,6 +8,8 @@ until max_tokens. The detector flags that; the budget processor then closes a
 repeating reasoning (with the same wrap-up note a budget close gets) or stops
 a repeating answer. A budget close waits briefly for a line end and says it
 is wrapping up, so the model does not keep drafting inside its answer.
+Without a budget, a reasoning that runs long without repeating gets a
+reminder to wrap up, and is closed only if it ignores it.
 """
 
 import itertools
@@ -27,6 +29,7 @@ from omlx.api.repetition import RepetitionDetector
 
 END, START, NL, EOS = 42, 41, 7, 2
 WRAP = [60, 61]
+NUDGE = [70, 71, 72]
 
 
 def _block(rng, size, lo=1000, hi=50000):
@@ -246,6 +249,64 @@ class TestLoopGuard:
         assert _forced(logits) is None and not proc._loop_stop
 
 
+@pytest.mark.skipif(not HAS_MLX, reason="mlx not available")
+class TestThinkingNudge:
+    CLOSE = WRAP + [NL, END, NL]
+
+    def _nudging(self, window):
+        return _proc(
+            budget=None, nudge_after=6, nudge_token_ids=NUDGE, nudge_window=window
+        )
+
+    @staticmethod
+    def _find(out, seq):
+        return next(i for i in range(len(out)) if out[i : i + len(seq)] == seq)
+
+    def test_reminds_at_a_line_end_then_lets_the_model_close(self):
+        script = [10, 11, 12, 13, 14, 15, 16, NL, 20, 21, END, NL, 100, 101]
+        out = _drive(self._nudging(window=20), script)
+        # past 6 reasoning tokens, the reminder waits for the newline
+        assert out == script[:8] + NUDGE + script[8:]
+
+    def test_closes_a_reasoning_that_ignores_the_reminder(self):
+        proc = self._nudging(window=5)
+        answer = list(range(100, 106))
+        out = _drive(proc, _loop_until_closed([20, 21, 22, NL], answer))
+        nudge = self._find(out, NUDGE)
+        assert out[nudge - 1] == NL and nudge >= 6
+        assert out.count(NUDGE[0]) == 1
+        close = self._find(out, self.CLOSE)
+        assert close - (nudge + len(NUDGE)) >= 5 and out[close - 1] == NL
+        assert out[close + len(self.CLOSE) :] == answer
+
+    def test_rewind_before_the_reminder_replays_it(self):
+        proc = self._nudging(window=50)
+        hist = [1]
+        proc(list(hist), mx.zeros((1, 128)))
+        for tok in [10, 11, 12, 13, 14, 15, 16]:
+            hist.append(tok)
+            proc(list(hist), mx.zeros((1, 128)))
+        snap = proc.snapshot_state()
+        hist.append(NL)
+        logits = proc(list(hist), mx.zeros((1, 128)))
+        assert _forced(logits) == NUDGE[0]
+        for tok in NUDGE:
+            hist.append(tok)
+            logits = proc(list(hist), mx.zeros((1, 128)))
+        assert proc._nudged_at is not None and _forced(logits) is None
+        proc.restore_state(snap)
+        del hist[8:]
+        assert proc._nudged_at is None and proc._force_kind == "close"
+        hist.append(NL)
+        assert _forced(proc(list(hist), mx.zeros((1, 128)))) == NUDGE[0]
+
+    def test_a_budget_close_is_not_delayed_by_the_reminder(self):
+        proc = _proc(nudge_after=6, nudge_token_ids=NUDGE, nudge_window=5)
+        out = _drive(proc, [10, 11, 12, 13, 14, 15, NL, 16, 17, 18])
+        assert NUDGE[0] not in out
+        assert out[7:12] == self.CLOSE
+
+
 # ---------------------------------------------------------------------------
 # Scheduler wiring
 # ---------------------------------------------------------------------------
@@ -281,11 +342,13 @@ class TestSchedulerWiring:
             "_resolve_think_end_token_ids",
             "_build_sampler_and_processors",
             "_thinking_wrapup_token_ids",
+            "_thinking_nudge_token_ids",
             "_loop_guard_stop_token_id",
         ):
             setattr(s, name, getattr(Scheduler, name).__get__(s, Scheduler))
         s._resolve_think_close_pattern = MagicMock(return_value=(None, None))
         s._thinking_wrapup_cache = None
+        s._thinking_nudge_cache = None
         tok = MagicMock()
         tok.encode.side_effect = lambda text, add_special_tokens=False: encoded.get(
             text, [70, 71]
@@ -311,12 +374,22 @@ class TestSchedulerWiring:
         assert proc._budget is None and proc._loop_detector is not None
         assert proc._stop_token_id == EOS
         assert proc._force_sequence[:2] == [70, 71]  # the wrap-up note
-        assert proc._boundary_grace == 0  # no budget, nothing to wait for
+        # No budget: the reminder after 8192 reasoning tokens, at a line end
+        assert proc._nudge_after == 8192 and proc._nudge_window == 1024
+        assert proc._nudge_sequence == [70, 71]
+        assert proc._boundary_grace == 64
+
+    def test_reminder_can_be_turned_off(self, monkeypatch):
+        monkeypatch.setenv("OMLX_THINKING_NUDGE_AFTER", "0")
+        (proc,) = self._processors(monkeypatch, budget=None)
+        assert proc._nudge_after is None and proc._boundary_grace == 0
+        assert proc._loop_detector is not None
 
     def test_budget_gets_grace_and_guard(self, monkeypatch):
         (proc,) = self._processors(monkeypatch, budget=1024)
         assert proc._budget == 1024 and proc._boundary_grace == 64
         assert proc._loop_detector is not None
+        assert proc._nudge_after is None  # the budget is the limit
 
     def test_guard_off_leaves_the_budget_alone(self, monkeypatch):
         (proc,) = self._processors(monkeypatch, budget=1024, guard="0")

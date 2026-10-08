@@ -583,6 +583,33 @@ _THINKING_WRAPUP_TEXT = (
     "write the final answer directly from the reasoning above, without more "
     "drafts."
 )
+# Forced into a long reasoning when no budget is set: a reminder, not a cut.
+# The model keeps reasoning and may close on its own; see
+# _thinking_nudge_limits. OMLX_THINKING_NUDGE_TEXT overrides it.
+_THINKING_NUDGE_TEXT = (
+    "\n\nWait, I have been thinking for a long time. I should stop exploring "
+    "alternatives and second-guessing, settle on the best approach I already "
+    "have, and wrap up my reasoning now so I can write the final answer.\n\n"
+)
+
+
+def _thinking_nudge_limits() -> tuple[int | None, int]:
+    """(reasoning tokens before the reminder, tokens allowed after it).
+
+    8192 tokens is about five minutes of GLM-5.3 oQ2e decode. Over the omp
+    sessions up to 2026-10-08 it reminds 1 of 2042 Qwen3.8 oQ5e reasonings
+    and 3 of 20 cloud GLM-5.3 Flash ones (all past 12k tokens).
+    OMLX_THINKING_NUDGE_AFTER=0 turns the reminder off.
+    """
+
+    def env_int(name: str, default: int) -> int:
+        try:
+            return max(0, int(os.environ.get(name, default)))
+        except ValueError:
+            return default
+
+    after = env_int("OMLX_THINKING_NUDGE_AFTER", 8192)
+    return (after or None), env_int("OMLX_THINKING_NUDGE_WINDOW", 1024)
 
 
 def _thinking_budget_grace(budget: int | None) -> int:
@@ -7179,10 +7206,15 @@ class Scheduler:
                         getattr(request, "needs_think_prefix", False)
                     )
                 loop_detector = None
+                nudge_after, nudge_window = None, 0
                 if loop_guard:
                     from .api.repetition import RepetitionDetector
 
                     loop_detector = RepetitionDetector()
+                    if budget is None:
+                        # No budget: a long reasoning gets a reminder to
+                        # wrap up instead of running without end.
+                        nudge_after, nudge_window = _thinking_nudge_limits()
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
                     budget=budget,
@@ -7192,12 +7224,19 @@ class Scheduler:
                     token_to_piece=self._thinking_budget_token_to_piece,
                     start_in_thinking=start_in_thinking,
                     wrapup_token_ids=self._thinking_wrapup_token_ids(),
-                    boundary_grace=_thinking_budget_grace(budget),
+                    boundary_grace=_thinking_budget_grace(
+                        budget if budget is not None else nudge_after
+                    ),
                     loop_detector=loop_detector,
                     stop_token_id=(
                         self._loop_guard_stop_token_id() if loop_detector else None
                     ),
                     label=getattr(request, "request_id", None),
+                    nudge_after=nudge_after,
+                    nudge_token_ids=(
+                        self._thinking_nudge_token_ids() if nudge_after else None
+                    ),
+                    nudge_window=nudge_window,
                 )
                 logits_processors.append(processor)
 
@@ -7274,6 +7313,16 @@ class Scheduler:
         text = os.environ.get("OMLX_THINKING_BUDGET_WRAPUP", _THINKING_WRAPUP_TEXT)
         ids = self._encode_thinking_marker(text) if text else None
         self._thinking_wrapup_cache = (ids,)
+        return ids
+
+    def _thinking_nudge_token_ids(self) -> list[int] | None:
+        """Tokens of the reminder forced into a long reasoning."""
+        cached = getattr(self, "_thinking_nudge_cache", None)
+        if cached is not None:
+            return cached[0]
+        text = os.environ.get("OMLX_THINKING_NUDGE_TEXT", _THINKING_NUDGE_TEXT)
+        ids = self._encode_thinking_marker(text) if text else None
+        self._thinking_nudge_cache = (ids,)
         return ids
 
     def _loop_guard_stop_token_id(self) -> int | None:
