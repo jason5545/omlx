@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import Future
 from pathlib import Path
 
 import mlx.core as mx
@@ -63,6 +64,12 @@ from .switch_layers import _sort_threshold
 logger = logging.getLogger(__name__)
 
 _PROJS = ("gate_proj", "up_proj", "down_proj")
+
+# glm5_next decode reads the next layer's predicted misses ahead (see
+# OffloadedSwitchGLU.stage_next_routes). OMLX_MOE_OFFLOAD_PREFETCH=0 turns
+# it off; at most _PREFETCH_MAX experts are read ahead per layer.
+_PREFETCH = os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH", "1") != "0"
+_PREFETCH_MAX = 8
 
 
 def is_deepseek_v4_switch_glu(obj) -> bool:
@@ -141,6 +148,65 @@ class _SlotCache(ExpertCache):
         return 0
 
 
+class _Prefetch:
+    """Read-ahead state of one wrapper, kept out of the module tree.
+
+    ``gate``/``next`` are the next offloaded MoE layer's router and wrapper;
+    ``staged`` is that router's prediction for the call in flight;
+    ``incoming`` holds the reads the previous layer started for this one.
+    """
+
+    __slots__ = ("gate", "next", "staged", "incoming")
+
+    def __init__(self):
+        self.gate = self.next = self.staged = self.incoming = None
+
+
+def _fill_reads(store_view, items) -> None:
+    """One IO task for an expert's slabs, in plan order. ``store_view`` is
+    only held: it keeps the shard descriptors open while the task runs
+    (a dropped read may outlive the call that started it). A cancelled
+    slab is skipped."""
+    for plan, future in items:
+        if not future.set_running_or_notify_cancel():
+            continue
+        try:
+            future.set_result(CheckpointExpertStore.read(plan))
+        except BaseException as exc:
+            future.set_exception(exc)
+
+
+def _read_expert(pool, cache: ExpertCache, e: int) -> list:
+    """Start reading expert ``e`` as one task; the group has the layout of
+    ``ExpertCache._submit`` (one future per slab)."""
+    group = [(name, field, plan, Future()) for name, field, plan in cache._plans(e)]
+    pool.submit(_fill_reads, cache.disk, [(plan, f) for _, _, plan, f in group])
+    return group
+
+
+def _flat_ids(a: mx.array) -> list:
+    """``a``'s ids as a flat list, read from ``a`` itself.
+
+    ``a.reshape(-1).tolist()`` evaluates a new (empty) reshape on the stream,
+    so the host waits for everything submitted before it; after the router
+    and the shared expert went out in separate command buffers, that meant
+    waiting for the shared expert too. Reading the evaluated ``a`` waits for
+    its own command buffer only.
+    """
+    out = a.tolist()
+    while out and isinstance(out[0], list):
+        out = [v for row in out for v in row]
+    return out
+
+
+def _cancel_reads(reads) -> None:
+    """Drop read-ahead groups without waiting (a running slab finishes in
+    the background and its bytes are discarded)."""
+    for group in (reads or {}).values():
+        for _, _, _, future in group:
+            future.cancel()
+
+
 class OffloadedSwitchGLU(nn.Module):
     """DeepSeek V4 SwitchGLU whose experts live in a :class:`_SlotCache`."""
 
@@ -153,6 +219,55 @@ class OffloadedSwitchGLU(nn.Module):
         # moe_expert_offload._GpuKeepalive). OMLX_MOE_OFFLOAD_OVERLAP=0 keeps
         # the plain wait.
         self._overlap = os.environ.get("OMLX_MOE_OFFLOAD_OVERLAP", "1") != "0"
+        self._prefetch = _Prefetch()
+
+    def stage_next_routes(self, x: mx.array) -> list:
+        """The next offloaded layer's routes predicted from this layer's
+        input, for the caller to start together with this layer's router.
+
+        The residual stream changes little from one layer to the next, so
+        the next layer's router applied to this layer's FFN input names
+        about half of the next layer's misses (54-57% on GLM-5.3 oQ2e at
+        85% residency, one wasted read per hit). After this layer's own
+        misses are installed, the decode branch starts reading the predicted
+        non-resident ones, which the next layer then finds in flight or
+        done. Reads only: nothing is installed or evicted on a prediction,
+        so the cache and every output stay as without it. Returns ``[]``
+        when nothing is predicted.
+        """
+        pf = self._prefetch
+        pf.staged = None
+        if not _PREFETCH or pf.gate is None or _io_pool() is None:
+            return []
+        pf.staged = pf.gate(x)[0]
+        return [pf.staged]
+
+    def _claim_reads(self, incoming, ids) -> dict | None:
+        """The read-ahead groups this call misses on; the rest are dropped."""
+        if not incoming:
+            return None
+        slot_of = self.cache.slot_of
+        need = {e for e in ids if e not in slot_of}
+        pending = {e: g for e, g in incoming.items() if e in need}
+        _cancel_reads({e: g for e, g in incoming.items() if e not in pending})
+        return pending or None
+
+    def _read_next(self, staged: mx.array) -> None:
+        """Start reading the next layer's predicted non-resident experts."""
+        nxt = self._prefetch.next
+        cache = nxt.cache
+        pool = _io_pool()
+        if cache.warm or pool is None:
+            return
+        cand = []
+        for e in dict.fromkeys(_flat_ids(staged)):
+            if e not in cache.slot_of:
+                cand.append(e)
+                if len(cand) >= _PREFETCH_MAX:
+                    break
+        if cand:
+            _cancel_reads(nxt._prefetch.incoming)
+            nxt._prefetch.incoming = {e: _read_expert(pool, cache, e) for e in cand}
 
     def overlaps_decode(self, n_routes: int) -> bool:
         """Whether a call of ``n_routes`` routes takes the decode branch.
@@ -225,13 +340,19 @@ class OffloadedSwitchGLU(nn.Module):
         if not fits:
             ids = flat_i.reshape(-1).tolist()
             fits = len(set(ids)) <= c.capacity
+        pf = self._prefetch
+        incoming, pf.incoming = pf.incoming, None
+        staged, pf.staged = pf.staged, None
         if fits:
             decode = self.overlaps_decode(indices.size)
             if decode:
                 # Decode: when the first miss is still being read after the
                 # grace period, the rest of the wait keeps the GPU clocked.
-                c._ensure_ids(indices.reshape(-1).tolist(), lambda: None)
+                ids = _flat_ids(indices)
+                pending = self._claim_reads(incoming, ids)
+                c._ensure_ids(ids, lambda: None, pending=pending)
             else:
+                _cancel_reads(incoming)
                 c.ensure(indices)
             slots = mx.take(c.map, indices)
             y = c.glu(x, slots, scores=scores, weighted_sum=weighted_sum)
@@ -243,7 +364,10 @@ class OffloadedSwitchGLU(nn.Module):
                 # they run. Scheduling only, same kernels on the same inputs
                 # (measured 5% less time per MTP cycle on GLM-5.3, M5 Max).
                 mx.async_eval(y)
+                if staged is not None and pf.next is not None:
+                    self._read_next(staged)
             return y
+        _cancel_reads(incoming)
         y = self._forward_expert_major(x.reshape(-1, x.shape[-1]), ids, k)
         y = y.reshape(indices.shape + (x.shape[-1],))
         # Sum exactly when the module's own forward would have: it returns the
@@ -262,6 +386,15 @@ class OffloadedSwitchGLU(nn.Module):
         ):
             y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         return y
+
+
+def _layer_index(path: str):
+    """The decoder layer index in a module path (``...layers.<i>....``)."""
+    parts = path.split(".")
+    for name, value in zip(parts, parts[1:]):
+        if name == "layers" and value.isdigit():
+            return int(value)
+    return None
 
 
 def _iter_deepseek_v4_switch_glus(model):
@@ -320,6 +453,7 @@ def apply_deepseek_v4_moe_expert_offload(
         return 0
     wrapped = 0
     total_bytes = resident_bytes = 0
+    chain = []  # (layer index, wrapper, its router) of glm5_next MoE blocks
     for parent, key, glu, path in targets:
         if mtp_resident and _is_mtp_path(path):
             continue
@@ -343,8 +477,18 @@ def apply_deepseek_v4_moe_expert_offload(
             setattr(parent, key, new)
         else:
             parent[key] = new
+        layer = _layer_index(path)
+        gate = parent.get("gate") if isinstance(parent, dict) else None
+        if layer is not None and type(gate).__name__ == "Glm5NextMoEGate":
+            chain.append((layer, new, gate))
         wrapped += 1
         _sync_and_clear_cache()
+
+    # Each glm5_next layer predicts the next one's routes (stage_next_routes).
+    chain.sort(key=lambda t: t[0])
+    for (_, cur, _), (_, nxt, gate) in zip(chain, chain[1:]):
+        cur._prefetch.gate = gate
+        cur._prefetch.next = nxt
 
     # glm5_next decoder layers compile their FFN block at decode shapes
     # (mlx_vlm glm5_next language.py ``compile_ffn``). The offloaded block

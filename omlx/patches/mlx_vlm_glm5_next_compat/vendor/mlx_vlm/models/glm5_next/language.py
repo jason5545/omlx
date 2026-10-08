@@ -1648,12 +1648,15 @@ class Glm5NextMoE(nn.Module):
             and overlaps(indices.size)
         ):
             # Expert offload reads the routes back to the host before the
-            # experts run. Start the router alone, then the shared expert,
-            # which does not depend on the routes: the read-back waits for
-            # the router only, and the shared expert runs while the host
-            # resolves the routes. The same ops on the same input, added in
-            # the same order.
-            mx.async_eval(indices, scores)
+            # experts run. Start the router alone (with the next layer's
+            # route prediction, which the offload reads ahead on), then the
+            # shared expert, which does not depend on the routes: the
+            # read-back waits for the router only, and the shared expert runs
+            # while the host resolves the routes. The same ops on the same
+            # input, added in the same order.
+            stage = getattr(self.switch_mlp, "stage_next_routes", None)
+            ahead = stage(x) if stage is not None else []
+            mx.async_eval(indices, scores, *ahead)
             shared = self.shared_experts(x)
             mx.async_eval(shared)
         y = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)

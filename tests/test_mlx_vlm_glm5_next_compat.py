@@ -3525,8 +3525,10 @@ def test_offloaded_moe_decode_starts_router_then_shared_expert(
             calls = [a for a in started if a[0].shape != (8,)]
             if overlap:
                 router, shared, routed = calls
-                assert router[0].shape == (1, length, 8)  # indices, scores
-                assert len(router) == 2
+                # indices, scores, and for all but the last layer the next
+                # layer's predicted routes (read ahead on by the offload).
+                assert [a.shape for a in router] == [(1, length, 8)] * len(router)
+                assert len(router) == (3 if m_off is not offloaded[-1] else 2)
                 assert shared[0].shape == (1, length, 1024)
                 # The routed experts (unsummed, or summed by the module).
                 assert routed[0].shape[:2] == (1, length)
@@ -3537,6 +3539,58 @@ def test_offloaded_moe_decode_starts_router_then_shared_expert(
     assert bad == 0
     misses = sum(m.switch_mlp.cache.misses for m in offloaded)
     assert misses > 8
+
+
+def test_offloaded_moe_reads_the_next_layer_ahead_and_changes_nothing(
+    tmp_path, monkeypatch
+):
+    """Each offloaded layer predicts the next one's routes (the next router
+    on its own input) and reads the predicted misses ahead. Reads only: the
+    outputs, the misses and the final slot contents are those without it,
+    and the next layer does pick up reads it was given."""
+    from omlx.patches.deepseek_v4 import moe_offload
+
+    read = moe_offload._read_expert
+    claim = moe_offload.OffloadedSwitchGLU._claim_reads
+
+    def run(prefetch):
+        monkeypatch.setattr(moe_offload, "_PREFETCH", prefetch)
+        root = tmp_path / ("on" if prefetch else "off")
+        root.mkdir()
+        offloaded, _ = _offloaded_moe_layers(root, n_layers=4)
+        counts = {"read": 0, "claimed": 0}
+
+        def counted_read(*a):
+            counts["read"] += 1
+            return read(*a)
+
+        def counted_claim(self, incoming, ids):
+            out = claim(self, incoming, ids)
+            counts["claimed"] += len(out or {})
+            return out
+
+        monkeypatch.setattr(moe_offload, "_read_expert", counted_read)
+        monkeypatch.setattr(
+            moe_offload.OffloadedSwitchGLU, "_claim_reads", counted_claim
+        )
+        mx.random.seed(9)
+        outs = []
+        for length in [1, 3, 2, 4, 1, 3, 3, 1, 2, 4, 3, 1] * 3:
+            h = (mx.random.normal((1, length, 1024)) * 0.5).astype(mx.bfloat16)
+            for m in offloaded:
+                h = h + m(h)  # residual, so a layer's input predicts the next
+            mx.eval(h)
+            outs.append(h)
+        caches = [m.switch_mlp.cache for m in offloaded]
+        state = [(c.misses, c.hits, c.slot_expert.tolist()) for c in caches]
+        return outs, state, counts
+
+    off_out, off_state, off_counts = run(False)
+    on_out, on_state, on_counts = run(True)
+    assert sum(_mismatches(a, b) for a, b in zip(off_out, on_out)) == 0
+    assert on_state == off_state
+    assert off_counts == {"read": 0, "claimed": 0}
+    assert on_counts["read"] > on_counts["claimed"] > 0
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
