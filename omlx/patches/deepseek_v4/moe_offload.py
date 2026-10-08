@@ -59,6 +59,7 @@ from ..moe_expert_offload import (
     _minimum_experts,
     _resolve_model_dir,
 )
+from . import route_trace
 from .switch_layers import _sort_threshold
 
 logger = logging.getLogger(__name__)
@@ -220,6 +221,9 @@ class OffloadedSwitchGLU(nn.Module):
         # the plain wait.
         self._overlap = os.environ.get("OMLX_MOE_OFFLOAD_OVERLAP", "1") != "0"
         self._prefetch = _Prefetch()
+        # The decoder layer index, for the routing trace (route_trace); 255
+        # when the module path names none.
+        self._layer = 255
 
     def stage_next_routes(self, x: mx.array) -> list:
         """The next offloaded layer's routes predicted from this layer's
@@ -343,15 +347,26 @@ class OffloadedSwitchGLU(nn.Module):
         pf = self._prefetch
         incoming, pf.incoming = pf.incoming, None
         staged, pf.staged = pf.staged, None
+        trace = route_trace.active()
         if fits:
             decode = self.overlaps_decode(indices.size)
             if decode:
                 # Decode: when the first miss is still being read after the
                 # grace period, the rest of the wait keeps the GPU clocked.
                 ids = _flat_ids(indices)
+                if trace is not None:
+                    route_trace.record(
+                        trace, self._layer, c, ids, n_tok, k, route_trace.ROUTES,
+                        decode=True, x=x,
+                    )
                 pending = self._claim_reads(incoming, ids)
                 c._ensure_ids(ids, lambda: None, pending=pending)
             else:
+                if trace is not None:
+                    route_trace.record(
+                        trace, self._layer, c, _flat_ids(indices), n_tok, k,
+                        route_trace.ROUTES, x=x,
+                    )
                 _cancel_reads(incoming)
                 c.ensure(indices)
             slots = mx.take(c.map, indices)
@@ -368,6 +383,10 @@ class OffloadedSwitchGLU(nn.Module):
                     self._read_next(staged)
             return y
         _cancel_reads(incoming)
+        if trace is not None:
+            route_trace.record(
+                trace, self._layer, c, ids, n_tok, k, route_trace.EXPERT_MAJOR
+            )
         y = self._forward_expert_major(x.reshape(-1, x.shape[-1]), ids, k)
         y = y.reshape(indices.shape + (x.shape[-1],))
         # Sum exactly when the module's own forward would have: it returns the
@@ -478,6 +497,8 @@ def apply_deepseek_v4_moe_expert_offload(
         else:
             parent[key] = new
         layer = _layer_index(path)
+        if layer is not None and layer < 255:
+            new._layer = layer
         gate = parent.get("gate") if isinstance(parent, dict) else None
         if layer is not None and type(gate).__name__ == "Glm5NextMoEGate":
             chain.append((layer, new, gate))

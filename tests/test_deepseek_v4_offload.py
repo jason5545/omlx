@@ -330,6 +330,70 @@ def test_decode_starts_the_routed_experts_it_returns(tmp_path, reference, monkey
     assert started_on and not started_off
 
 
+def test_route_trace_records_calls_and_changes_nothing(
+    tmp_path, reference, monkeypatch
+):
+    """The routing trace records every call's routes, and the layer's cache
+    state before its first call, without changing anything: the same calls
+    with the trace off give the same bits, hits, misses and resident experts,
+    and with ENABLE absent no file is written."""
+    import numpy as np
+
+    from omlx.patches.deepseek_v4 import route_trace
+
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    monkeypatch.setenv("OMLX_MOE_ROUTE_TRACE", str(trace_dir))
+    calls = [
+        (_x(1, 1, D), mx.arange(K).reshape(1, 1, K)),  # decode, cold cache
+        (_x(1, 3, D), _routes((1, 3, K), e=8, seed=2)),  # verify, 3 rows
+        (_x(2, 64, D), _routes((2, 64, K), seed=3)),  # over-capacity prefill
+        (_x(1, 16, D), _routes((1, 16, K), e=6, seed=4)),  # in-capacity, sorted
+        (_x(1, 1, D), mx.array([[[0, 1, 2, 3, 20, 21]]])),  # decode after it
+    ]
+    routes, major = route_trace.ROUTES, route_trace.EXPERT_MAJOR
+    kinds = [routes, routes, major, routes, routes]
+
+    def run(on):
+        monkeypatch.setattr(route_trace, "_TRACER", route_trace._Tracer())
+        enable = trace_dir / "ENABLE"
+        if on:
+            enable.write_text("x=1")
+        elif enable.exists():
+            enable.unlink()
+        wrapped = _wrapped(tmp_path, reference, 0.25)
+        wrapped._layer = 7
+        outs = [wrapped(x, i) for x, i in calls]
+        mx.eval(outs)
+        route_trace._TRACER.close()
+        c = wrapped.cache
+        return outs, (c.hits, c.misses, sorted(c.slot_of), c.score.tolist())
+
+    off_out, off_cache = run(False)
+    assert not list(trace_dir.glob("routes-*.bin"))
+    on_out, on_cache = run(True)
+    assert on_cache == off_cache
+    assert all(bool(mx.array_equal(a, b)) for a, b in zip(off_out, on_out))
+
+    (path,) = trace_dir.glob("routes-*.bin")
+    header, recs = route_trace.read(path)
+    assert header["x"] is True
+    state, *rest = recs
+    assert state["kind"] == route_trace.STATE and state["layer"] == 7
+    assert len(state["slots"]) == 8 and (state["slots"] == -1).all()
+    assert state["calls"] == 0 and not state["score"].any()
+    assert [r["kind"] for r in rest] == kinds
+    for r, (x, i) in zip(rest, calls):
+        assert r["layer"] == 7 and r["k"] == K and r["rows"] == i.size // K
+        assert r["ids"].tolist() == i.reshape(-1, K).tolist()
+    # decode-sized inputs carry their bf16 bits; larger calls do not
+    assert [r["x"] is not None for r in rest] == [True, True, False, False, True]
+    for r, (x, _) in zip(rest, calls):
+        if r["x"] is not None:
+            bits = np.array(x.reshape(r["rows"], D).view(mx.uint16))
+            assert (r["x"] == bits).all()
+
+
 def test_uncovered_checkpoint_is_skipped(tmp_path):
     glu = _make_glu()
     tensors = _tensors(glu)
