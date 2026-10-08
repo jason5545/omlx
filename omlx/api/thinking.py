@@ -9,9 +9,18 @@ Used by reasoning models like DeepSeek R1, Qwen3/3.5, MiniMax that wrap
 their chain-of-thought reasoning in <think>...</think> tags.
 """
 
+import logging
 import re
 from collections.abc import Callable, Sequence
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from .repetition import RepetitionDetector
+
+logger = logging.getLogger(__name__)
+
+# Token text that ends a line or a sentence: a budget close waits for one.
+_BOUNDARY_ENDS = tuple(s.encode() for s in ("\n", ".", "!", "?", "。", "！", "？"))
 
 # Tags used for thinking blocks
 _OPEN_TAG = "<think>"
@@ -404,34 +413,64 @@ class ThinkingBudgetProcessor:
     Handles both single-token and multi-token close-think sequences, and
     supports alternative think markers (e.g. ``<longcat_think>``).
 
+    Two optional behaviors make a forced close read as a decision instead of
+    a cut. With ``boundary_grace`` the close waits, at most that many tokens
+    past the budget, for a token ending a line or sentence. With
+    ``wrapup_token_ids`` a short note precedes the close telling the model to
+    answer from the reasoning so far; without it a model cut mid-thought
+    keeps drafting inside the answer.
+
+    With ``loop_detector`` the processor also stops a generation repeating
+    itself: in the reasoning it closes the reasoning the same way (with or
+    without a budget), in the answer it forces ``stop_token_id``.
+
     Args:
         think_end_token_ids: Token ID(s) for the close-think tag.
-        budget: Maximum number of thinking tokens before forcing close.
+        budget: Maximum number of thinking tokens before forcing close, or
+            ``None`` for no budget (loop guard only).
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
         start_in_thinking: False when the model, not the prompt, opens
             thinking. Counting then starts at ``think_start_token_id``.
+        wrapup_token_ids: Tokens forced before the close sequence.
+        boundary_grace: Tokens a budget close may wait for a line or sentence
+            end (0 closes at the budget, as before).
+        loop_detector: Detector fed with every generated token of each phase.
+        stop_token_id: Forced when the answer loops (an EOS id).
+        label: Request id for log lines.
     """
 
     def __init__(
         self,
         think_end_token_ids: List[int],
-        budget: int,
+        budget: Optional[int],
         think_start_token_id: Optional[int] = None,
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
         start_in_thinking: bool = True,
+        wrapup_token_ids: Optional[List[int]] = None,
+        boundary_grace: int = 0,
+        loop_detector: Optional["RepetitionDetector"] = None,
+        stop_token_id: Optional[int] = None,
+        label: Optional[str] = None,
     ):
         self._think_end_ids = think_end_token_ids
-        # Full force sequence: \n + </think> + \n\n (matches training pattern)
+        # Full force sequence: [wrap-up] + \n + </think> + \n\n (the part from
+        # \n on matches the training pattern)
         self._force_sequence = (
-            (leading_token_ids or [])
+            list(wrapup_token_ids or [])
+            + (leading_token_ids or [])
             + list(think_end_token_ids)
             + (trailing_token_ids or [])
         )
         self._budget = budget
         self._think_start_id = think_start_token_id
         self._token_to_piece = token_to_piece
+        self._boundary_grace = max(0, int(boundary_grace))
+        self._loop_detector = loop_detector
+        self._stop_token_id = stop_token_id
+        self._label = label or ""
+        self._loop_logged = False  # not rewound: one log line per request
 
         # State
         self._thinking_tokens: int = 0
@@ -445,6 +484,12 @@ class ThinkingBudgetProcessor:
         self._recent_tokens: List[int] = []
         self._last_token_utf8_complete: bool = True
         self._pending_utf8: bytes = b""
+        # Tokens generated past the budget while waiting for a boundary.
+        self._grace_count: int = 0
+        self._at_boundary: bool = False
+        # Loop guard verdicts: close the reasoning / stop the answer.
+        self._close_requested: bool = False
+        self._loop_stop: bool = False
 
     def __call__(self, tokens, logits):
         """mlx-lm logits processor: (tokens, logits) -> logits."""
@@ -460,6 +505,9 @@ class ThinkingBudgetProcessor:
                 self._update_state(int(tokens[i]))
             self._accepted_up_to = n
 
+        if self._loop_stop:
+            return self._force_stop(logits, mx)
+
         # If state changed by _update_state, handle immediately
         if self._done:
             return logits
@@ -472,7 +520,7 @@ class ThinkingBudgetProcessor:
 
         if self._in_thinking:
             self._thinking_tokens += 1
-            if self._thinking_tokens >= self._budget:
+            if self._close_due():
                 if self._last_token_utf8_complete:
                     self._forcing = True
                     self._force_idx = 0
@@ -483,9 +531,27 @@ class ThinkingBudgetProcessor:
 
         return logits
 
+    def _close_due(self) -> bool:
+        """Whether the reasoning should be closed at this position."""
+        if self._close_requested:
+            return True
+        if self._budget is None or self._thinking_tokens < self._budget:
+            return False
+        if not self._boundary_grace:
+            return True
+        # Past the budget: close at the first line or sentence end, or once
+        # the grace runs out.
+        self._grace_count += 1
+        return self._at_boundary or self._grace_count > self._boundary_grace
+
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""
         self._last_token_utf8_complete = self._is_utf8_complete(token_id)
+        if self._boundary_grace:
+            self._at_boundary = self._is_boundary(token_id)
+
+        if self._loop_stop:
+            return
 
         if self._done:
             if self._think_start_id and token_id == self._think_start_id:
@@ -493,6 +559,9 @@ class ThinkingBudgetProcessor:
                 self._done = False
                 self._thinking_tokens = 0
                 self._recent_tokens = []
+                self._new_phase()
+                return
+            self._feed_loop_guard(token_id)
             return
 
         if self._forcing:
@@ -501,6 +570,7 @@ class ThinkingBudgetProcessor:
                 self._in_thinking = False
                 self._forcing = False
                 self._done = True
+                self._new_phase()
             return
 
         # Detect natural close-think via sliding window
@@ -508,6 +578,7 @@ class ThinkingBudgetProcessor:
             if token_id == self._think_end_ids[0]:
                 self._in_thinking = False
                 self._done = True
+                self._new_phase()
                 return
         else:
             self._recent_tokens.append(token_id)
@@ -516,6 +587,7 @@ class ThinkingBudgetProcessor:
             if self._recent_tokens == self._think_end_ids:
                 self._in_thinking = False
                 self._done = True
+                self._new_phase()
                 return
 
         if self._waiting_utf8:
@@ -532,6 +604,56 @@ class ThinkingBudgetProcessor:
             self._done = False
             self._thinking_tokens = 0
             self._recent_tokens = []
+            self._new_phase()
+            return
+
+        self._feed_loop_guard(token_id)
+
+    def _new_phase(self) -> None:
+        """Reasoning opened or closed: budget grace and loop window start over."""
+        self._close_requested = False
+        self._grace_count = 0
+        if self._loop_detector is not None:
+            self._loop_detector.reset()
+
+    def _feed_loop_guard(self, token_id: int) -> None:
+        det = self._loop_detector
+        if det is None or det.looping or not det.feed(token_id):
+            return
+        if self._in_thinking:
+            self._close_requested = True
+            action = "closing the reasoning"
+        elif self._stop_token_id is not None:
+            self._loop_stop = True
+            action = "stopping the answer"
+        else:
+            action = "no stop token to force, letting it run"
+        if not self._loop_logged:
+            self._loop_logged = True
+            logger.warning(
+                "Loop guard%s: the %s repeats itself (%.0f%% of %d-token spans "
+                "repeat over the last %d tokens); %s",
+                f" [{self._label}]" if self._label else "",
+                "reasoning" if self._in_thinking else "answer",
+                100 * det.ratio,
+                det.n,
+                min(det.fed, det.window),
+                action,
+            )
+
+    def _is_boundary(self, token_id: int) -> bool:
+        """Whether the token's text ends a line or a sentence."""
+        if self._token_to_piece is None:
+            return False
+        try:
+            piece = self._token_to_piece(token_id)
+        except Exception:
+            return False
+        if piece is None:
+            return False
+        if isinstance(piece, str):
+            piece = piece.encode("utf-8", "ignore")
+        return piece.rstrip(b" \t").endswith(_BOUNDARY_ENDS)
 
     def _is_utf8_complete(self, token_id: int) -> bool:
         """Best-effort UTF-8 boundary check for accepted token bytes."""
@@ -566,6 +688,14 @@ class ThinkingBudgetProcessor:
         forced[..., target_id] = 0.0
         return forced
 
+    def _force_stop(self, logits, mx):
+        """Force the stop token once the answer was found looping."""
+        if self._stop_token_id is None:
+            return logits
+        forced = mx.full(logits.shape, float("-inf"))
+        forced[..., self._stop_token_id] = 0.0
+        return forced
+
     # -- Speculative-decoding (vlm_mtp) support -----------------------------
     #
     # The vlm_mtp decode path applies this processor inside mlx-vlm's
@@ -588,6 +718,10 @@ class ThinkingBudgetProcessor:
         "_last_token_utf8_complete",
         "_pending_utf8",
         "_accepted_up_to",
+        "_grace_count",
+        "_at_boundary",
+        "_close_requested",
+        "_loop_stop",
     )
 
     def snapshot_state(self) -> dict:
@@ -600,6 +734,8 @@ class ThinkingBudgetProcessor:
             if isinstance(value, list):
                 value = list(value)
             state[name] = value
+        if self._loop_detector is not None:
+            state["_loop_detector"] = self._loop_detector.snapshot()
         return state
 
     def restore_state(self, state: dict) -> None:
@@ -614,3 +750,5 @@ class ThinkingBudgetProcessor:
                 # Lazily-created attr absent from the snapshot: drop it so
                 # the next __call__ re-baselines from the history it sees.
                 delattr(self, name)
+        if self._loop_detector is not None and "_loop_detector" in state:
+            self._loop_detector.restore(state["_loop_detector"])

@@ -965,6 +965,9 @@ class TestSchedulerGrammarPath:
         scheduler.model.config = SimpleNamespace(vocab_size=vocab_size)
         scheduler.tokenizer = MagicMock()
         scheduler.tokenizer.eos_token_id = 2
+        # A model without reasoning markers: the thinking-budget / loop-guard
+        # processor has no close sequence to force.
+        scheduler._get_output_parser_thinking_end_text.return_value = None
 
         sampling_params = SamplingParams(
             max_tokens=100,

@@ -575,6 +575,30 @@ class _RegisteredRow(NamedTuple):
 
 _UID_ROW_REGISTRY_MAX = 4096
 _QWEN4_WIDE_PREFILL_STEP = 8192
+# Forced before a thinking-budget or loop-guard close. Without it a model cut
+# mid-thought keeps drafting inside its answer (GLM-5.3 oQ2e, 2026-10-08).
+# OMLX_THINKING_BUDGET_WRAPUP overrides it; an empty value turns it off.
+_THINKING_WRAPUP_TEXT = (
+    "\n\nI have used up my thinking budget, so I will stop reasoning here and "
+    "write the final answer directly from the reasoning above, without more "
+    "drafts."
+)
+
+
+def _thinking_budget_grace(budget: int | None) -> int:
+    """Tokens a budget close may wait for a line or sentence end.
+
+    At most an eighth of the budget, so a tiny budget still closes at once.
+    """
+    if budget is None:
+        return 0
+    try:
+        cap = max(0, int(os.environ.get("OMLX_THINKING_BUDGET_GRACE", "64")))
+    except ValueError:
+        cap = 64
+    return min(cap, max(0, int(budget)) // 8)
+
+
 # Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
 # instance starting at 0, so two engines serving concurrently (or an engine
 # reload) produce colliding uid sequences. The model object is the one
@@ -7090,9 +7114,19 @@ class Scheduler:
             getattr(sampling_params.compiled_grammar, "_omlx_has_thinking_phase", False)
             is True
         )
+        # The loop guard rides on the same processor, with or without a
+        # budget: it closes a reasoning that repeats itself and stops a
+        # repeating answer. Without a budget this attaches a processor that
+        # would not be there otherwise, which moves the request off the
+        # processor-free MTP fast paths (batched greedy verify, sparse
+        # top-k). Forcing EOS could break a grammar's structure, so
+        # constrained requests skip it.
+        from .api.repetition import loop_guard_enabled
+
+        loop_guard = loop_guard_enabled() and sampling_params.compiled_grammar is None
         if (
             grammar_allows_thinking
-            and sampling_params.thinking_budget is not None
+            and (sampling_params.thinking_budget is not None or loop_guard)
             and request is not None
             and (
                 getattr(request, "needs_think_prefix", False)
@@ -7135,14 +7169,35 @@ class Scheduler:
                 )
                 if parser_trailing_ids is not None:
                     trailing_ids = parser_trailing_ids
+                budget = sampling_params.thinking_budget
+                start_in_thinking = not optional_thinking
+                if budget is None:
+                    # Loop guard only: count the reasoning as open only when
+                    # the prompt opened it; a model opening it itself is
+                    # caught by ``think_start_token_id``.
+                    start_in_thinking = start_in_thinking and bool(
+                        getattr(request, "needs_think_prefix", False)
+                    )
+                loop_detector = None
+                if loop_guard:
+                    from .api.repetition import RepetitionDetector
+
+                    loop_detector = RepetitionDetector()
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
-                    budget=sampling_params.thinking_budget,
+                    budget=budget,
                     think_start_token_id=think_start_id,
                     leading_token_ids=leading_ids,
                     trailing_token_ids=trailing_ids,
                     token_to_piece=self._thinking_budget_token_to_piece,
-                    start_in_thinking=not optional_thinking,
+                    start_in_thinking=start_in_thinking,
+                    wrapup_token_ids=self._thinking_wrapup_token_ids(),
+                    boundary_grace=_thinking_budget_grace(budget),
+                    loop_detector=loop_detector,
+                    stop_token_id=(
+                        self._loop_guard_stop_token_id() if loop_detector else None
+                    ),
+                    label=getattr(request, "request_id", None),
                 )
                 logits_processors.append(processor)
 
@@ -7210,6 +7265,26 @@ class Scheduler:
         if factory is None:
             return None
         return getattr(factory, "thinking_start_output_text", None)
+
+    def _thinking_wrapup_token_ids(self) -> list[int] | None:
+        """Tokens of the note forced before a budget or loop-guard close."""
+        cached = getattr(self, "_thinking_wrapup_cache", None)
+        if cached is not None:
+            return cached[0]
+        text = os.environ.get("OMLX_THINKING_BUDGET_WRAPUP", _THINKING_WRAPUP_TEXT)
+        ids = self._encode_thinking_marker(text) if text else None
+        self._thinking_wrapup_cache = (ids,)
+        return ids
+
+    def _loop_guard_stop_token_id(self) -> int | None:
+        """The EOS id forced when an answer loops."""
+        eos = getattr(self.tokenizer, "eos_token_id", None)
+        if isinstance(eos, (list, tuple)):
+            eos = eos[0] if eos else None
+        if isinstance(eos, int):
+            return eos
+        stops = self._get_stop_tokens()
+        return min(stops) if stops else None
 
     def _encode_thinking_marker(self, text: str) -> list[int] | None:
         """Encode a parser/tokenizer thinking marker into token IDs."""
