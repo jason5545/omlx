@@ -375,7 +375,7 @@ class TestSchedulerWiring:
         assert proc._stop_token_id == EOS
         assert proc._force_sequence[:2] == [70, 71]  # the wrap-up note
         # No budget: the reminder after 8192 reasoning tokens, at a line end
-        assert proc._nudge_after == 8192 and proc._nudge_window == 1024
+        assert proc._nudge_after == 8192 and proc._nudge_window == 2048
         assert proc._nudge_sequence == [70, 71]
         assert proc._boundary_grace == 64
 

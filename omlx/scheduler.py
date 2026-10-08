@@ -599,6 +599,9 @@ def _thinking_nudge_limits() -> tuple[int | None, int]:
     8192 tokens is about five minutes of GLM-5.3 oQ2e decode. Over the omp
     sessions up to 2026-10-08 it reminds 1 of 2042 Qwen3.8 oQ5e reasonings
     and 3 of 20 cloud GLM-5.3 Flash ones (all past 12k tokens).
+    The 2048 that follow leave room to draft the code and check it: GLM-5.3
+    took the reminder, drafted its ~900-token answer in the reasoning, and
+    a 1024 window cut it just as it found a bug in that draft (2026-10-08).
     OMLX_THINKING_NUDGE_AFTER=0 turns the reminder off.
     """
 
@@ -609,7 +612,7 @@ def _thinking_nudge_limits() -> tuple[int | None, int]:
             return default
 
     after = env_int("OMLX_THINKING_NUDGE_AFTER", 8192)
-    return (after or None), env_int("OMLX_THINKING_NUDGE_WINDOW", 1024)
+    return (after or None), env_int("OMLX_THINKING_NUDGE_WINDOW", 2048)
 
 
 def _thinking_budget_grace(budget: int | None) -> int:
