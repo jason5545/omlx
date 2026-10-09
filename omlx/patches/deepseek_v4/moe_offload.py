@@ -63,7 +63,7 @@ from ..moe_expert_offload import (
     _minimum_experts,
     _resolve_model_dir,
 )
-from . import route_trace
+from . import capacity_profile, route_trace
 from .switch_layers import _sort_threshold
 
 logger = logging.getLogger(__name__)
@@ -751,6 +751,45 @@ def _iter_deepseek_v4_switch_glus(model):
     yield from walk(None, None, model, "")
 
 
+def _profiled_capacities(covered, uniform, model_dir, minimum):
+    """Per-layer capacities from the model's capacity profile (see
+    capacity_profile.py), keyed like ``uniform``; ``None`` keeps the uniform
+    split (no profile, a profile for other layers or expert counts, or
+    layers without a decoder index)."""
+    path = capacity_profile.profile_path(model_dir)
+    profile = capacity_profile.load_profile(path)
+    if profile is None or not covered:
+        return None
+    layers = [_layer_index(path_) for *_, path_, _view, _n, _b in covered]
+    counts = {n for *_, n, _ in covered}
+    if None in layers or len(set(layers)) != len(layers) or len(counts) != 1:
+        return None
+    plan = capacity_profile.plan_capacities(
+        profile,
+        {L: b // n for L, (*_, n, b) in zip(layers, covered)},
+        {L: uniform[i] for i, L in enumerate(layers)},
+        counts.pop(),
+        minimum,
+    )
+    if plan is None:
+        logger.info(
+            "deepseek_v4 moe expert offload: capacity profile %s does not fit "
+            "this model; uniform capacity",
+            path,
+        )
+        return None
+    logger.info(
+        "deepseek_v4 moe expert offload: per-layer capacity from %s (%d..%d slots, "
+        "uniform %d): %s",
+        path,
+        min(plan.values()),
+        max(plan.values()),
+        uniform[0],
+        " ".join(f"{L}:{plan[L]}" for L in sorted(plan)),
+    )
+    return {i: plan[L] for i, L in enumerate(layers)}
+
+
 def apply_deepseek_v4_moe_expert_offload(
     model,
     model_path: str | Path,
@@ -785,9 +824,7 @@ def apply_deepseek_v4_moe_expert_offload(
             "deepseek_v4 moe expert offload: no safetensors under %s", model_dir
         )
         return 0
-    wrapped = 0
-    total_bytes = resident_bytes = 0
-    chain = []  # (layer index, wrapper, its router) of glm5_next MoE blocks
+    covered = []
     for parent, key, glu, path in targets:
         if mtp_resident and _is_mtp_path(path):
             continue
@@ -798,12 +835,23 @@ def apply_deepseek_v4_moe_expert_offload(
             )
             continue
         n_experts = glu[_PROJS[0]]["weight"].shape[0]
-        capacity = min(n_experts, max(minimum, round(n_experts * resident_fraction)))
         layer_bytes = sum(
             int(np.prod(glu[proj][field].shape)) * glu[proj][field].dtype.size
             for proj in _PROJS
             for field in _fields(glu[proj])
         )
+        covered.append((parent, key, glu, path, view, n_experts, layer_bytes))
+    uniform = {
+        i: min(n, max(minimum, round(n * resident_fraction)))
+        for i, (*_, n, _) in enumerate(covered)
+    }
+    capacities = _profiled_capacities(covered, uniform, model_dir, minimum) or uniform
+
+    wrapped = 0
+    total_bytes = resident_bytes = 0
+    chain = []  # (layer index, wrapper, its router) of glm5_next MoE blocks
+    for i, (parent, key, glu, path, view, n_experts, layer_bytes) in enumerate(covered):
+        capacity = capacities[i]
         total_bytes += layer_bytes
         resident_bytes += layer_bytes * capacity // n_experts
         new = OffloadedSwitchGLU(glu, capacity, view)

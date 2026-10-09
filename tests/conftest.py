@@ -79,8 +79,13 @@ def cluster_home(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_user_route_trace(tmp_path, monkeypatch):
     """Offloaded MoE calls record a route trace while ~/.omlx/route_trace/ENABLE
-    exists; point the switch elsewhere so a test run never writes there."""
+    exists, and the glm5_next offload reads per-layer capacities from
+    ~/.omlx/moe_offload_profiles; point both elsewhere so a test run neither
+    writes the user's traces nor loads their profiles."""
     monkeypatch.setenv("OMLX_MOE_ROUTE_TRACE", str(tmp_path / "route-trace"))
+    monkeypatch.setenv(
+        "OMLX_MOE_OFFLOAD_CAPACITY_PROFILE", str(tmp_path / "no-capacity-profile.json")
+    )
 
 
 class MockTokenizer:

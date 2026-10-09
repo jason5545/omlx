@@ -620,6 +620,172 @@ def test_route_trace_records_calls_and_changes_nothing(
             assert (r["x"] == bits).all()
 
 
+def _capacity_profile(path, layers, grid, n=E):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "format": 1,
+                "n_experts": n,
+                "capacities": grid,
+                "layers": {str(L): v for L, v in layers.items()},
+            }
+        )
+    )
+    return path
+
+
+_STEEP_FLAT = ({0: [10, 6, 3, 1], 1: [2, 1.9, 1.8, 1.7]}, [8, 16, 24, 32])
+
+
+def test_capacity_plan_spends_the_uniform_bytes_where_slots_save_most():
+    from omlx.patches.deepseek_v4 import capacity_profile as cp
+
+    layers, grid = _STEEP_FLAT
+    profile = {"n_experts": E, "capacities": grid, "layers": layers}
+    uniform = {0: 16, 1: 16}
+    assert cp.plan_capacities(profile, {0: 100, 1: 100}, uniform, E, 6) == {0: 24, 1: 8}
+    # The budget is bytes: with layer 0's experts 3x larger, its third step
+    # would overrun it, and layer 1's cheaper step still fits.
+    assert cp.plan_capacities(profile, {0: 300, 1: 100}, uniform, E, 6) == {0: 16, 1: 16}
+    # Capacities below the routing minimum are not offered.
+    assert cp.plan_capacities(profile, {0: 100, 1: 100}, uniform, E, 12) == {0: 16, 1: 16}
+    # Anything that does not match keeps the uniform split.
+    assert cp.plan_capacities(profile, {0: 100}, {0: 16}, E, 6) is None
+    assert cp.plan_capacities(profile, {0: 100, 1: 100}, uniform, 2 * E, 6) is None
+    assert cp.plan_capacities(profile, {0: 100, 1: 100}, {0: 4, 1: 4}, E, 6) is None
+    assert cp.plan_capacities(None, {0: 100, 1: 100}, uniform, E, 6) is None
+
+
+def test_capacity_profile_file_and_switch(tmp_path, monkeypatch):
+    from omlx.patches.deepseek_v4 import capacity_profile as cp
+
+    monkeypatch.setenv("OMLX_MOE_OFFLOAD_CAPACITY_PROFILE", "0")
+    assert cp.profile_path(tmp_path / "Model") is None
+    monkeypatch.delenv("OMLX_MOE_OFFLOAD_CAPACITY_PROFILE")
+    assert cp.profile_path(tmp_path / "Model") == (
+        cp.Path.home() / ".omlx" / "moe_offload_profiles" / "Model.json"
+    )
+    good = _capacity_profile(tmp_path / "good.json", *_STEEP_FLAT)
+    monkeypatch.setenv("OMLX_MOE_OFFLOAD_CAPACITY_PROFILE", str(good))
+    assert cp.profile_path(tmp_path / "Model") == good
+    loaded = cp.load_profile(good)
+    assert loaded["layers"] == _STEEP_FLAT[0] and loaded["capacities"] == _STEEP_FLAT[1]
+    short = _capacity_profile(tmp_path / "short.json", {0: [1, 2]}, [8, 16, 24])
+    assert cp.load_profile(short) is None
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({**json.loads(good.read_text()), "format": 0}))
+    assert cp.load_profile(old) is None
+    assert cp.load_profile(tmp_path / "missing.json") is None
+
+
+def _settle_offload():
+    """Finish the GPU work a test started and drop its readers, so none of it
+    is still running when the interpreter exits (it aborted at exit,
+    ``recursive_mutex lock failed``, in two of three full test runs before
+    these tests settled)."""
+    import gc
+
+    from omlx.patches.moe_expert_offload import _shutdown_io_pool
+
+    mx.synchronize()
+    gc.collect()
+    _shutdown_io_pool()
+
+
+def _two_layer_checkpoint(tmp_path, reference):
+    tensors = {}
+    for i in range(2):
+        tensors.update(_tensors(reference, prefix=f"model.layers.{i}.ffn.switch_mlp"))
+    return _write(tmp_path, tensors)
+
+
+def test_offload_takes_per_layer_capacity_from_the_profile(
+    tmp_path, reference, monkeypatch
+):
+    """With a profile, the layers get their planned slots within the uniform
+    split's expert bytes, and decode stays bit-exact; without one (or with
+    the switch off) every layer keeps the uniform capacity."""
+    _two_layer_checkpoint(tmp_path, reference)
+    profile = _capacity_profile(tmp_path / "profiles" / "p.json", *_STEEP_FLAT)
+
+    def wrap():
+        model = _Model([_copy(reference), _copy(reference)])
+        assert dsv4.apply_deepseek_v4_moe_expert_offload(model, tmp_path, 0.5) == 2
+        return [layer.ffn.switch_mlp for layer in model.model.layers]
+
+    try:
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_CAPACITY_PROFILE", str(profile))
+        planned = wrap()
+        assert [w.cache.capacity for w in planned] == [24, 8]
+        assert sum(w.cache.capacity * w.cache.expert_bytes for w in planned) <= (
+            2 * 16 * planned[0].cache.expert_bytes
+        )
+        for w in planned:
+            for _ in range(3):
+                x, i = _x(1, 2, D), _routes((1, 2, K), seed=11)
+                ref, got = reference(x, i), w(x, i)
+                mx.eval(ref, got)
+                assert bool(mx.array_equal(ref, got))
+        del planned, w
+        for off in ("0", str(tmp_path / "none.json")):
+            monkeypatch.setenv("OMLX_MOE_OFFLOAD_CAPACITY_PROFILE", off)
+            assert [w.cache.capacity for w in wrap()] == [16, 16]
+    finally:
+        _settle_offload()
+
+
+def test_capacity_profile_replay_matches_the_live_cache(
+    tmp_path, reference, monkeypatch
+):
+    """Replaying a recorded trace at the recorded capacity with the profile's
+    copy of the cache rules gives the live cache's misses, residents and
+    decayed counts (decode, verify, streamed and in-capacity prefill), and
+    build_profile writes a profile load_profile accepts."""
+    import omlx.patches.moe_expert_offload as meo
+    from omlx.patches.deepseek_v4 import capacity_profile as cp
+    from omlx.patches.deepseek_v4 import route_trace
+
+    try:
+        trace_dir = tmp_path / "trace"
+        trace_dir.mkdir()
+        (trace_dir / "ENABLE").write_text("")
+        monkeypatch.setenv("OMLX_MOE_ROUTE_TRACE", str(trace_dir))
+        monkeypatch.setattr(route_trace, "_TRACER", route_trace._Tracer())
+        wrapped = _wrapped(tmp_path, reference, 0.5)  # 16 slots
+        wrapped._layer = 3
+        calls = (
+            _decode_steps(n=12)
+            + [(_x(2, 64, D), _routes((2, 64, K), seed=3))]  # over capacity: streamed
+            + [(_x(1, 2, D), _routes((1, 2, K), e=10, seed=4))]  # in-capacity prefill
+            + _decode_steps(n=10, seed=9)
+        )
+        for x, i in calls:
+            mx.eval(wrapped(x, i))
+        route_trace._TRACER.close()
+        (path,) = trace_dir.glob("routes-*.bin")
+        _, recs = route_trace.read(path)
+        state, *rest = recs
+        assert state["kind"] == route_trace.STATE and len(rest) == len(calls)
+        assert {r["kind"] for r in rest} == {route_trace.ROUTES, route_trace.EXPERT_MAJOR}
+        c = wrapped.cache
+        replica = cp._Cache(
+            E, len(state["slots"]), dsv4._SLOT_SCORE_DECAY, meo._SCORE_DECAY_EVERY, state
+        )
+        assert sum(replica.call(r) for r in rest) == c.misses > 16
+        assert replica.slot_of == c.slot_of
+        assert replica.score.tolist() == c.score.tolist()
+
+        out = tmp_path / "profile.json"
+        assert cp.main([str(path), "--out", str(out), "--grid", "8:32:8"]) == 0
+        profile = cp.load_profile(out)
+        assert profile["n_experts"] == E and profile["capacities"] == [8, 16, 24, 32]
+        row = profile["layers"][3]
+        assert row[-1] <= row[0]  # more slots, no more misses
+    finally:
+        _settle_offload()
+
+
 def test_uncovered_checkpoint_is_skipped(tmp_path):
     glu = _make_glu()
     tensors = _tensors(glu)
