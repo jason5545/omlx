@@ -257,6 +257,47 @@ def test_least_used_eviction_and_counters(tmp_path, reference):
     assert bool(mx.array_equal(ref, got))
 
 
+def test_slot_cache_decays_by_its_own_factor(tmp_path, reference, monkeypatch):
+    """The slot caches decay their routing counts by _SLOT_SCORE_DECAY on
+    every path that counts (decode read into the slots, decode through the
+    installing path, streamed prefill); the common cache keeps 0.7."""
+    import numpy as np
+
+    import omlx.patches.moe_expert_offload as meo
+
+    assert meo.ExpertCache.score_decay == meo._SCORE_DECAY == 0.7
+    assert dsv4._SlotCache.score_decay == dsv4._SLOT_SCORE_DECAY == 0.97
+    decay = np.float32(dsv4._SLOT_SCORE_DECAY)
+    steps = _decode_steps(n=11)
+    prefill = (_x(1, 64, D), _routes((1, 64, K), seed=5))
+    assert len(set(prefill[1].reshape(-1).tolist())) > 24  # over capacity: streamed
+    for into in (True, False):
+        wrapped = _wrapped(tmp_path, reference, 0.75)  # 24 slots
+        with monkeypatch.context() as patch:
+            patch.setattr(dsv4, "_INTO_SLOT", into)
+            for x, i in steps:
+                mx.eval(wrapped(x, i))
+            assert not wrapped.cache.free  # so the prefill fills no slot
+            mx.eval(wrapped(*prefill))
+        expected = np.zeros(E, dtype=np.float32)
+        calls = [i.reshape(-1).tolist() for _, i in steps]
+        calls.append(sorted(set(prefill[1].reshape(-1).tolist())))  # once per expert
+        for n, ids in enumerate(calls, start=1):
+            np.add.at(expected, np.asarray(ids, dtype=np.int64), np.float32(1.0))
+            if n % meo._SCORE_DECAY_EVERY == 0:
+                expected *= decay
+        assert wrapped.cache.score.tolist() == expected.tolist()
+        assert wrapped.cache.misses > 24
+
+
+def test_slot_score_decay_override(monkeypatch):
+    for raw, want in (("0.9", 0.9), ("1", 1.0), ("0", 0.97), ("1.5", 0.97), ("x", 0.97)):
+        monkeypatch.setenv("OMLX_TEST_DECAY", raw)
+        assert dsv4._env_decay("OMLX_TEST_DECAY", 0.97) == want
+    monkeypatch.delenv("OMLX_TEST_DECAY")
+    assert dsv4._env_decay("OMLX_TEST_DECAY", 0.97) == 0.97
+
+
 def test_over_capacity_prefill_never_rereads_a_resident_expert(tmp_path, reference):
     """Resident experts run first, so the call's installs evict only experts
     it has already used. Sorting by expert id alone let the first chunk evict

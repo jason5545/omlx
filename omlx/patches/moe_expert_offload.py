@@ -363,7 +363,8 @@ class ExpertCache:
     """Contiguous resident slots over one layer's experts.
 
     A miss evicts the expert with the lowest decayed routing count (+1 per
-    route, x``_SCORE_DECAY`` every ``_SCORE_DECAY_EVERY`` calls).
+    route, x``score_decay`` every ``_SCORE_DECAY_EVERY`` calls;
+    ``score_decay`` is ``_SCORE_DECAY`` unless a subclass sets its own).
 
     Holds no reference to the wrapped module's expert tensors — only the
     resident slots and the store view. That is the difference between saving
@@ -372,6 +373,7 @@ class ExpertCache:
     """
 
     moe_offload_cache = True  # walked by materialize_offload_state / stats
+    score_decay = _SCORE_DECAY
 
     def __init__(
         self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView, floor: int = 1
@@ -542,7 +544,7 @@ class ExpertCache:
         np.add.at(self.score, np.asarray(ids, dtype=np.int64), 1.0)
         self._calls += 1
         if self._calls % _SCORE_DECAY_EVERY == 0:
-            self.score *= _SCORE_DECAY
+            self.score *= self.score_decay
         misses = [e for e in needed if e not in self.slot_of]
         self.hits += len(needed) - len(misses)
         if not misses:

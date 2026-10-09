@@ -76,6 +76,13 @@ def cluster_home(tmp_path, monkeypatch):
     return home
 
 
+@pytest.fixture(autouse=True)
+def _no_user_route_trace(tmp_path, monkeypatch):
+    """Offloaded MoE calls record a route trace while ~/.omlx/route_trace/ENABLE
+    exists; point the switch elsewhere so a test run never writes there."""
+    monkeypatch.setenv("OMLX_MOE_ROUTE_TRACE", str(tmp_path / "route-trace"))
+
+
 class MockTokenizer:
     """Mock tokenizer for testing without loading real models."""
 

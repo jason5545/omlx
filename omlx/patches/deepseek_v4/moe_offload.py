@@ -49,7 +49,6 @@ from ...custom_kernels.glm_moe_dsa import fast as glm_fast
 from ...scheduler import _sync_and_clear_cache
 from ..moe_expert_offload import (
     _DTYPES,
-    _SCORE_DECAY,
     _SCORE_DECAY_EVERY,
     _SORT_MIN_ROUTES,
     CheckpointExpertStore,
@@ -86,6 +85,23 @@ _INTO_SLOT = os.environ.get("OMLX_MOE_OFFLOAD_READ_INTO_SLOT", "1") != "0"
 # How long those reads may run before the wait keeps the GPU clocked (the
 # common adapter waits 0.5 ms; this path was measured at 0).
 _KEEPALIVE_GRACE_S = _env_int("OMLX_MOE_OFFLOAD_KEEPALIVE_GRACE_US", 0, 0) * 1e-6
+
+
+def _env_decay(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return value if 0.0 < value <= 1.0 else default
+
+
+# Eviction decay of these slot caches (the common cache keeps _SCORE_DECAY,
+# 0.7): routing counts x_SLOT_SCORE_DECAY every _SCORE_DECAY_EVERY calls.
+# Replaying a 15-minute agent-loop route trace of GLM-5.3 oQ3.5e at 54%
+# residency (M5 Max) through an exact copy of this cache: 0.97 reads 9.3%
+# fewer experts in decode than 0.7 (0.95-0.98 within 0.5% of it; LRU 4% and
+# LFU 60% more than 0.7). OMLX_MOE_OFFLOAD_SLOT_SCORE_DECAY overrides it.
+_SLOT_SCORE_DECAY = _env_decay("OMLX_MOE_OFFLOAD_SLOT_SCORE_DECAY", 0.97)
 
 # Over-capacity prefill reads the experts the cache does not hold into
 # temporary weights and computes them group by group while the next groups
@@ -155,8 +171,10 @@ class _SlotCache(ExpertCache):
     The common cache's slot tensors are installed as the projections'
     parameters, so the module's own forward computes on them, and its
     eviction (lowest decayed routing count), read-ahead and decode keepalive
-    apply unchanged.
+    apply unchanged, with the counts decaying by ``_SLOT_SCORE_DECAY``.
     """
+
+    score_decay = _SLOT_SCORE_DECAY
 
     def __init__(self, glu, capacity: int, view: _GLUStoreView):
         self.glu = glu  # read by _allocate, which the base constructor calls
@@ -206,7 +224,7 @@ class _SlotCache(ExpertCache):
         np.add.at(self.score, np.asarray(ids, dtype=np.int64), 1.0)
         self._calls += 1
         if self._calls % _SCORE_DECAY_EVERY == 0:
-            self.score *= _SCORE_DECAY
+            self.score *= self.score_decay
         misses = [e for e in needed if e not in self.slot_of]
         self.hits += len(needed) - len(misses)
         if not misses:
@@ -294,7 +312,7 @@ class _SlotCache(ExpertCache):
         np.add.at(self.score, np.asarray(ids, dtype=np.int64), 1.0)
         self._calls += 1
         if self._calls % _SCORE_DECAY_EVERY == 0:
-            self.score *= _SCORE_DECAY
+            self.score *= self.score_decay
         self.hits += hits
         self.misses += streamed
         self.fetched_bytes += streamed * self.expert_bytes
