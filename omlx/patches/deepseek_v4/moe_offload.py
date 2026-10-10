@@ -39,6 +39,7 @@ import copy
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
@@ -80,12 +81,25 @@ _PROJS = ("gate_proj", "up_proj", "down_proj")
 # An earlier version (up to 8 per layer, each a task reading its slabs in
 # turn, on the demand pool) made decode 12-20% slower: the next layer's own
 # misses queued behind reads that ran past its routes. On by default
-# (OMLX_MOE_OFFLOAD_PREFETCH=0 turns it off); OMLX_MOE_OFFLOAD_PREFETCH_MAX
-# sets the count.
+# (OMLX_MOE_OFFLOAD_PREFETCH=0 turns it off; the file named by
+# OMLX_MOE_OFFLOAD_PREFETCH_FILE, ~/.omlx/moe_offload_prefetch by default,
+# holding 0 or 1 overrides that while the server runs, re-read at most once
+# a second); OMLX_MOE_OFFLOAD_PREFETCH_MAX sets the count.
 _PREFETCH = os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH", "1") != "0"
 _AHEAD_MAX = max(1, _env_int("OMLX_MOE_OFFLOAD_PREFETCH_MAX", 2, 2))
-_AHEAD_WORKERS = 9  # one expert's slabs at once
+# Each Python reader takes the GIL from the main thread, which builds the
+# next layer's graph while they read, every time a read returns: an expert's
+# three big slabs get a task each and its small ones share one, on four
+# workers, so one expert is read at a time and the next waits in the queue,
+# where dropping it costs nothing (on GLM-5.3 oQ3.5e shapes, M5 Max: 88 us
+# of main-thread time per layer reading two experts ahead, against 160 us
+# for a task per slab on nine workers). POSIX AIO would take no GIL, but
+# macOS cannot cancel a queued AIO read, and the dropped ones then delay the
+# next layer's own reads by about a millisecond.
+_AHEAD_WORKERS = 4
+_AHEAD_BIG = 1 << 20  # slabs read by a task of their own
 _AHEAD_BUFFERS = 6  # host buffers read into, reused once their reads are done
+_SWITCH = {"checked": float("-inf"), "value": None}
 # Decode misses are read straight into their slots (_SlotCache._ensure_decode).
 # OMLX_MOE_OFFLOAD_READ_INTO_SLOT=0 keeps the read-then-install path.
 _INTO_SLOT = os.environ.get("OMLX_MOE_OFFLOAD_READ_INTO_SLOT", "1") != "0"
@@ -187,6 +201,7 @@ class _SlotCache(ExpertCache):
         self.glu = glu  # read by _allocate, which the base constructor calls
         super().__init__(glu, capacity, view)
         self.rows = self._row_layout()
+        self._ahead_layout = None  # see ahead_slabs
 
     def _row_layout(self):
         """Per projection field ``(name, fi)``: ``(shape, dtype, row bytes)``
@@ -213,20 +228,23 @@ class _SlotCache(ExpertCache):
         oQ3.5e expert shapes, M5 Max: 0.3-0.38 ms less per miss, from the SSD
         and from page cache alike). Once a read is still running
         ``_KEEPALIVE_GRACE_S`` after they start, the rest of the wait keeps
-        the GPU clocked. A read started ahead (``pending``) lands in a host
-        buffer, copied into the slot once done. A failed read waits out the
-        others and gives back the slots whose expert did not arrive. Falls back to
+        the GPU clocked. A read started ahead (``pending``, :class:`_Ahead`)
+        lands in a host buffer and is copied into its slot first, while the
+        other misses are still being read (read again if it failed). A failed
+        read waits out the others and gives back the slots whose expert did
+        not arrive. Falls back to
         :meth:`_ensure_ids` (with the keepalive) when reads are serial or a
         slab's checkpoint bytes are not its slot row's layout.
         """
         pool = _io_pool()
         if not _INTO_SLOT or pool is None or self.rows is None:
-            self._ensure_ids(ids, lambda: None, pending=pending)
+            _cancel_reads(pending)
+            self._ensure_ids(ids, lambda: None)
             return
         pending = dict(pending or {})
         needed = list(dict.fromkeys(int(e) for e in ids))
         if len(needed) > self.capacity:
-            _drain(pending)
+            _cancel_reads(pending)
             raise ValueError("Expert cache capacity is smaller than the call's routes")
         np.add.at(self.score, np.asarray(ids, dtype=np.int64), 1.0)
         self._calls += 1
@@ -235,12 +253,12 @@ class _SlotCache(ExpertCache):
         misses = [e for e in needed if e not in self.slot_of]
         self.hits += len(needed) - len(misses)
         if not misses:
-            _drain(pending)
+            _cancel_reads(pending)
             return
         protected = frozenset(needed)
-        claimed = []  # (expert, slot); resident once its reads are done
-        groups = []  # per claimed expert: [(slot row view, future, copy bytes)]
-        done = 0
+        claimed = []  # (expert, slot); resident once its bytes are in the slot
+        groups = []  # per claimed expert: (its read ahead or None, [(slot row, plan, read)])
+        landed = set()  # indices into claimed whose expert is in its slot
         try:
             for e in misses:
                 slot = self._reserve(protected)
@@ -256,47 +274,92 @@ class _SlotCache(ExpertCache):
             }
             for e, slot in claimed:
                 ahead = pending.pop(e, None)
-                group = []
-                for n, (name, fi, plan) in enumerate(self._plans(e)):
+                rows = []
+                for name, fi, plan in self._plans(e):
                     row = self.rows[(name, fi)][2]
                     dst = views[(name, fi)][slot * row : (slot + 1) * row]
-                    if ahead is not None:
-                        group.append((dst, ahead[n][3], True))
-                    else:
-                        future = pool.submit(_pread_into, self.disk, plan, dst)
-                        group.append((dst, future, False))
-                groups.append(group)
+                    read = None
+                    if ahead is None:
+                        read = pool.submit(_pread_into, self.disk, plan, dst)
+                    rows.append((dst, plan, read))
+                groups.append((ahead, rows))
+            # Copy what was read ahead while the other misses are being read.
+            for i, (ahead, rows) in enumerate(groups):
+                if ahead is None:
+                    continue
+                if ahead.arrived():
+                    for n, (dst, _, _) in enumerate(rows):
+                        _copy_into(dst, ahead.slab(n))
+                    self._landed(*claimed[i])
+                    landed.add(i)
+                else:  # the read ahead failed: read the expert now
+                    groups[i] = (None, [
+                        (dst, plan, pool.submit(_pread_into, self.disk, plan, dst))
+                        for dst, plan, _ in rows
+                    ])
             keepalive = None
-            reads = [f for group in groups for _, f, _ in group]
-            if wait(reads, timeout=_KEEPALIVE_GRACE_S).not_done:
+            reads = [f for i, (_, rows) in enumerate(groups) if i not in landed
+                     for _, _, f in rows]
+            if reads and wait(reads, timeout=_KEEPALIVE_GRACE_S).not_done:
                 keepalive = _gpu_keepalive()
-            for (e, slot), group in zip(claimed, groups):
-                futures = [f for _, f, _ in group]
+            for i, (_, rows) in enumerate(groups):
+                if i in landed:
+                    continue
+                futures = [f for _, _, f in rows]
                 if keepalive is not None:
                     keepalive.wait(futures)
                 else:
                     wait(futures)
-                for dst, future, ahead in group:
-                    raw = future.result()
-                    if ahead:
-                        _copy_into(dst, raw)
-                self.map[e] = slot
-                self.misses += 1
-                self.fetched_bytes += self.expert_bytes
-                done += 1
+                for future in futures:
+                    future.result()
+                self._landed(*claimed[i])
+                landed.add(i)
         finally:
-            if done < len(claimed):
+            if len(landed) < len(claimed):
                 # Nothing may write a slot once it is given back.
-                futures = [f for group in groups for _, f, _ in group]
+                futures = [f for _, rows in groups for _, _, f in rows if f is not None]
                 for future in futures:
                     future.cancel()
                 wait(futures)
-                for e, slot in claimed[done:]:
-                    del self.slot_of[e]
-                    self.slot_expert[slot] = -1
-                    self.free.append(slot)
-            _drain(pending)
+                for i, (e, slot) in enumerate(claimed):
+                    if i not in landed:
+                        del self.slot_of[e]
+                        self.slot_expert[slot] = -1
+                        self.free.append(slot)
+            _cancel_reads(pending)
         self.warm = len(self.slot_of) == self.n_experts
+
+    def _landed(self, e: int, slot: int) -> None:
+        """Expert ``e``'s bytes are in ``slot``: route to it."""
+        self.map[e] = slot
+        self.misses += 1
+        self.fetched_bytes += self.expert_bytes
+
+    def ahead_slabs(self, e: int) -> list:
+        """Expert ``e``'s slabs as ``(fd, offset, bytes)`` in plan order: by
+        offset arithmetic when every slab is a row of a stacked checkpoint
+        tensor (worked out once), else from the read plans."""
+        if self._ahead_layout is None:
+            self._ahead_layout = self._stacked_layout() or False
+        if self._ahead_layout:
+            return [(fd, base + e * nbytes, nbytes) for fd, base, nbytes in self._ahead_layout]
+        return [(plan.fd, plan.offset, plan.nbytes) for *_, plan in self._plans(e)]
+
+    def _stacked_layout(self):
+        if self.n_experts < 2:
+            return None
+        last = self.n_experts - 1
+        out = []
+        for (*_, a), (*_, b), (*_, z) in zip(self._plans(0), self._plans(1), self._plans(last)):
+            if not (
+                a.fd == b.fd == z.fd
+                and a.nbytes == b.nbytes == z.nbytes
+                and b.offset == a.offset + a.nbytes
+                and z.offset == a.offset + last * a.nbytes
+            ):
+                return None
+            out.append((a.fd, a.offset, a.nbytes))
+        return out
 
     def _allocate(self, capacity: int) -> None:
         super()._allocate(capacity)
@@ -368,27 +431,44 @@ def _shutdown_ahead_pool() -> None:
 
 
 class _Ahead:
-    """One expert read ahead into a host buffer. ``group`` has the layout of
-    ``ExpertCache._submit`` (one future per slab, in plan order), each
-    future's result the buffer's view of its slab."""
+    """One expert read ahead into a host buffer: ``slabs`` holds each slab's
+    ``(offset, bytes)`` in the buffer, in plan order; ``futures`` its reads."""
 
-    __slots__ = ("buf", "group", "released")
+    __slots__ = ("buf", "slabs", "futures", "released")
 
     def __init__(self, nbytes: int):
         # Written once, so the reads into it take no page faults.
         self.buf = np.zeros(nbytes, dtype=np.uint8)
-        self.group = []
+        self.slabs = []
+        self.futures = []
         self.released = False
 
     def idle(self) -> bool:
         """Released, and nothing is still reading into it."""
-        return self.released and all(f.done() for *_, f in self.group)
+        return self.released and all(f.done() for f in self.futures)
+
+    def arrived(self) -> bool:
+        """Wait for the reads; whether every slab arrived."""
+        wait(self.futures)
+        return all(not f.cancelled() and f.exception() is None for f in self.futures)
+
+    def slab(self, n: int) -> memoryview:
+        offset, nbytes = self.slabs[n]
+        return memoryview(self.buf)[offset : offset + nbytes]
+
+    def drop(self) -> None:
+        """Cancel the queued reads; a running one finishes in the background,
+        and the buffer is not handed out again before it does."""
+        for future in self.futures:
+            future.cancel()
+        self.released = True
 
 
 class _AheadBuffers:
     """At most ``limit`` read-ahead buffers, shared by the layers. A buffer
     is handed out again only once it was released and every read into it
-    (a dropped read may still be running) has finished."""
+    (a dropped read may still be running) has finished; a larger one serves
+    a smaller expert."""
 
     def __init__(self, limit: int):
         self.limit = limit
@@ -396,20 +476,20 @@ class _AheadBuffers:
         self._all: list[_Ahead] = []
 
     def take(self, nbytes: int) -> _Ahead | None:
-        """A buffer of ``nbytes``, or ``None`` when all are busy."""
+        """A buffer of at least ``nbytes``, or ``None`` when all are busy."""
         with self._lock:
             idle = [i for i, a in enumerate(self._all) if a.idle()]
-            for i in idle:
-                a = self._all[i]
-                if a.buf.nbytes == nbytes:
-                    a.group, a.released = [], False
-                    return a
+            fits = [i for i in idle if self._all[i].buf.nbytes >= nbytes]
+            if fits:
+                a = self._all[min(fits, key=lambda i: self._all[i].buf.nbytes)]
+                a.slabs, a.futures, a.released = [], [], False
+                return a
             if len(self._all) >= self.limit and not idle:
                 return None
             a = _Ahead(nbytes)
             if len(self._all) < self.limit:
                 self._all.append(a)
-            else:  # an idle buffer of another layer's size makes room
+            else:  # an idle buffer too small for this expert makes room
                 self._all[idle[0]] = a
             return a
 
@@ -417,23 +497,51 @@ class _AheadBuffers:
 _AHEAD = _AheadBuffers(_AHEAD_BUFFERS)
 
 
-def _pread_ahead(store_view, plan, view):
-    """:func:`_pread_into` for a read ahead; the result is the view it filled."""
-    _pread_into(store_view, plan, view)
-    return view
+def _prefetch_on() -> bool:
+    """``_PREFETCH``, unless the switch file says otherwise ("0" off, anything
+    else on); the file is re-read at most once a second."""
+    now = time.monotonic()
+    if now - _SWITCH["checked"] >= 1.0:
+        _SWITCH["checked"] = now
+        path = os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH_FILE") or (
+            Path.home() / ".omlx" / "moe_offload_prefetch"
+        )
+        try:
+            _SWITCH["value"] = Path(path).expanduser().read_text().strip() != "0"
+        except OSError:
+            _SWITCH["value"] = None
+    value = _SWITCH["value"]
+    return _PREFETCH if value is None else value
+
+
+def _read_slabs(store_view, items) -> None:
+    """Read ``(fd, offset, view)`` items in turn (positional; any thread).
+    ``store_view`` is only held, so the shard descriptors stay open."""
+    for fd, offset, view in items:
+        got, nbytes = 0, len(view)
+        while got < nbytes:
+            n = os.preadv(fd, [view[got:]], offset + got)
+            if n <= 0:
+                raise OSError(f"short read of {nbytes} bytes at {offset}")
+            got += n
 
 
 def _start_ahead(pool, cache: ExpertCache, e: int, ahead: _Ahead) -> None:
-    """Start reading expert ``e`` into ``ahead``'s buffer, a task per slab."""
+    """Start reading expert ``e`` into ``ahead``'s buffer: a task per big
+    slab, one for the small ones."""
     buf = memoryview(ahead.buf)
-    pos = 0
-    for name, fi, plan in cache._plans(e):
-        view = buf[pos : pos + plan.nbytes]
-        pos += plan.nbytes
-        # Kept as each starts, so the buffer waits for every read into it.
-        ahead.group.append(
-            (name, fi, plan, pool.submit(_pread_ahead, cache.disk, plan, view))
-        )
+    small, pos = [], 0
+    for fd, offset, nbytes in cache.ahead_slabs(e):
+        item = (fd, offset, buf[pos : pos + nbytes])
+        ahead.slabs.append((pos, nbytes))
+        pos += nbytes
+        if nbytes >= _AHEAD_BIG:
+            # Kept as each starts, so the buffer waits for every read into it.
+            ahead.futures.append(pool.submit(_read_slabs, cache.disk, [item]))
+        else:
+            small.append(item)
+    if small:
+        ahead.futures.append(pool.submit(_read_slabs, cache.disk, small))
 
 
 def _copy_into(dst, src) -> None:
@@ -475,13 +583,9 @@ def _pread_into(store_view, plan, view) -> None:
 
 
 def _cancel_reads(reads) -> None:
-    """Drop reads ahead without waiting: queued slabs are cancelled, a
-    running one finishes in the background, and its buffer is not handed
-    out again before it does."""
+    """Drop reads ahead without waiting (see :meth:`_Ahead.drop`)."""
     for ahead in (reads or {}).values():
-        for *_, future in ahead.group:
-            future.cancel()
-        ahead.released = True
+        ahead.drop()
 
 
 class OffloadedSwitchGLU(nn.Module):
@@ -517,7 +621,7 @@ class OffloadedSwitchGLU(nn.Module):
         """
         pf = self._prefetch
         pf.staged = None
-        if not _PREFETCH or pf.gate is None or _ahead_pool() is None:
+        if pf.gate is None or not _prefetch_on() or _ahead_pool() is None:
             return []
         pf.staged = tuple(pf.gate(x))
         return list(pf.staged)
@@ -772,9 +876,7 @@ class OffloadedSwitchGLU(nn.Module):
                     )
                 claimed = self._claim_reads(incoming, ids) or {}
                 try:
-                    c._ensure_decode(
-                        ids, pending={e: a.group for e, a in claimed.items()} or None
-                    )
+                    c._ensure_decode(ids, pending=claimed or None)
                 finally:
                     # Copied into their slots, or drained on the way out.
                     for ahead in claimed.values():

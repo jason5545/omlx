@@ -559,7 +559,8 @@ def test_decode_read_failure_gives_the_claimed_slots_back(
 def test_read_ahead_buffers_wait_for_dropped_reads():
     """A dropped read ahead may still be writing its buffer: the buffer is
     handed out again only once that read is done, no more than ``limit``
-    exist, and an idle one of another size makes room."""
+    exist, a larger idle one serves a smaller expert, and an idle one too
+    small for an expert makes room."""
     from concurrent.futures import Future
 
     ring = dsv4._AheadBuffers(2)
@@ -567,16 +568,29 @@ def test_read_ahead_buffers_wait_for_dropped_reads():
     assert a is not b and ring.take(100) is None
     running = Future()
     assert running.set_running_or_notify_cancel()
-    a.group = [(None, 0, None, running)]
+    a.futures = [running]
     dsv4._cancel_reads({1: a, 2: b})
     assert not running.cancelled()  # a running read cannot be stopped
-    assert ring.take(100) is b
+    assert ring.take(50) is b  # larger serves smaller
     assert ring.take(100) is None  # a is released but still being read into
     running.set_result(None)
     assert ring.take(100) is a
     a.released = True
-    c = ring.take(50)
-    assert c is not a and c.buf.nbytes == 50 and ring.take(100) is None
+    c = ring.take(150)
+    assert c is not a and c.buf.nbytes == 150 and ring.take(10) is None
+
+
+def _held_reads(c, experts, release):
+    """``_read_slabs`` that blocks on ``release`` for ``experts``' slabs."""
+    held = {(fd, off) for e in experts for fd, off, _ in c.ahead_slabs(e)}
+    read = dsv4._read_slabs
+
+    def slabs(store_view, items):
+        if any((fd, off) in held for fd, off, _ in items):
+            release.wait(10)  # until the call is over
+        read(store_view, items)
+
+    return slabs
 
 
 def test_dropped_read_ahead_never_holds_up_the_call(tmp_path, reference, monkeypatch):
@@ -584,9 +598,11 @@ def test_dropped_read_ahead_never_holds_up_the_call(tmp_path, reference, monkeyp
     waiting for them, and takes the one it misses on from its buffer instead
     of reading it again: same output as the module, same cache state as
     without reads ahead. The dropped reads hold every read-ahead worker and
-    more, which would stall the call's own reads on a shared pool."""
+    as many tasks as the demand pool has workers, which would stall the
+    call's own reads on a shared pool."""
     import threading
     import time
+    from concurrent.futures import wait as wait_all
 
     x = _x(1, 1, D)
     idx = mx.array([[[0, 1, 2, 3, 4, 5]]])
@@ -597,50 +613,98 @@ def test_dropped_read_ahead_never_holds_up_the_call(tmp_path, reference, monkeyp
     release = threading.Event()
     demand = []
 
-    def plain(*_):
-        wrapped = _wrapped(tmp_path, reference, 0.5)
-        out = wrapped(x, idx)
-        mx.eval(out)
-        return wrapped, out
-
-    base, _ = plain()
+    base = _wrapped(tmp_path, reference, 0.5)
+    mx.eval(base(x, idx))
     wrapped = _wrapped(tmp_path, reference, 0.5)
     c = wrapped.cache
-    held = {plan for e in (30, 31) for _, _, plan in c._plans(e)}
-
-    def ahead(store_view, plan, view):
-        if plan in held:
-            release.wait(10)  # until the call is over
-        read_into(store_view, plan, view)
-        return view
-
     with monkeypatch.context() as patch:
-        patch.setattr(dsv4, "_pread_ahead", ahead)
+        patch.setattr(dsv4, "_read_slabs", _held_reads(c, (29, 30, 31), release))
         patch.setattr(
             dsv4, "_pread_into", lambda sv, plan, view: (demand.append(plan), read_into(sv, plan, view))[1]
         )
         pool = dsv4._ahead_pool()
-        used, dropped, queued = (dsv4._AHEAD.take(c.expert_bytes) for _ in range(3))
-        dsv4._start_ahead(pool, c, 5, used)  # routed, not resident
-        dsv4._start_ahead(pool, c, 30, dropped)  # not routed: held until released
-        dsv4._start_ahead(pool, c, 31, queued)
-        wrapped._prefetch.incoming = {5: used, 30: dropped, 31: queued}
+        aheads = {e: dsv4._AHEAD.take(c.expert_bytes) for e in (5, 30, 31, 29)}
+        for e, a in aheads.items():  # 5 is routed and not resident; the rest are not routed
+            dsv4._start_ahead(pool, c, e, a)
+        wrapped._prefetch.incoming = dict(aheads)
         t0 = time.perf_counter()
         out = wrapped(x, idx)
         mx.eval(out)
         took = time.perf_counter() - t0
-        assert not dropped.idle()  # still being read into, so not handed out
+        assert not aheads[30].idle()  # still being read into, so not handed out
         release.set()
-        wait_for = [f for a in (dropped, queued) for *_, f in a.group]
-        from concurrent.futures import wait as wait_all
-
-        wait_all(wait_for)
+        wait_all([f for a in aheads.values() for f in a.futures])
     dsv4._shutdown_ahead_pool()
     assert took < 5
     assert bool(mx.array_equal(ref, out))
     assert _cache_state(c) == _cache_state(base.cache)
     assert {plan for _, _, plan in c._plans(5)}.isdisjoint(demand)
-    assert used.idle() and dropped.idle() and queued.idle()
+    assert all(a.idle() for a in aheads.values())
+
+
+def test_failed_read_ahead_is_read_again(tmp_path, reference, monkeypatch):
+    """A claimed read ahead that failed is read again on the demand path:
+    same output, same cache state."""
+    x = _x(1, 1, D)
+    idx = mx.array([[[0, 1, 2, 3, 4, 5]]])
+    ref = reference(x, idx)
+    mx.eval(ref)
+    monkeypatch.setattr(dsv4, "_AHEAD", dsv4._AheadBuffers(dsv4._AHEAD_BUFFERS))
+    base = _wrapped(tmp_path, reference, 0.5)
+    mx.eval(base(x, idx))
+    wrapped = _wrapped(tmp_path, reference, 0.5)
+    c = wrapped.cache
+
+    def failing(store_view, items):
+        raise OSError("injected")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dsv4, "_read_slabs", failing)
+        ahead = dsv4._AHEAD.take(c.expert_bytes)
+        dsv4._start_ahead(dsv4._ahead_pool(), c, 5, ahead)
+        wrapped._prefetch.incoming = {5: ahead}
+        out = wrapped(x, idx)
+        mx.eval(out)
+    _settle_offload()
+    assert bool(mx.array_equal(ref, out))
+    assert _cache_state(c) == _cache_state(base.cache)
+    assert ahead.idle()
+
+
+def test_ahead_slabs_follow_the_read_plans(tmp_path, reference):
+    """The read-ahead's offset arithmetic names every expert's slabs exactly
+    as the read plans do."""
+    c = _wrapped(tmp_path, reference, 0.5).cache
+    assert c.ahead_slabs(0) and c._ahead_layout
+    for e in range(E):
+        assert c.ahead_slabs(e) == [(p.fd, p.offset, p.nbytes) for *_, p in c._plans(e)]
+    c._ahead_layout = False  # not stacked: the plans themselves
+    assert c.ahead_slabs(7) == [(p.fd, p.offset, p.nbytes) for *_, p in c._plans(7)]
+    _settle_offload()
+
+
+def test_prefetch_switch_file(tmp_path, monkeypatch):
+    """The switch file overrides the default while the server runs ("0" off,
+    anything else on, absent: the default), re-read at most once a second."""
+    path = tmp_path / "switch"
+    monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH_FILE", str(path))
+    monkeypatch.setattr(dsv4, "_SWITCH", {"checked": float("-inf"), "value": None})
+
+    def recheck():
+        dsv4._SWITCH["checked"] = float("-inf")
+        return dsv4._prefetch_on()
+
+    monkeypatch.setattr(dsv4, "_PREFETCH", True)
+    assert recheck()
+    path.write_text("0\n")
+    assert not recheck()
+    monkeypatch.setattr(dsv4, "_PREFETCH", False)
+    path.write_text("1")
+    assert recheck()
+    path.unlink()
+    assert not recheck()
+    path.write_text("1")
+    assert not dsv4._prefetch_on()  # checked under a second ago
 
 
 def test_read_ahead_takes_the_most_weighted_non_resident_experts(

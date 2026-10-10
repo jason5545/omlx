@@ -3527,12 +3527,15 @@ def test_offloaded_moe_decode_starts_router_then_shared_expert(
             # The read-back-free keepalive pulses are float32 [8] arrays.
             calls = [a for a in started if a[0].shape != (8,)]
             if overlap:
-                router, shared, routed = calls
-                # indices, scores, and for all but the last layer the next
-                # layer's predicted indices and scores (read ahead on by the
-                # offload).
-                assert [a.shape for a in router] == [(1, length, 8)] * len(router)
-                assert len(router) == (4 if m_off is not offloaded[-1] else 2)
+                # The router's indices and scores, then on all but the last
+                # layer the next layer's predicted ones (read ahead on by the
+                # offload) apart, so the read-back waits for the router only.
+                if m_off is not offloaded[-1]:
+                    router, ahead, shared, routed = calls
+                    assert [a.shape for a in ahead] == [(1, length, 8)] * 2
+                else:
+                    router, shared, routed = calls
+                assert [a.shape for a in router] == [(1, length, 8)] * 2
                 assert shared[0].shape == (1, length, 1024)
                 # The routed experts (unsummed, or summed by the module).
                 assert routed[0].shape[:2] == (1, length)
@@ -3563,7 +3566,7 @@ def test_offloaded_moe_reads_the_next_layer_ahead_and_changes_nothing(
     start = moe_offload._start_ahead
     claim = moe_offload.OffloadedSwitchGLU._claim_reads
     read_next = moe_offload.OffloadedSwitchGLU._read_next
-    read_ahead = moe_offload._pread_ahead
+    read_ahead = moe_offload._read_slabs
     take = moe_offload._AheadBuffers.take
 
     def run(prefetch):
@@ -3605,7 +3608,7 @@ def test_offloaded_moe_reads_the_next_layer_ahead_and_changes_nothing(
         monkeypatch.setattr(moe_offload.OffloadedSwitchGLU, "_read_next", counted_read_next)
         monkeypatch.setattr(moe_offload._AheadBuffers, "take", checked_take)
         if slow:
-            monkeypatch.setattr(moe_offload, "_pread_ahead", slow_read_ahead)
+            monkeypatch.setattr(moe_offload, "_read_slabs", slow_read_ahead)
         mx.random.seed(9)
         outs = []
         for length in [1, 3, 2, 4, 1, 3, 3, 1, 2, 4, 3, 1] * 3:

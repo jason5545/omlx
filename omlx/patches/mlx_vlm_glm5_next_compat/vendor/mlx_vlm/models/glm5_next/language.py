@@ -1656,7 +1656,10 @@ class Glm5NextMoE(nn.Module):
             # input, added in the same order.
             stage = getattr(self.switch_mlp, "stage_next_routes", None)
             ahead = stage(x) if stage is not None else []
-            mx.async_eval(indices, scores, *ahead)
+            mx.async_eval(indices, scores)
+            if ahead:
+                # Apart, so the read-back does not wait for the prediction.
+                mx.async_eval(*ahead)
             shared = self.shared_experts(x)
             mx.async_eval(shared)
         y = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)
