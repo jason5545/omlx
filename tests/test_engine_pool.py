@@ -994,6 +994,21 @@ class TestApplySettingsOverrides:
         assert pool.get_entry("model-b").model_type == "llm"
         assert pool.get_entry("model-b").engine_type == "batched"
 
+    def test_decision_override_selects_decision_engine(self, small_mock_model_dir):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        from omlx.model_settings import ModelSettings
+
+        settings_manager = MagicMock()
+        settings_manager.get_settings.return_value = ModelSettings(
+            model_type_override="decision"
+        )
+        pool.apply_settings_overrides(settings_manager)
+
+        assert pool.get_entry("model-a").model_type == "decision"
+        assert pool.get_entry("model-a").engine_type == "decision"
+
     def test_no_override_leaves_entry_unchanged(self, small_mock_model_dir):
         """Test that None override doesn't change entry types."""
         pool = _make_pool(ceiling=10 * 1024**3)
@@ -1835,6 +1850,20 @@ class TestEnginePoolAsync:
         assert sig(off) != sig(on)
         assert sig(on) != sig(other_floor)
 
+    def test_oq_a8_toggle_changes_qwen4_exp_signature(self, pool_with_mock_engines):
+        """Flash-Next reloads on the same toggle, so routed-expert tags never
+        outlive an OFF request (OFF -> ON -> OFF -> ON each get a new engine)."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        pool._entries["model-a"].config_model_type = "qwen4_exp"
+        sig = lambda enabled: pool._engine_runtime_signature(  # noqa: E731
+            "model-a", ModelSettings(qwen35_oq_a8_enabled=enabled)
+        )
+        assert sig(False) != sig(True)
+        assert sig(True) == sig(True)
+        assert sig(False) == sig(False)
+
     def test_oq_a8_tuning_is_ignored_while_disabled(self, pool_with_mock_engines):
         """A stale floor on a disabled feature must not split the engine."""
         from omlx.model_settings import ModelSettings
@@ -1972,6 +2001,8 @@ class TestEnginePoolAsync:
             model_name=str(model_path),
             trust_remote_code=False,
             scheduler_config=scheduler_config,
+            audio_enabled=False,
+            audio_max_seconds=None,
         )
 
     @pytest.mark.asyncio
@@ -2000,6 +2031,48 @@ class TestEnginePoolAsync:
 
         assert engine is mock_engine
         MockEmbeddingEngine.assert_called_once_with(
+            model_name=str(model_path),
+            trust_remote_code=False,
+            scheduler_config=pool._scheduler_config,
+            audio_enabled=False,
+            audio_max_seconds=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_decision_engine_ignores_saved_dflash_settings(self, tmp_path):
+        """A checkpoint once served as a VLM may keep DFlash settings; a decision
+        load must still build the decision engine."""
+        from omlx.model_settings import ModelSettings
+
+        model_path = tmp_path / "clef"
+        model_path.mkdir()
+        (model_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._settings_manager = MagicMock()
+        pool._settings_manager.get_settings.return_value = ModelSettings(
+            dflash_enabled=True, dflash_draft_model="draft"
+        )
+        pool._entries["clef"] = EngineEntry(
+            model_id="clef",
+            model_path=str(model_path),
+            model_type="decision",
+            engine_type="decision",
+            estimated_size=1024,
+        )
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with (
+            patch(
+                "omlx.engine_pool.DecisionEngine", return_value=mock_engine
+            ) as MockDecisionEngine,
+            patch("omlx.engine.dflash.DFlashEngine") as MockDFlashEngine,
+        ):
+            engine = await pool.get_engine("clef")
+
+        assert engine is mock_engine
+        MockDFlashEngine.assert_not_called()
+        MockDecisionEngine.assert_called_once_with(
             model_name=str(model_path),
             trust_remote_code=False,
             scheduler_config=pool._scheduler_config,
@@ -4462,6 +4535,62 @@ class TestMemorySettleBarrier:
 
         entry_b.in_use = 1
         assert pool._other_entries_serving("model-a") is True
+
+    @pytest.mark.asyncio
+    async def test_unload_survives_metal_command_buffer_error(
+        self, pool_with_loaded_model
+    ):
+        """A pending Metal error at unload must not leak the memory accounting."""
+        pool = pool_with_loaded_model
+        est_size = pool._entries["model-a"].estimated_size  # 5GB
+        initial_memory = pool._current_model_memory
+        oom_error = RuntimeError(
+            "[METAL] Command buffer execution failed: Insufficient Memory "
+            "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        )
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_mx.get_active_memory = MagicMock(
+                side_effect=[10 * 1024**3, 5 * 1024**3]
+            )
+            mock_mx.synchronize = MagicMock(side_effect=[oom_error, None])
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == initial_memory - est_size
+
+    @pytest.mark.asyncio
+    async def test_unload_exits_on_submissions_ignored(self, pool_with_loaded_model):
+        """SubmissionsIgnored at unload exits instead of retrying."""
+        pool = pool_with_loaded_model
+        sub_ignored = RuntimeError(
+            "[METAL] Command buffer execution failed: GPU submissions ignored "
+            "(00000008:kIOGPUCommandBufferCallbackErrorSubmissionsIgnored)"
+        )
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch("omlx.utils.fatal.fatal_exit", side_effect=SystemExit) as fatal_exit,
+        ):
+            mock_mx.get_active_memory = MagicMock(return_value=0)
+            mock_mx.synchronize = MagicMock(side_effect=[sub_ignored])
+            mock_mx.clear_cache = MagicMock()
+
+            with pytest.raises(SystemExit):
+                await pool._stop_and_unload_engine("model-a")
+
+        fatal_exit.assert_called_once()
+        assert str(sub_ignored) in str(fatal_exit.call_args.args[0])
 
 
 class TestEnginePoolInUseLease:

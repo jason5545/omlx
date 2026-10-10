@@ -56,6 +56,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
                 "audio_stt",
                 "audio_tts",
                 "audio_sts",
+                "decision",
             ]
         )
     }
@@ -359,6 +360,20 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNil(vm.currentSettingsDict()["enable_thinking"])
         vm.model?.anePrefillBackend = nil
         XCTAssertFalse(vm.isQwen35AnePrefillModel)
+    }
+
+    func testQwenOqA8ModelGateCoversQwen4ExpOnly() {
+        let vm = ModelSettingsScreenVM()
+        for type in ["qwen3_5", "qwen3_5_moe", "qwen3_6", "qwen3_8", "qwen4_exp", "Qwen4-Exp"] {
+            vm.model = makeModel(id: "m", configModelType: type)
+            XCTAssertTrue(vm.isQwenOqA8Model, type)
+        }
+        for type in ["qwen4", "qwen4_exp_x", "qwen3", "llama", "k2_horizon"] {
+            vm.model = makeModel(id: "m", configModelType: type)
+            XCTAssertFalse(vm.isQwenOqA8Model, type)
+        }
+        vm.model = makeModel(id: "m", configModelType: nil)
+        XCTAssertFalse(vm.isQwenOqA8Model)
     }
 
     func testQwen4SsdOffloadWireKeysAndCompatibility() throws {

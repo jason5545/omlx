@@ -33,6 +33,7 @@ final class ModelSettingsScreenVM {
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
         case trustRemoteCode
+        case embeddingAudioEnabled, embeddingAudioMaxSeconds
         case reasoningParser
         case chatTemplateKwargs
         case turboquantKvEnabled, turboquantKvBits
@@ -85,6 +86,9 @@ final class ModelSettingsScreenVM {
             ("audio_sts", String(localized: "settings.model_type.audio_sts",
                                  defaultValue: "Audio STS",
                                  comment: "Model type option label for speech-to-speech models")),
+            ("decision", String(localized: "settings.model_type.decision",
+                                defaultValue: "Decision",
+                                comment: "Model type option label for decision models served by /v1/systemone")),
         ]
     }
 
@@ -268,6 +272,10 @@ final class ModelSettingsScreenVM {
 
     // Security
     var trustRemoteCode: Bool = false
+
+    // Embedding audio tower. Empty seconds keeps the 30 s processor default.
+    var embeddingAudioEnabled: Bool = false
+    var embeddingAudioMaxSeconds: String = ""
 
     // Reasoning parser (free-form override; empty = auto)
     var reasoningParser: String = ""
@@ -467,6 +475,8 @@ final class ModelSettingsScreenVM {
             .replacingOccurrences(of: "-", with: "_") == "qwen4_exp"
     }
 
+    var embeddingAudioSupported: Bool { model?.embeddingAudioSupported == true }
+
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
@@ -524,6 +534,8 @@ final class ModelSettingsScreenVM {
         case .alias, .modelType, .contextLength, .maxTokens:
             return false
         case .temperature, .ttl, .isPinned, .isFavorite, .trustRemoteCode:
+            return false
+        case .embeddingAudioEnabled, .embeddingAudioMaxSeconds:
             return false
         case .chatTemplateKwargs:
             return false
@@ -630,6 +642,8 @@ final class ModelSettingsScreenVM {
                 self.isPinned = s?.isPinned ?? false
                 self.isFavorite = s?.isFavorite ?? false
                 self.trustRemoteCode = s?.trustRemoteCode ?? false
+                self.embeddingAudioEnabled = s?.embeddingAudioEnabled ?? false
+                self.embeddingAudioMaxSeconds = s?.embeddingAudioMaxSeconds.map { Self.formatPct($0) } ?? ""
                 self.reasoningParser = s?.reasoningParser ?? ""
                 self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
                     ChatTemplateKwargsCodec.decode(
@@ -786,6 +800,17 @@ final class ModelSettingsScreenVM {
         case .isPinned:                patch.isPinned = isPinned
         case .isFavorite:              patch.isFavorite = isFavorite
         case .trustRemoteCode:         patch.trustRemoteCode = trustRemoteCode
+        case .embeddingAudioEnabled:   patch.embeddingAudioEnabled = embeddingAudioEnabled
+        case .embeddingAudioMaxSeconds:
+            let text = embeddingAudioMaxSeconds.trimmingCharacters(in: .whitespaces)
+            if text.isEmpty {
+                patch.embeddingAudioMaxSeconds = .some(nil)
+            } else if let seconds = Double(text), seconds > 0 {
+                patch.embeddingAudioMaxSeconds = seconds
+            } else {
+                lastError = "Max audio length must be a positive number of seconds."
+                return
+            }
         case .reasoningParser:
             patch.reasoningParser = reasoningParser.isEmpty ? nil : reasoningParser
         case .chatTemplateKwargs:
@@ -1133,6 +1158,9 @@ final class ModelSettingsScreenVM {
     }
 
     var isQwenOqA8Model: Bool {
+        // qwen4_exp (Qwen3.8-Flash-Next) matches exactly: only that validated
+        // family has routed-expert A8, not every qwen4*.
+        if isQwen4Exp { return true }
         let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
         return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
     }

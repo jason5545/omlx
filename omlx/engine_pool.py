@@ -18,7 +18,6 @@ import copy
 import gc
 import json
 import logging
-import os
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
@@ -34,6 +33,7 @@ if TYPE_CHECKING:
 import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
+from .engine.decision import DecisionEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.sts import STSEngine
@@ -63,6 +63,7 @@ from .model_settings import (
     validate_ane_prefill,
 )
 from .scheduler import SchedulerConfig
+from .utils.fatal import exit_if_gpu_submissions_ignored
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.model_loading import dflash_batched_requested, dflash_batched_supported
 from .utils.proc_memory import get_phys_footprint
@@ -274,7 +275,14 @@ class EngineEntry:
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
     model_type: Literal[
-        "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"
+        "llm",
+        "vlm",
+        "embedding",
+        "reranker",
+        "audio_stt",
+        "audio_tts",
+        "audio_sts",
+        "decision",
     ]  # Model type
     engine_type: Literal[
         "batched",
@@ -285,6 +293,7 @@ class EngineEntry:
         "audio_stt",
         "audio_tts",
         "audio_sts",
+        "decision",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
@@ -310,6 +319,7 @@ class EngineEntry:
         BaseEngine
         | EmbeddingEngine
         | RerankerEngine
+        | DecisionEngine
         | STTEngine
         | STSEngine
         | TTSEngine
@@ -572,10 +582,7 @@ class EnginePool:
 
             fraction = runtime_settings.moe_expert_offload_resident_fraction
             if entry.config_model_type == "deepseek_v41":
-                if (
-                    v41_estimate is None
-                    and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-                ):
+                if v41_estimate is None:
                     from .patches.deepseek_v41.moe_offload import (
                         estimate_expert_savings,
                     )
@@ -787,10 +794,7 @@ class EnginePool:
             estimate = deepseek_v41_residency_estimate(entry.model_path)
             if not estimate.supported:
                 return False, False, None
-            if (
-                getattr(settings, "moe_expert_offload_enabled", False)
-                and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-            ):
+            if getattr(settings, "moe_expert_offload_enabled", False):
                 from .patches.deepseek_v41.moe_offload import estimate_expert_savings
 
                 saved = estimate_expert_savings(
@@ -1062,6 +1066,12 @@ class EnginePool:
         # Security/load gates.
         add("trust_remote_code", bool(data.get("trust_remote_code", False)))
         add("index_cache_freq", normalized_index_cache_freq())
+        # Embedding audio tower residency is decided at load. The audio length
+        # only matters while the tower is loaded.
+        audio_active = bool(data.get("embedding_audio_enabled", False))
+        add("embedding_audio_enabled", audio_active)
+        if audio_active:
+            add("embedding_audio_max_seconds", data.get("embedding_audio_max_seconds"))
 
         # Load-time model variants. Dependent fields only matter when their
         # feature is active; stale draft paths or tuning defaults must not
@@ -1430,6 +1440,7 @@ class EnginePool:
         "audio_stt": "audio_stt",
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
+        "decision": "decision",
     }
 
     @staticmethod
@@ -3255,6 +3266,28 @@ class EnginePool:
         if cancelled:
             raise asyncio.CancelledError
 
+    async def _metal_sync_clear_cache(self, model_id: str) -> None:
+        """Synchronize and clear the Metal cache during unload."""
+
+        def sync_clear() -> None:
+            mx.synchronize()
+            mx.clear_cache()
+
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(get_mlx_executor(), sync_clear)
+        except RuntimeError as e:
+            if "Command buffer execution failed" not in str(e):
+                raise
+            exit_if_gpu_submissions_ignored(e)
+            # A failed prefill can leave this error pending. MLX clears it when
+            # it raises, so one retry lets the unload release its accounting.
+            logger.warning(
+                f"Metal command-buffer error while unloading '{model_id}': {e}; "
+                f"retrying synchronize once"
+            )
+            await loop.run_in_executor(get_mlx_executor(), sync_clear)
+
     async def _stop_and_unload_engine(
         self, model_id: str, *, local_only: bool = False
     ) -> None:
@@ -3357,10 +3390,7 @@ class EnginePool:
         # Synchronize before clearing to prevent releasing Metal buffers
         # still referenced by in-flight command buffers. See issue #300.
         gc.collect()
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
+        await self._metal_sync_clear_cache(model_id)
 
         # RAM Engram tables share MLX buffers with CPU views, so their packed
         # bytes are included in both admission and Metal unload settlement.
@@ -3440,9 +3470,7 @@ class EnginePool:
             )
             await asyncio.sleep(0.5)
             gc.collect()
-            await loop.run_in_executor(
-                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-            )
+            await self._metal_sync_clear_cache(model_id)
 
         # Release memory tracking AFTER barrier
         self._current_model_memory = max(0, self._current_model_memory - resident_size)
@@ -3476,10 +3504,7 @@ class EnginePool:
             )
             for _ in range(3):
                 gc.collect()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+                await self._metal_sync_clear_cache(model_id)
                 await asyncio.sleep(1.0)
             active_after = mx.get_active_memory()
             if active_after > self._current_model_memory + 5 * 1024**3:
@@ -3653,7 +3678,13 @@ class EnginePool:
             # since DFlash has its own model loading pipeline
             engine = None
             deployment = deployment if effective_type == "batched" else None
-            if deployment is None and model_settings is not None:
+            # Decision models never decode, so speculative decoding settings
+            # saved for the same checkpoint do not apply.
+            if (
+                deployment is None
+                and model_settings is not None
+                and effective_type != "decision"
+            ):
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
                 if dflash_enabled and not dflash_draft:
@@ -3789,11 +3820,23 @@ class EnginePool:
                         model_name=entry.model_path,
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
+                        audio_enabled=bool(
+                            getattr(model_settings, "embedding_audio_enabled", False)
+                        ),
+                        audio_max_seconds=getattr(
+                            model_settings, "embedding_audio_max_seconds", None
+                        ),
                     )
                 elif effective_type == "reranker":
                     engine = RerankerEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
+                    )
+                elif effective_type == "decision":
+                    engine = DecisionEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
                     )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(

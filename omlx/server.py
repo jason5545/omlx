@@ -40,6 +40,8 @@ The server provides:
 
 import argparse
 import asyncio
+import importlib
+import importlib.util
 import inspect
 import json
 import logging
@@ -48,7 +50,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -88,6 +90,7 @@ from .api.anthropic_utils import (
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
+from .api.body_limit import RequestBodySizeLimitMiddleware
 from .api.embedding_models import (
     EmbeddingData,
     EmbeddingRequest,
@@ -124,9 +127,14 @@ from .api.openai_models import (
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
+    DetokenizeRequest,
+    DetokenizeResponse,
     ModelInfo,
     ModelsResponse,
     PromptTokensDetails,
+    TokenizeChatRequest,
+    TokenizeRequest,
+    TokenizeResponse,
     Usage,
 )
 from .api.parser_tool_calls import (
@@ -159,6 +167,7 @@ from .api.responses_utils import (
     normalize_response_output_to_messages,
     split_namespace_tool_name,
 )
+from .api.systemone_models import SystemOneRequest
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallExtraction,
@@ -185,11 +194,12 @@ from .api.utils import (
     cache_reasoning_output,
     uses_native_reasoning_content,
 )
-from .engine import BaseEngine, VLMBatchedEngine
+from .engine import BaseEngine, BatchedEngine, GenerationOutput, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
 from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
+from .engine.decision import DecisionEngine
 from .engine_pool import EnginePool
 from .exceptions import (
     EnginePoolError,
@@ -202,9 +212,12 @@ from .exceptions import (
     ModelUnavailableError,
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
+    RequestAbortedError,
     SchedulerQueueFullError,
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -226,6 +239,7 @@ class EngineType(Enum):
     LLM = "llm"
     EMBEDDING = "embedding"
     RERANKER = "reranker"
+    DECISION = "decision"
 
 
 @dataclass
@@ -667,12 +681,7 @@ async def lifespan(app: FastAPI):
     # Advertise this oMLX instance so another Mac can identify it by hostname
     # and API port without asking the user to type an SSH target. Publication
     # is best-effort: inference remains available if Bonjour is disabled.
-    if (
-        _server_state.global_settings is not None
-        and distributed_inference_enabled()
-        and os.environ.get("OMLX_BONJOUR", "1").strip().lower()
-        not in {"0", "false", "no", "off"}
-    ):
+    if _server_state.global_settings is not None and distributed_inference_enabled():
         bonjour_publisher = BonjourPublisher(
             port=_server_state.global_settings.server.port,
             version=__version__,
@@ -691,13 +700,9 @@ async def lifespan(app: FastAPI):
 
     # Cluster v2: always-on peer discovery (mDNS + IPv6 multicast fallback +
     # manual + Tailscale). Best-effort: discovery failures must never block
-    # serving. OMLX_DISCOVERY=0 disables it for hostile networks.
+    # serving.
     discovery_service = None
-    if (
-        distributed_inference_enabled()
-        and os.environ.get("OMLX_DISCOVERY", "1").strip().lower()
-        not in {"0", "false", "no", "off"}
-    ):
+    if distributed_inference_enabled():
         try:
             from .cluster.discovery import (
                 DiscoveryConfig,
@@ -930,9 +935,14 @@ except ImportError:
     pass
 
 # Include admin routes
-from .admin.auth import _RedirectToLogin, require_admin
+from .admin.auth import _RedirectToLogin, require_admin, set_web_ui_enabled
+from .admin.routes import (
+    configured_api_key,
+    configured_ui_language,
+    is_admin_request,
+    set_admin_getters,
+)
 from .admin.routes import router as admin_router
-from .admin.routes import set_admin_getters
 
 set_admin_getters(
     get_server_state,
@@ -940,6 +950,34 @@ set_admin_getters(
     lambda: _server_state.settings_manager,
     lambda: _server_state.global_settings,
 )
+
+
+def _load_web_ui():
+    """Return the omlx_web package, or None to serve the API only."""
+    if os.environ.get("OMLX_HEADLESS", "0") == "1":
+        logger.info("Headless mode: serving the API without the web UI")
+        return None
+    if importlib.util.find_spec("omlx_web") is None:
+        logger.warning("Web UI package omlx_web is not installed; serving the API only")
+        return None
+    return importlib.import_module("omlx_web")
+
+
+_web_ui = _load_web_ui()
+if _web_ui is None:
+    set_web_ui_enabled(False)
+else:
+    _web_ui.set_host(
+        _web_ui.WebUIHost(
+            version=__version__,
+            require_admin=require_admin,
+            is_admin=is_admin_request,
+            ui_language=configured_ui_language,
+            main_api_key=configured_api_key,
+        )
+    )
+    # Before admin_router so the page routes keep their original order.
+    app.include_router(_web_ui.router)
 app.include_router(admin_router)
 
 _cluster_routes_registered = False
@@ -1034,6 +1072,10 @@ def _status_to_error_type(status_code: int) -> str:
     return "invalid_request_error"
 
 
+# vLLM serves its tokenizer API at the root, outside /v1.
+_ROOT_API_ROUTES = frozenset({"/tokenize", "/detokenize"})
+
+
 def _is_api_route(request: FastAPIRequest) -> bool:
     """Check if request targets an OpenAI-compatible API route.
 
@@ -1046,7 +1088,8 @@ def _is_api_route(request: FastAPIRequest) -> bool:
     matching at that point.
     """
 
-    return request.url.path.startswith("/v1/")
+    path = request.url.path
+    return path.startswith("/v1/") or path in _ROOT_API_ROUTES
 
 
 def _openai_error_body(message, status_code: int, param=None, code=None) -> dict:
@@ -1130,6 +1173,14 @@ async def invalid_request_error_handler(
     else:
         content = {"detail": str(exc)}
     return JSONResponse(status_code=400, content=content)
+
+
+@app.exception_handler(RequestAbortedError)
+async def request_aborted_handler(request: FastAPIRequest, exc: RequestAbortedError):
+    """Map a request aborted by a model unload to HTTP 409."""
+    return await http_exception_handler(
+        request, HTTPException(status_code=409, detail=str(exc))
+    )
 
 
 @app.exception_handler(SchedulerQueueFullError)
@@ -1478,6 +1529,9 @@ class ClientDisconnectTrackingMiddleware:
 # passes through the same one-shot disconnect fan-out.
 app.add_middleware(ClientDisconnectTrackingMiddleware)
 app.add_middleware(DebugRequestLoggingMiddleware)
+# Outermost so oversized bodies are rejected before any buffering below
+# (the debug middleware caches the whole textual body at trace level).
+app.add_middleware(RequestBodySizeLimitMiddleware)
 
 
 # =============================================================================
@@ -1497,15 +1551,17 @@ async def get_engine(
     engine_type: EngineType = EngineType.LLM,
     _lease: bool = False,
     _leased_out: list | None = None,
-) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine]:
+) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine, DecisionEngine]:
     """
     Get engine for the specified model and type.
 
-    This is the unified engine getter that handles LLM, embedding, and reranker models.
+    This is the unified engine getter that handles LLM, embedding, reranker,
+    and decision models.
 
     Args:
         model_id: Model ID to get engine for, or None for default (LLM only)
-        engine_type: Type of engine to retrieve (LLM, EMBEDDING, or RERANKER)
+        engine_type: Type of engine to retrieve (LLM, EMBEDDING, RERANKER, or
+            DECISION)
         _lease: When True, take an atomic in-use lease on the engine that the
             pool actually loaded (eviction-proof until released). The caller
             MUST release exactly one lease per successful leased call.
@@ -1637,6 +1693,13 @@ async def get_engine(
                     detail=f"Model '{model_id}' is not a reranker model. "
                     f"Use a SequenceClassification model for reranking.",
                 )
+        elif engine_type == EngineType.DECISION:
+            if not isinstance(engine, DecisionEngine):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model '{model_id}' is not a decision model. "
+                    f"Use a decision model such as Clef or OpenJev.",
+                )
         elif engine_type == EngineType.LLM:
             # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
             # fell through and crashed on `engine.model_type` with an unhandled
@@ -1686,6 +1749,8 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
         return "Use /v1/embeddings for embedding models."
     if isinstance(engine, RerankerEngine):
         return "Use /v1/rerank for reranker models."
+    if isinstance(engine, DecisionEngine):
+        return "Use /v1/systemone for decision models."
     return "Use the model's dedicated endpoint (see /v1/models)."
 
 
@@ -1734,7 +1799,7 @@ class _LLMEngineLease:
 
 async def _raise_if_llm_lease_abort_requested(lease: _LLMEngineLease) -> None:
     reason = lease.abort_reason()
-    if reason == "manual admin unload":
+    if reason in ("manual admin unload", "manual unload"):
         raise HTTPException(
             status_code=409,
             detail="Request aborted because this model is being unloaded.",
@@ -1869,6 +1934,28 @@ async def acquire_reranker_engine(model: str):
     leased: list = []
     engine = await get_engine(
         model, EngineType.RERANKER, _lease=True, _leased_out=leased
+    )
+    try:
+        yield engine
+    finally:
+        if leased:
+            await get_engine_pool().release_engine(leased[0])
+
+
+async def get_decision_engine(model: str) -> DecisionEngine:
+    """Get the decision engine for ``model`` (see get_engine for errors)."""
+    return await get_engine(model, EngineType.DECISION)
+
+
+@asynccontextmanager
+async def acquire_decision_engine(model: str):
+    """Acquire a decision engine with an atomic, eviction-proof in-use lease.
+
+    See acquire_embedding_engine for the lease/release contract.
+    """
+    leased: list = []
+    engine = await get_engine(
+        model, EngineType.DECISION, _lease=True, _leased_out=leased
     )
     try:
         yield engine
@@ -2329,6 +2416,30 @@ def get_embedding_max_length(
     return get_max_context_window(model_id)
 
 
+def _prepare_chat_prompt_for_request(
+    engine: BaseEngine,
+    messages: list,
+    tools: list | None = None,
+    chat_template_kwargs: dict | None = None,
+    is_partial: bool | None = None,
+) -> tuple[int, tuple[str, list[int]] | None]:
+    # Subclasses (e.g. distributed) have their own prompt handling.
+    if type(engine) is BatchedEngine:
+        prepared = engine.prepare_chat_prompt(
+            messages, tools, chat_template_kwargs, is_partial
+        )
+        return len(prepared[1]), prepared
+    return (
+        engine.count_chat_tokens(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        ),
+        None,
+    )
+
+
 def validate_context_window(
     num_prompt_tokens: int,
     model_id: str | None = None,
@@ -2416,11 +2527,6 @@ def init_server(
             / "response-state"
         )
     _server_state.responses_store = ResponseStore(state_dir=response_state_dir)
-
-    # Refresh i18n with loaded language setting
-    from .admin.routes import _refresh_i18n_globals
-
-    _refresh_i18n_globals()
 
     # Initialize auth with persistent secret key
     if global_settings:
@@ -2805,6 +2911,85 @@ async def _aclose_async_iterator(iterator: object) -> None:
         await close()
 
 
+_PROMPT_PROGRESS_POLL_S = 0.5
+
+
+@dataclass(frozen=True)
+class _PromptProgress:
+    """llama.cpp ``prompt_progress`` payload. Token counts include the cache."""
+
+    total: int
+    cache: int
+    processed: int
+    time_ms: int
+
+
+async def _with_prompt_progress(
+    outputs: AsyncIterator[GenerationOutput],
+    request_id: str,
+) -> AsyncIterator[GenerationOutput | _PromptProgress]:
+    """Interleave ``_PromptProgress`` events before the first engine output.
+
+    Event order matches llama.cpp: 0% (``processed == cache``), strictly
+    increasing updates, then 100% right before the first output.
+    """
+    tracker = get_prefill_tracker()
+    ait = outputs.__aiter__()
+    start = time.monotonic()
+    task: asyncio.Future | None = asyncio.ensure_future(_safe_anext(ait))
+    totals: tuple[int, int] | None = None
+    sent = -1
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_PROMPT_PROGRESS_POLL_S)
+            if done:
+                break
+            entry = tracker.get(request_id)
+            # SpecPrefill phases count draft-scored and sparse tokens, not the prompt.
+            if (
+                not entry
+                or entry.get("phase") != "prefill"
+                or not entry.get("prompt_tokens")
+                or entry["total"] <= 0
+            ):
+                continue
+            if totals is None:
+                totals = (entry["prompt_tokens"], entry["cached_tokens"])
+                # Like llama.cpp, count time from prefill start, not queue entry.
+                start = entry.get("prefill_started_at") or start
+                yield _PromptProgress(totals[0], totals[1], totals[1], 0)
+                sent = totals[1]
+            total, cache = totals
+            # Tracker counts cover only the uncached suffix.
+            processed = cache + (total - cache) * entry["processed"] // entry["total"]
+            if sent < processed < total:
+                # Stamp with the scheduler's update time, not the poll time.
+                time_ms = int((entry["last_time"] - start) * 1000)
+                yield _PromptProgress(total, cache, processed, time_ms)
+                sent = processed
+        first = task.result()
+        task = None
+        if first is _KEEPALIVE_SENTINEL:
+            return
+        if totals is None and first.prompt_tokens > 0:
+            cache = min(first.cached_tokens, first.prompt_tokens)
+            totals = (first.prompt_tokens, cache)
+            yield _PromptProgress(totals[0], totals[1], totals[1], 0)
+            sent = totals[1]
+        if totals is not None and sent < totals[0]:
+            time_ms = int((time.monotonic() - start) * 1000)
+            yield _PromptProgress(totals[0], totals[1], totals[0], time_ms)
+        yield first
+        async for output in ait:
+            yield output
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        await _aclose_async_iterator(outputs)
+
+
 def _request_abort_id(engine: BaseEngine) -> str | None:
     """Mint an opaque id only for engines with targeted abort semantics."""
 
@@ -3060,6 +3245,10 @@ async def _with_json_keepalive(
         except PrefillMemoryExceededError as e:
             logger.warning(f"JSON keepalive prefill rejected: {e}")
             yield json.dumps(_prefill_memory_openai_error_body(e))
+            return
+        except RequestAbortedError as e:
+            logger.warning("JSON keepalive request aborted: %s", e)
+            yield json.dumps(_openai_error_body(str(e), 409))
             return
         except HTTPException as e:
             # Headers are already sent; preserve the API error in the body.
@@ -3722,8 +3911,23 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+    if entry.is_loading:
+        raise HTTPException(status_code=409, detail=f"Model still loading: {model_id}")
 
-    await _server_state.engine_pool._unload_engine(model_id)
+    # _unload_engine alone leaves active streams open; abort them first.
+    unloaded = await _server_state.engine_pool.request_unload(
+        model_id, reason="manual unload"
+    )
+    if not unloaded:
+        logger.info("Queued manual unload for active model: %s", model_id)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "unloading",
+                "model_id": model_id,
+                "message": f"Aborting active requests before unloading {model_id}",
+            },
+        )
     return {"status": "ok", "model_id": model_id}
 
 
@@ -3979,6 +4183,7 @@ async def create_rerank(
             documents=documents_raw,
             top_n=request.top_n,
             max_length=request.max_length,
+            instruction=request.instruction,
         )
 
     elapsed = time.perf_counter() - start_time
@@ -4018,6 +4223,79 @@ async def create_rerank(
         model=request.model,
         usage=RerankUsage(total_tokens=output.total_tokens),
     )
+
+
+@app.post("/v1/systemone")
+async def create_systemone(
+    request: SystemOneRequest,
+    http_request: FastAPIRequest,
+    _: bool = Depends(verify_inference_api_key),
+):
+    """
+    Answer typed questions about a state with a decision model.
+
+    TypeSafe System One compatible endpoint. Every answer carries a
+    probability for each option of a ``noul`` (yes/no), ``choice`` or
+    ``score`` question.
+
+    Example request:
+    ```json
+    {
+        "model": "clef-flash-4bit",
+        "state": "Checkout fails for every customer since the last deploy.",
+        "questions": {
+            "urgent": {"type": "noul", "instructions": "Is this urgent?"}
+        }
+    }
+    ```
+    """
+    oq_manager = getattr(_server_state, "oq_manager", None)
+    if oq_manager and oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+    _reject_lone_surrogates(request)
+
+    # Tokenize and preprocess images before the keepalive response starts, so
+    # request errors keep their real status codes.
+    engine = await get_decision_engine(request.model)
+    try:
+        plan = await engine.encode(request.model_dump(), truncate=request.truncate)
+    except DecisionContextLengthError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except DecisionRequestError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    async def _decide():
+        start_time = time.perf_counter()
+        async with acquire_decision_engine(request.model) as leased_engine:
+            result = await leased_engine.systemone(plan)
+        elapsed = time.perf_counter() - start_time
+        resolved_model = resolve_model_id(request.model) or request.model
+        input_tokens = result["input_tokens"]
+        logger.info(
+            f"SystemOne: model={resolved_model}, {len(request.questions)} "
+            f"questions, {input_tokens} tokens in {elapsed:.3f}s"
+        )
+        get_server_metrics().record_request_complete(
+            prompt_tokens=input_tokens,
+            completion_tokens=0,
+            cached_tokens=0,
+            prefill_duration=elapsed,
+            model_id=resolved_model,
+            request_duration=elapsed,
+        )
+        return json.dumps(
+            {
+                "model": request.model,
+                "answers": result["answers"],
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            },
+            ensure_ascii=False,
+        )
+
+    return await _json_response_or_keepalive(http_request, _decide())
 
 
 # =============================================================================
@@ -4261,6 +4539,179 @@ async def create_completion(
         raise
 
 
+def _merge_chat_template_kwargs(
+    request: ChatCompletionRequest, ms
+) -> tuple[dict, int | None]:
+    """Return the merged chat template kwargs and the thinking budget."""
+    merged_ct_kwargs = merge_chat_template_request_kwargs(
+        ms,
+        merge_reasoning_effort_chat_template_kwargs(
+            request.chat_template_kwargs,
+            request.reasoning_effort,
+        ),
+    )
+
+    # Auto-set enable_thinking in chat template kwargs when a positive thinking
+    # budget is active (from request or model settings).  Some chat
+    # templates (e.g. Gemma 4) explicitly suppress thinking unless this
+    # kwarg is True.  Set it before grammar compilation, which reads the
+    # thinking state to build the reasoning phase.
+    thinking_budget = _resolve_thinking_budget(request, request.model)
+    if (
+        thinking_budget is not None
+        and thinking_budget > 0
+        and "enable_thinking" not in merged_ct_kwargs
+    ):
+        merged_ct_kwargs["enable_thinking"] = True
+    return merged_ct_kwargs, thinking_budget
+
+
+@dataclass
+class _ChatTemplateMessages:
+    messages: list[dict]
+    is_partial: bool
+    native_reasoning: bool
+    merge_system_fallback_roles: bool
+
+
+def _extract_chat_messages(
+    request: ChatCompletionRequest,
+    engine: BaseEngine,
+    resolved_model: str | None,
+    max_tool_result_tokens: int | None,
+) -> _ChatTemplateMessages:
+    """Convert request messages into the dicts the engine chat template takes."""
+    # Extract messages - different engines need different content handling.
+    # Templates that expose message.reasoning_content natively (Qwen 3.6+)
+    # get reasoning as a separate field; others fall back to <think> inlined
+    # in content.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    native_reasoning = uses_native_reasoning_content(
+        resolved_model,
+        config_model_type=(
+            getattr(_entry, "config_model_type", None) if _entry is not None else None
+        ),
+        engine_model_type=getattr(engine, "model_type", None),
+        preserve_thinking_default=(
+            getattr(_entry, "preserve_thinking_default", None)
+            if _entry is not None
+            else None
+        ),
+    )
+    is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_dflash_vlm = not is_vlm and getattr(
+        engine, "supports_multimodal_fallback", False
+    )
+    extractor = getattr(engine, "message_extractor", None)
+    merge_system_fallback_roles = not (is_vlm or is_dflash_vlm)
+    if extractor is not None:
+        extractor_kwargs = {}
+        try:
+            if "consolidate_system_messages" in inspect.signature(extractor).parameters:
+                extractor_kwargs["consolidate_system_messages"] = False
+        except (TypeError, ValueError):
+            pass
+        messages = extractor(
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            **extractor_kwargs,
+        )
+        merge_system_fallback_roles = True
+    elif is_vlm or is_dflash_vlm:
+        # VLM or DFlash with VLM fallback: preserve image_url content parts
+        messages = extract_multimodal_content(
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
+            consolidate_system_messages=False,
+        )
+    else:
+        messages = extract_text_content(
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
+            consolidate_system_messages=False,
+        )
+
+    # Detect and strip partial mode at the API boundary — exactly once,
+    # before any chat template application.  The boolean result is forwarded
+    # as an explicit parameter so the engine never has to re-derive it.
+    is_partial = detect_and_strip_partial(messages)
+    return _ChatTemplateMessages(
+        messages=messages,
+        is_partial=is_partial,
+        native_reasoning=native_reasoning,
+        merge_system_fallback_roles=merge_system_fallback_roles,
+    )
+
+
+def _resolve_template_tools(
+    request: ChatCompletionRequest,
+    engine: BaseEngine,
+    resolved_model: str | None,
+) -> list[dict] | None:
+    """Return the request tools, plus exposed MCP tools, in template form."""
+    # Merge MCP tools with user-provided tools unless the request explicitly
+    # disables tool use.
+    tools_disabled = request.tool_choice == "none"
+    if getattr(engine, "is_diffusion_model", False) and not getattr(
+        engine, "supports_tool_calling", False
+    ):
+        if request.tools and not tools_disabled:
+            raise InvalidRequestError(
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
+                field="tools",
+            )
+        tools_disabled = True
+    effective_tools = None if tools_disabled else request.tools
+    if _server_state.mcp_manager and not tools_disabled and mcp_tools_exposed():
+        # Convert Pydantic ToolDefinition models to dicts for merge_tools
+        user_tools_dicts = (
+            [t.model_dump() for t in request.tools] if request.tools else None
+        )
+        effective_tools = _server_state.mcp_manager.get_merged_tools(user_tools_dicts)
+
+    tools_for_template = (
+        convert_tools_for_template(effective_tools) if effective_tools else None
+    )
+    # Gemma 4 drops required params that lack descriptions — enrich them
+    if tools_for_template and "gemma" in (resolved_model or "").lower():
+        tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
+    return tools_for_template
+
+
+def _is_chat_template_error(e: Exception) -> bool:
+    # Jinja2 TemplateError, AssertionError from strict role validation,
+    # ValueError, etc.
+    err_name = type(e).__name__.lower()
+    err_msg = str(e).lower()
+    return (
+        "template" in err_name
+        or "template" in err_msg
+        or isinstance(e, (AssertionError, ValueError))
+    )
+
+
+def _apply_preserve_thinking_default(
+    resolved_model: str | None, merged_ct_kwargs: dict
+) -> None:
+    # Auto-set preserve_thinking only when the template advertises support
+    # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs
+    # today but strict templates could raise, so gate on the detected flag.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    if (
+        _entry is not None
+        and _entry.preserve_thinking_default is True
+        and merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    ):
+        merged_ct_kwargs["preserve_thinking"] = True
+
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
@@ -4335,92 +4786,15 @@ async def create_chat_completion(
             max_tool_result_tokens = ms.max_tool_result_tokens
             reasoning_parser = ms.reasoning_parser
             settings_guided_grammar = _settings_guided_grammar(ms)
-        merged_ct_kwargs = merge_chat_template_request_kwargs(
-            ms,
-            merge_reasoning_effort_chat_template_kwargs(
-                request.chat_template_kwargs,
-                request.reasoning_effort,
-            ),
-        )
+        merged_ct_kwargs, thinking_budget = _merge_chat_template_kwargs(request, ms)
         _apply_request_chat_template_overrides(merged_ct_kwargs, request_policy)
 
-        # Auto-set enable_thinking in chat template kwargs when a positive thinking
-        # budget is active (from request or model settings).  Some chat
-        # templates (e.g. Gemma 4) explicitly suppress thinking unless this
-        # kwarg is True.  Set it before grammar compilation, which reads the
-        # thinking state to build the reasoning phase.
-        thinking_budget = _resolve_thinking_budget(request, request.model)
-        if (
-            thinking_budget is not None
-            and thinking_budget > 0
-            and "enable_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["enable_thinking"] = True
-
-        # Extract messages - different engines need different content handling.
-        # Templates that expose message.reasoning_content natively (Qwen 3.6+)
-        # get reasoning as a separate field; others fall back to <think> inlined
-        # in content.
-        _entry = get_engine_pool().get_entry(resolved_model)
-        native_reasoning = uses_native_reasoning_content(
-            resolved_model,
-            config_model_type=(
-                getattr(_entry, "config_model_type", None)
-                if _entry is not None
-                else None
-            ),
-            engine_model_type=getattr(engine, "model_type", None),
-            preserve_thinking_default=(
-                getattr(_entry, "preserve_thinking_default", None)
-                if _entry is not None
-                else None
-            ),
+        chat_messages = _extract_chat_messages(
+            request, engine, resolved_model, max_tool_result_tokens
         )
-        is_vlm = isinstance(engine, VLMBatchedEngine)
-        is_dflash_vlm = not is_vlm and getattr(
-            engine, "supports_multimodal_fallback", False
-        )
-        extractor = getattr(engine, "message_extractor", None)
-        merge_system_fallback_roles = not (is_vlm or is_dflash_vlm)
-        if extractor is not None:
-            extractor_kwargs = {}
-            try:
-                if (
-                    "consolidate_system_messages"
-                    in inspect.signature(extractor).parameters
-                ):
-                    extractor_kwargs["consolidate_system_messages"] = False
-            except (TypeError, ValueError):
-                pass
-            messages = extractor(
-                request.messages,
-                max_tool_result_tokens,
-                engine.tokenizer,
-                **extractor_kwargs,
-            )
-            merge_system_fallback_roles = True
-        elif is_vlm or is_dflash_vlm:
-            # VLM or DFlash with VLM fallback: preserve image_url content parts
-            messages = extract_multimodal_content(
-                request.messages,
-                max_tool_result_tokens,
-                engine.tokenizer,
-                native_reasoning_content=native_reasoning,
-                consolidate_system_messages=False,
-            )
-        else:
-            messages = extract_text_content(
-                request.messages,
-                max_tool_result_tokens,
-                engine.tokenizer,
-                native_reasoning_content=native_reasoning,
-                consolidate_system_messages=False,
-            )
-
-        # Detect and strip partial mode at the API boundary — exactly once,
-        # before any chat template application.  The boolean result is forwarded
-        # as an explicit parameter so the engine never has to re-derive it.
-        is_partial = detect_and_strip_partial(messages)
+        messages = chat_messages.messages
+        is_partial = chat_messages.is_partial
+        native_reasoning = chat_messages.native_reasoning
 
         # Compile grammar for structured output (logit-level enforcement).
         # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
@@ -4464,40 +4838,9 @@ async def create_chat_completion(
             if json_instruction:
                 messages = _inject_json_instruction(messages, json_instruction)
 
-        # Merge MCP tools with user-provided tools unless the request explicitly
-        # disables tool use.
-        tools_disabled = request.tool_choice == "none"
-        if getattr(engine, "is_diffusion_model", False) and not getattr(
-            engine, "supports_tool_calling", False
-        ):
-            if request.tools and not tools_disabled:
-                raise InvalidRequestError(
-                    "Tool calling is not supported for this diffusion model "
-                    "(no tool parser matched its chat template).",
-                    field="tools",
-                )
-            tools_disabled = True
-        effective_tools = None if tools_disabled else request.tools
-        if (
-            _server_state.mcp_manager
-            and not tools_disabled
-            and mcp_tools_exposed()
-        ):
-            # Convert Pydantic ToolDefinition models to dicts for merge_tools
-            user_tools_dicts = (
-                [t.model_dump() for t in request.tools] if request.tools else None
-            )
-            effective_tools = _server_state.mcp_manager.get_merged_tools(
-                user_tools_dicts
-            )
-
-        # Validate context window before sending to model
-        tools_for_template = (
-            convert_tools_for_template(effective_tools) if effective_tools else None
-        )
-        # Gemma 4 drops required params that lack descriptions — enrich them
-        if tools_for_template and "gemma" in (resolved_model or "").lower():
-            tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
+        tools_for_template = _resolve_template_tools(request, engine, resolved_model)
+        # Resolve template defaults before preparing the prompt for reuse.
+        _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
         await _ensure_tokenizer_for_system_probe(engine, messages)
         messages = prepare_system_messages_for_template(
             messages,
@@ -4505,26 +4848,20 @@ async def create_chat_completion(
             tools=tools_for_template,
             chat_template_kwargs=merged_ct_kwargs or None,
             is_partial=is_partial,
-            merge_consecutive_roles=merge_system_fallback_roles,
+            merge_consecutive_roles=chat_messages.merge_system_fallback_roles,
             unsupported_mid_system_policy=_unsupported_mid_system_policy(),
         )
+        # Validate context window before sending to model
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
                 is_partial=is_partial,
             )
         except Exception as e:
-            # Catch chat template rendering failures: Jinja2 TemplateError,
-            # AssertionError from strict role validation, ValueError, etc.
-            err_name = type(e).__name__.lower()
-            err_msg = str(e).lower()
-            if (
-                "template" in err_name
-                or "template" in err_msg
-                or isinstance(e, (AssertionError, ValueError))
-            ):
+            if _is_chat_template_error(e):
                 raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
             raise
         validate_context_window(
@@ -4592,17 +4929,8 @@ async def create_chat_completion(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set preserve_thinking only when the template advertises support
-        # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs
-        # today but strict templates could raise, so gate on the detected flag.
-        _entry = get_engine_pool().get_entry(resolved_model)
-        if (
-            _entry is not None
-            and _entry.preserve_thinking_default is True
-            and merged_ct_kwargs.get("enable_thinking") is not False
-            and "preserve_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["preserve_thinking"] = True
+        if prepared_prompt is not None:
+            chat_kwargs["_prepared_prompt"] = prepared_prompt
 
         # Add compiled grammar for logit-level structured output.
         # When a reasoning_parser is configured, the structural tag includes
@@ -4774,17 +5102,24 @@ async def create_chat_completion(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                if failure := _tool_call_failure(extraction):
+                recovered = _nonstream_recovery_text(
+                    extraction,
+                    regular_content,
+                    output,
+                    engine.tokenizer,
+                    tools_for_template,
+                )
+                if recovered is not None:
+                    cleaned_text = recovered
+                elif failure := _tool_call_failure(extraction):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Process response_format if specified
             if response_format and not tool_calls:
-                cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text, _, is_valid, error = parse_json_output(
                     cleaned_text or regular_content, response_format
                 )
-                if parsed_json is not None:
-                    cleaned_text = json.dumps(parsed_json)
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
 
@@ -5381,6 +5716,10 @@ async def stream_completion(
         gen_kwargs["thinking_budget"] = thinking_budget
     if inference_request_id is not None:
         gen_kwargs["_request_id"] = inference_request_id
+    progress_request_id = None
+    if request.return_progress:
+        # The engine keys the prefill tracker by this id.
+        progress_request_id = gen_kwargs.setdefault("_request_id", str(uuid.uuid4()))
     # Widen the repetition-penalty look-back window when the client
     # asks for it (mlx-lm default window is 20 tokens).
     repetition_context_size = getattr(
@@ -5388,23 +5727,37 @@ async def stream_completion(
     )
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
+    outputs = engine.stream_generate(
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+        repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        xtc_probability=xtc_probability,
+        xtc_threshold=xtc_threshold,
+        stop=request.stop,
+        seed=request.seed,
+        **gen_kwargs,
+    )
+    if progress_request_id is not None:
+        outputs = _with_prompt_progress(outputs, progress_request_id)
     try:
-        async for output in engine.stream_generate(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
-            xtc_probability=xtc_probability,
-            xtc_threshold=xtc_threshold,
-            stop=request.stop,
-            seed=request.seed,
-            **gen_kwargs,
-        ):
+        async for output in outputs:
+            if isinstance(output, _PromptProgress):
+                data = {
+                    "id": response_id,
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [{"index": 0, "text": "", "finish_reason": None}],
+                    "prompt_progress": asdict(output),
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+                continue
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -5530,6 +5883,9 @@ def _render_chat_prompt_for_thinking_detection(
     messages: list,
     kwargs: dict,
 ) -> tuple[str, list[int] | None]:
+    prepared = kwargs.get("_prepared_prompt")
+    if prepared is not None:
+        return prepared
     tokenizer = getattr(engine, "tokenizer", None)
     if tokenizer is None:
         return "", None
@@ -5605,6 +5961,60 @@ def _tool_call_failure(extraction: ToolCallExtraction) -> dict | None:
         "Tool call generation failed: code=%s, failed_calls=%d", code, len(failed)
     )
     return _openai_error_body(message, 500, code=code)
+
+
+def _take_recoverable_withheld_text(
+    tool_filter: ToolCallStreamFilter | None,
+    thinking_filter: ToolCallStreamFilter | None,
+    tool_calls: object,
+    parse_errors: tuple,
+    streamed_tool_calls: list | None = None,
+) -> tuple[str, str]:
+    """Drain withheld envelope text and return the (thinking, content) to emit.
+
+    A marker quoted in prose fails parsing as "incomplete" like a truncated
+    call. Recover the text only when no call was produced, every error is
+    "incomplete" and no withheld opener in either channel starts a payload.
+    """
+    is_payload = any(
+        f.recovery_candidate_is_payload() for f in (tool_filter, thinking_filter) if f
+    )
+    thinking = thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if (
+        tool_calls
+        or streamed_tool_calls
+        or any(error != "incomplete" for error in parse_errors)
+        or (parse_errors and is_payload)
+    ):
+        return "", ""
+    return thinking, content
+
+
+def _nonstream_recovery_text(
+    extraction: ToolCallExtraction,
+    raw_text: str,
+    output: GenerationOutput,
+    tokenizer: object,
+    tools: object,
+) -> str | None:
+    """Return the raw answer when the only failure is a marker quoted in prose."""
+    if extraction.tool_calls:
+        return None
+    failed = extraction.parse_errors
+    if not failed or any(error != "incomplete" for error in failed):
+        return None
+    # Judge the text the stream filter would see, before special tokens are
+    # cleaned out of it.
+    _, generated = extract_thinking(
+        output.text or "", truncated=output.finish_reason == "length"
+    )
+    probe = ToolCallStreamFilter(tokenizer, tools=tools)
+    probe.feed(generated)
+    probe.finish()
+    if probe.recovery_candidate_is_payload() or not probe.take_recovery_candidate():
+        return None
+    return raw_text
 
 
 def _registered_tool_names(tools: object) -> set[str]:
@@ -5788,9 +6198,30 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    progress_request_id = None
+    if request.return_progress:
+        # The engine keys the prefill tracker by this id.
+        progress_request_id = kwargs.setdefault("_request_id", str(uuid.uuid4()))
     engine_stream = engine.stream_chat(messages=messages, **kwargs)
+    if progress_request_id is not None:
+        engine_stream = _with_prompt_progress(engine_stream, progress_request_id)
     try:
         async for output in engine_stream:
+            if isinstance(output, _PromptProgress):
+                progress_chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(
+                                role="assistant", content=""
+                            ),
+                        )
+                    ],
+                ).model_dump(exclude_none=True)
+                progress_chunk["prompt_progress"] = asdict(output)
+                yield f"data: {json.dumps(progress_chunk)}\n\n"
+                continue
             if first_token_time is None:
                 produced_at = getattr(output, "first_token_at", None)
                 if produced_at is None:
@@ -6039,6 +6470,7 @@ async def stream_chat_completion(
     # Parse tool calls from accumulated text
     tool_calls = None
     tool_failure = None
+    parse_errors: tuple = ()
     cleaned_text = accumulated_text
     terminal_tool_calls_authoritative = bool(last_output and last_output.tool_calls)
     if last_output and last_output.tool_calls:
@@ -6061,15 +6493,14 @@ async def stream_chat_completion(
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
         cleaned_thinking = extraction.cleaned_thinking
         # Process response_format if specified
         if request.response_format and not tool_calls:
-            cleaned_text, parsed_json, is_valid, error = parse_json_output(
+            cleaned_text, _, is_valid, error = parse_json_output(
                 cleaned_text, request.response_format
             )
-            if parsed_json is not None:
-                cleaned_text = json.dumps(parsed_json)
             if not is_valid:
                 logger.warning(f"JSON validation failed: {error}")
 
@@ -6109,10 +6540,12 @@ async def stream_chat_completion(
     # Surface an unterminated paired envelope only when final parsing could not
     # recover a structured tool call. The candidate begins at the opening marker,
     # so prose already streamed before it is never duplicated.
-    recovered_thinking = (
-        thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
+        tool_filter, thinking_filter, tool_calls, parse_errors, streamed_tool_calls
     )
-    recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if recovered_thinking or recovered_content:
+        # The marker was quoted in prose, so this is not a failed tool call.
+        tool_failure = None
     if not tool_calls and not tool_failure:
         if recovered_thinking:
             chunk = ChatCompletionChunk(
@@ -6442,7 +6875,10 @@ async def stream_anthropic_messages(
     # This is needed for message_start event
     estimated_input_tokens = 0
     try:
-        if hasattr(engine, "tokenizer") and engine.tokenizer is not None:
+        prepared = kwargs.get("_prepared_prompt")
+        if prepared is not None:
+            estimated_input_tokens = len(prepared[1])
+        elif hasattr(engine, "tokenizer") and engine.tokenizer is not None:
             # Build the prompt using chat template
             template_kwargs = {"tokenize": False, "add_generation_prompt": True}
             if kwargs.get("tools"):
@@ -6635,6 +7071,7 @@ async def stream_anthropic_messages(
     # For other models, parse from accumulated text
     tool_calls = None
     tool_failure = None
+    parse_errors: tuple = ()
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -6653,12 +7090,15 @@ async def stream_anthropic_messages(
             finish_reason=last_output.finish_reason if last_output else "stop",
         )
         tool_calls = extraction.tool_calls
+        parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
 
-    recovered_thinking = (
-        thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
+        tool_filter, thinking_filter, tool_calls, parse_errors
     )
-    recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if recovered_thinking or recovered_content:
+        # The marker was quoted in prose, so this is not a failed tool call.
+        tool_failure = None
     if not tool_calls and not tool_failure:
         if recovered_thinking:
             if text_block_started:
@@ -7076,7 +7516,8 @@ async def create_anthropic_message(
 
         # Validate context window before sending to model
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
                 messages,
                 internal_tools,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -7097,6 +7538,9 @@ async def create_anthropic_message(
             request.model,
             request_policy=request_policy,
         )
+
+        if prepared_prompt is not None:
+            chat_kwargs["_prepared_prompt"] = prepared_prompt
 
         # Add stop sequences
         if request.stop_sequences:
@@ -7195,7 +7639,16 @@ async def create_anthropic_message(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                if failure := _tool_call_failure(extraction):
+                recovered = _nonstream_recovery_text(
+                    extraction,
+                    regular_content,
+                    output,
+                    engine.tokenizer,
+                    internal_tools,
+                )
+                if recovered is not None:
+                    cleaned_text = recovered
+                elif failure := _tool_call_failure(extraction):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -7306,6 +7759,193 @@ async def count_anthropic_tokens(
 
         return TokenCountResponse(input_tokens=input_tokens)
 
+    finally:
+        await lease.release()
+
+
+# =============================================================================
+# Tokenizer API (/tokenize, /detokenize) - vLLM-compatible extension
+# =============================================================================
+
+# Content parts that need media or file preprocessing before templating.
+_TOKENIZE_UNSUPPORTED_PART_TYPES = frozenset(
+    {
+        "image_url",
+        "input_image",
+        "image",
+        "video_url",
+        "input_video",
+        "video",
+        "input_audio",
+        "audio",
+        "file",
+        "input_file",
+    }
+)
+
+
+def _reject_tokenize_media_parts(messages: list) -> None:
+    for i, msg in enumerate(messages):
+        if not isinstance(msg.content, list):
+            continue
+        for part in msg.content:
+            part_type = (
+                part.get("type")
+                if isinstance(part, dict)
+                else getattr(part, "type", None)
+            )
+            if part_type in _TOKENIZE_UNSUPPORTED_PART_TYPES:
+                raise InvalidRequestError(
+                    f"Content part type '{part_type}' is not supported by "
+                    "/tokenize; only text content can be tokenized.",
+                    field=f"messages[{i}].content",
+                )
+
+
+def _token_strings(tokenizer, token_ids: list[int]) -> list[str]:
+    convert = getattr(tokenizer, "convert_ids_to_tokens", None)
+    if callable(convert):
+        return [str(token) for token in convert(token_ids)]
+    return [tokenizer.decode([token_id]) for token_id in token_ids]
+
+
+async def _tokenize_chat_messages(
+    request: TokenizeChatRequest,
+    engine: BaseEngine,
+    resolved_model: str | None,
+) -> list[int]:
+    chat_request = ChatCompletionRequest(
+        model=request.model or resolved_model,
+        messages=request.messages,
+        tools=request.tools,
+        chat_template_kwargs=request.chat_template_kwargs,
+    )
+    ms = get_model_settings_for_request(chat_request.model)
+    max_tool_result_tokens = ms.max_tool_result_tokens if ms else None
+    merged_ct_kwargs, _ = _merge_chat_template_kwargs(chat_request, ms)
+    chat_messages = _extract_chat_messages(
+        chat_request, engine, resolved_model, max_tool_result_tokens
+    )
+    is_partial = chat_messages.is_partial or request.continue_final_message
+    tools_for_template = _resolve_template_tools(chat_request, engine, resolved_model)
+    _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
+    await _ensure_tokenizer_for_system_probe(engine, chat_messages.messages)
+    messages = prepare_system_messages_for_template(
+        chat_messages.messages,
+        engine.tokenizer,
+        tools=tools_for_template,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        is_partial=is_partial,
+        merge_consecutive_roles=chat_messages.merge_system_fallback_roles,
+        unsupported_mid_system_policy=_unsupported_mid_system_policy(),
+    )
+    add_generation_prompt = (
+        None if is_partial or request.add_generation_prompt else False
+    )
+    try:
+        return await engine.tokenize_chat(
+            messages,
+            tools_for_template,
+            chat_template_kwargs=merged_ct_kwargs or None,
+            is_partial=is_partial,
+            add_generation_prompt=add_generation_prompt,
+            add_special_tokens=request.add_special_tokens,
+        )
+    except NotImplementedError as e:
+        raise InvalidRequestError(
+            "Tokenization is not supported for this model.", field="model"
+        ) from e
+    except Exception as e:
+        if _is_chat_template_error(e):
+            raise HTTPException(
+                status_code=400, detail=f"Chat template error: {e}"
+            ) from e
+        raise
+
+
+@app.post("/tokenize", response_model=TokenizeResponse)
+@app.post("/v1/tokenize", response_model=TokenizeResponse)
+async def tokenize(
+    request: TokenizeRequest,
+    _: bool = Depends(verify_inference_api_key),
+) -> TokenizeResponse:
+    """Tokenize a prompt or chat messages (vLLM-compatible).
+
+    A ``prompt`` is encoded like /v1/completions. ``messages`` go through the
+    /v1/chat/completions preparation and the engine's own prompt rendering, so
+    the IDs are the ones generation would see. The context window is not
+    enforced; ``max_model_len`` reports it instead.
+    """
+    _reject_lone_surrogates(request)
+    if isinstance(request, TokenizeChatRequest):
+        if request.chat_template is not None:
+            raise InvalidRequestError(
+                "Per-request chat_template is not supported; the model's chat "
+                "template is always used.",
+                field="chat_template",
+            )
+        _reject_tokenize_media_parts(request.messages)
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
+    lease = _LLMEngineLease()
+    try:
+        engine = await get_engine_for_model(request.model, lease=lease)
+        await _raise_if_llm_lease_abort_requested(lease)
+        resolved_model = _serving_model_id(lease, request.model)
+        tokenizer = engine.tokenizer
+        if isinstance(request, TokenizeChatRequest):
+            token_ids = await _tokenize_chat_messages(request, engine, resolved_model)
+        else:
+            token_ids = list(
+                tokenizer.encode(
+                    request.prompt, add_special_tokens=request.add_special_tokens
+                )
+            )
+        return TokenizeResponse(
+            count=len(token_ids),
+            max_model_len=get_max_context_window(request.model or resolved_model),
+            tokens=token_ids,
+            token_strs=(
+                _token_strings(tokenizer, token_ids)
+                if request.return_token_strs
+                else None
+            ),
+        )
+    finally:
+        await lease.release()
+
+
+@app.post("/detokenize", response_model=DetokenizeResponse)
+@app.post("/v1/detokenize", response_model=DetokenizeResponse)
+async def detokenize(
+    request: DetokenizeRequest,
+    _: bool = Depends(verify_inference_api_key),
+) -> DetokenizeResponse:
+    """Decode token IDs to text, keeping special tokens (vLLM-compatible)."""
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
+    lease = _LLMEngineLease()
+    try:
+        engine = await get_engine_for_model(request.model, lease=lease)
+        await _raise_if_llm_lease_abort_requested(lease)
+        tokenizer = engine.tokenizer
+        vocab_size = len(tokenizer)
+        for i, token_id in enumerate(request.tokens):
+            if token_id >= vocab_size:
+                raise InvalidRequestError(
+                    f"Token id {token_id} is out of vocabulary "
+                    f"(size {vocab_size}).",
+                    field=f"tokens[{i}]",
+                )
+        return DetokenizeResponse(prompt=tokenizer.decode(request.tokens))
     finally:
         await lease.release()
 
@@ -7535,6 +8175,15 @@ async def create_response(
         tools_for_template = (
             convert_tools_for_template(effective_tools) if effective_tools else None
         )
+        # Resolve template defaults before preparing the prompt for reuse.
+        native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+        if (
+            native_reasoning
+            and merged_ct_kwargs.get("enable_thinking") is not False
+            and "preserve_thinking" not in merged_ct_kwargs
+        ):
+            merged_ct_kwargs["preserve_thinking"] = True
+
         # Gemma 4 drops required params that lack descriptions — enrich them
         if tools_for_template and "gemma" in (resolved_model or "").lower():
             tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
@@ -7551,7 +8200,8 @@ async def create_response(
 
         # Validate context window
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -7626,16 +8276,8 @@ async def create_response(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set preserve_thinking only when the template advertises support
-        # for it (Qwen 3.6+). Gated on detection so other templates don't
-        # receive an unknown kwarg.
-        native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
-        if (
-            native_reasoning
-            and merged_ct_kwargs.get("enable_thinking") is not False
-            and "preserve_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["preserve_thinking"] = True
+        if prepared_prompt is not None:
+            chat_kwargs["_prepared_prompt"] = prepared_prompt
 
         # Add compiled grammar for logit-level structured output.
         if compiled_grammar is not None:
@@ -7771,7 +8413,16 @@ async def create_response(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                if failure := _tool_call_failure(extraction):
+                recovered = _nonstream_recovery_text(
+                    extraction,
+                    regular_content,
+                    output,
+                    engine.tokenizer,
+                    tools_for_template,
+                )
+                if recovered is not None:
+                    cleaned_text = recovered
+                elif failure := _tool_call_failure(extraction):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -7789,11 +8440,9 @@ async def create_response(
 
             # Process response_format if specified
             if response_format and not tool_calls:
-                cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text, _, is_valid, error = parse_json_output(
                     cleaned_text or regular_content, response_format
                 )
-                if parsed_json is not None:
-                    cleaned_text = json.dumps(parsed_json)
                 if not is_valid:
                     logger.warning(f"JSON validation failed: {error}")
 
@@ -7901,6 +8550,7 @@ async def stream_responses_api(
     last_output = None
     accumulated_text = ""
     accumulated_reasoning = ""
+    message_deltas = []
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
@@ -8188,6 +8838,7 @@ async def stream_responses_api(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
+                        message_deltas.append(content_delta)
                         seq = stream_state.next_sequence()
                         yield format_sse_event(
                             "response.output_text.delta",
@@ -8257,6 +8908,7 @@ async def stream_responses_api(
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
             if content_delta:
+                message_deltas.append(content_delta)
                 seq = stream_state.next_sequence()
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -8277,6 +8929,7 @@ async def stream_responses_api(
                         yield ev
                 for ev in _open_message():
                     yield ev
+                message_deltas.append(remaining)
                 seq = stream_state.next_sequence()
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -8293,6 +8946,7 @@ async def stream_responses_api(
     # Parse tool calls from accumulated text
     tool_calls = None
     tool_failure = None
+    parse_errors: tuple = ()
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -8311,6 +8965,7 @@ async def stream_responses_api(
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
         if not stream_content:
             cleaned_thinking = (extraction.cleaned_thinking or "").strip()
@@ -8322,6 +8977,7 @@ async def stream_responses_api(
         if not stream_content and cleaned_text:
             for ev in _open_message():
                 yield ev
+            message_deltas.append(cleaned_text)
             seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_text.delta",
@@ -8342,10 +8998,16 @@ async def stream_responses_api(
         )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
-    recovered_thinking = (
-        thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
+        tool_filter, thinking_filter, tool_calls, parse_errors
     )
-    recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if recovered_thinking or recovered_content:
+        # The marker was quoted in prose, so this is not a failed tool call.
+        tool_failure = None
+    if recovered_content:
+        # The parser strips the prose before the marker, so rebuild the final
+        # text from the raw answer to match the streamed deltas.
+        cleaned_text = clean_special_tokens(regular_content)
     if not tool_calls and not tool_failure:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
@@ -8355,6 +9017,7 @@ async def stream_responses_api(
                     yield ev
             for ev in _open_message():
                 yield ev
+            message_deltas.append(recovered_content)
             seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_text.delta",
@@ -8380,13 +9043,16 @@ async def stream_responses_api(
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
-    final_text = cleaned_text.strip() if cleaned_text else ""
+    # Final message content must preserve the bytes already emitted to clients.
+    final_text = "".join(message_deltas)
 
     # Process response_format if specified
     if response_format and not tool_calls:
-        _, parsed_json, is_valid, error = parse_json_output(final_text, response_format)
-        if parsed_json is not None:
-            final_text = json.dumps(parsed_json)
+        json_text, _, is_valid, error = parse_json_output(final_text, response_format)
+        # Unconstrained output can wrap the JSON in prose or a code fence.
+        # Strip those so clients can parse the final text as JSON.
+        if json_text != final_text.strip():
+            final_text = json_text
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
 
