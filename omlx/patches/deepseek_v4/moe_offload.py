@@ -79,9 +79,10 @@ _PROJS = ("gate_proj", "up_proj", "down_proj")
 # (M5 Max), about one expert read (1.1 ms, then 0.93 ms per more), hence 2.
 # An earlier version (up to 8 per layer, each a task reading its slabs in
 # turn, on the demand pool) made decode 12-20% slower: the next layer's own
-# misses queued behind reads that ran past its routes. Off unless
-# OMLX_MOE_OFFLOAD_PREFETCH=1; OMLX_MOE_OFFLOAD_PREFETCH_MAX sets the count.
-_PREFETCH = os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH", "0") == "1"
+# misses queued behind reads that ran past its routes. On by default
+# (OMLX_MOE_OFFLOAD_PREFETCH=0 turns it off); OMLX_MOE_OFFLOAD_PREFETCH_MAX
+# sets the count.
+_PREFETCH = os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH", "1") != "0"
 _AHEAD_MAX = max(1, _env_int("OMLX_MOE_OFFLOAD_PREFETCH_MAX", 2, 2))
 _AHEAD_WORKERS = 9  # one expert's slabs at once
 _AHEAD_BUFFERS = 6  # host buffers read into, reused once their reads are done

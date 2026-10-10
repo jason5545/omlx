@@ -3502,7 +3502,7 @@ def test_offloaded_moe_decode_starts_router_then_shared_expert(
     from omlx.patches.deepseek_v4 import moe_offload
 
     language = _language()
-    monkeypatch.setattr(moe_offload, "_PREFETCH", True)  # off by default
+    monkeypatch.setattr(moe_offload, "_PREFETCH", True)  # whatever the environment says
     offloaded, reference = _offloaded_moe_layers(tmp_path)
     for m in offloaded:
         m.switch_mlp._overlap = overlap
