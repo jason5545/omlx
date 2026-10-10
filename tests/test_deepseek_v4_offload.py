@@ -556,6 +556,123 @@ def test_decode_read_failure_gives_the_claimed_slots_back(
     assert bool(mx.array_equal(ref, out))
 
 
+def test_read_ahead_buffers_wait_for_dropped_reads():
+    """A dropped read ahead may still be writing its buffer: the buffer is
+    handed out again only once that read is done, no more than ``limit``
+    exist, and an idle one of another size makes room."""
+    from concurrent.futures import Future
+
+    ring = dsv4._AheadBuffers(2)
+    a, b = ring.take(100), ring.take(100)
+    assert a is not b and ring.take(100) is None
+    running = Future()
+    assert running.set_running_or_notify_cancel()
+    a.group = [(None, 0, None, running)]
+    dsv4._cancel_reads({1: a, 2: b})
+    assert not running.cancelled()  # a running read cannot be stopped
+    assert ring.take(100) is b
+    assert ring.take(100) is None  # a is released but still being read into
+    running.set_result(None)
+    assert ring.take(100) is a
+    a.released = True
+    c = ring.take(50)
+    assert c is not a and c.buf.nbytes == 50 and ring.take(100) is None
+
+
+def test_dropped_read_ahead_never_holds_up_the_call(tmp_path, reference, monkeypatch):
+    """The next call drops the reads ahead it does not miss on without
+    waiting for them, and takes the one it misses on from its buffer instead
+    of reading it again: same output as the module, same cache state as
+    without reads ahead. The dropped reads hold every read-ahead worker and
+    more, which would stall the call's own reads on a shared pool."""
+    import threading
+    import time
+
+    x = _x(1, 1, D)
+    idx = mx.array([[[0, 1, 2, 3, 4, 5]]])
+    ref = reference(x, idx)
+    mx.eval(ref)
+    monkeypatch.setattr(dsv4, "_AHEAD", dsv4._AheadBuffers(dsv4._AHEAD_BUFFERS))
+    read_into = dsv4._pread_into
+    release = threading.Event()
+    demand = []
+
+    def plain(*_):
+        wrapped = _wrapped(tmp_path, reference, 0.5)
+        out = wrapped(x, idx)
+        mx.eval(out)
+        return wrapped, out
+
+    base, _ = plain()
+    wrapped = _wrapped(tmp_path, reference, 0.5)
+    c = wrapped.cache
+    held = {plan for e in (30, 31) for _, _, plan in c._plans(e)}
+
+    def ahead(store_view, plan, view):
+        if plan in held:
+            release.wait(10)  # until the call is over
+        read_into(store_view, plan, view)
+        return view
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dsv4, "_pread_ahead", ahead)
+        patch.setattr(
+            dsv4, "_pread_into", lambda sv, plan, view: (demand.append(plan), read_into(sv, plan, view))[1]
+        )
+        pool = dsv4._ahead_pool()
+        used, dropped, queued = (dsv4._AHEAD.take(c.expert_bytes) for _ in range(3))
+        dsv4._start_ahead(pool, c, 5, used)  # routed, not resident
+        dsv4._start_ahead(pool, c, 30, dropped)  # not routed: held until released
+        dsv4._start_ahead(pool, c, 31, queued)
+        wrapped._prefetch.incoming = {5: used, 30: dropped, 31: queued}
+        t0 = time.perf_counter()
+        out = wrapped(x, idx)
+        mx.eval(out)
+        took = time.perf_counter() - t0
+        assert not dropped.idle()  # still being read into, so not handed out
+        release.set()
+        wait_for = [f for a in (dropped, queued) for *_, f in a.group]
+        from concurrent.futures import wait as wait_all
+
+        wait_all(wait_for)
+    dsv4._shutdown_ahead_pool()
+    assert took < 5
+    assert bool(mx.array_equal(ref, out))
+    assert _cache_state(c) == _cache_state(base.cache)
+    assert {plan for _, _, plan in c._plans(5)}.isdisjoint(demand)
+    assert used.idle() and dropped.idle() and queued.idle()
+
+
+def test_read_ahead_takes_the_most_weighted_non_resident_experts(
+    tmp_path, reference, monkeypatch
+):
+    """The next layer's predicted experts are read ahead by their routing
+    weight summed over the call's rows, at most _AHEAD_MAX, never one the
+    next layer already holds."""
+    monkeypatch.setattr(dsv4, "_AHEAD", dsv4._AheadBuffers(dsv4._AHEAD_BUFFERS))
+    model = _Model([_copy(reference), _copy(reference)])
+    assert dsv4.apply_deepseek_v4_moe_expert_offload(
+        model, _two_layer_checkpoint(tmp_path, reference), 0.5
+    ) == 2
+    cur, nxt = (layer.ffn.switch_mlp for layer in model.model.layers)
+    cur._prefetch.next = nxt
+    mx.eval(nxt(_x(1, 1, D), mx.array([[[9, 10, 11, 12, 13, 14]]])))  # resident
+    started = []
+    start = dsv4._start_ahead
+    monkeypatch.setattr(
+        dsv4, "_start_ahead", lambda pool, c, e, a: (started.append(e), start(pool, c, e, a))
+    )
+    # Expert 20 (0.3 + 0.3 over two rows) and 22 (0.4) outweigh 21 and 1,
+    # which come first; 9 weighs most but is resident.
+    indices = mx.array([[[9, 21, 1, 20], [9, 22, 2, 20]]])
+    weights = mx.array([[[0.9, 0.35, 0.1, 0.3], [0.9, 0.4, 0.05, 0.3]]])
+    monkeypatch.setattr(dsv4, "_AHEAD_MAX", 2)
+    cur._read_next((indices, weights))
+    assert started == [20, 22]
+    assert list(nxt._prefetch.incoming) == [20, 22]
+    _settle_offload()
+
+
 def test_route_trace_records_calls_and_changes_nothing(
     tmp_path, reference, monkeypatch
 ):
@@ -690,6 +807,7 @@ def _settle_offload():
 
     mx.synchronize()
     gc.collect()
+    dsv4._shutdown_ahead_pool()
     _shutdown_io_pool()
 
 

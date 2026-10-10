@@ -38,7 +38,8 @@ from __future__ import annotations
 import copy
 import logging
 import os
-from concurrent.futures import Future, wait
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 import mlx.core as mx
@@ -71,14 +72,19 @@ logger = logging.getLogger(__name__)
 _PROJS = ("gate_proj", "up_proj", "down_proj")
 
 # glm5_next decode can read the next layer's predicted misses ahead (see
-# OffloadedSwitchGLU.stage_next_routes); at most _PREFETCH_MAX experts per
-# layer. Off unless OMLX_MOE_OFFLOAD_PREFETCH=1: on GLM-5.3 oQ3.5e at 54%
-# residency (M5 Max) it made decode 12-20% slower per MTP cycle. Each read
-# ahead holds an IO worker for its expert's slabs in turn, and the next
-# layer's own misses queue behind them on the same pool, while about half
-# the reads go unused.
+# OffloadedSwitchGLU.stage_next_routes) while the GPU computes and the SSD
+# would otherwise wait: the _AHEAD_MAX experts with the most predicted routing
+# weight, on a pool of their own, the unused ones dropped when the next
+# layer's routes arrive. That gap is 0.85-1.9 ms per layer on GLM-5.3 oQ3.5e
+# (M5 Max), about one expert read (1.1 ms, then 0.93 ms per more), hence 2.
+# An earlier version (up to 8 per layer, each a task reading its slabs in
+# turn, on the demand pool) made decode 12-20% slower: the next layer's own
+# misses queued behind reads that ran past its routes. Off unless
+# OMLX_MOE_OFFLOAD_PREFETCH=1; OMLX_MOE_OFFLOAD_PREFETCH_MAX sets the count.
 _PREFETCH = os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH", "0") == "1"
-_PREFETCH_MAX = 8
+_AHEAD_MAX = max(1, _env_int("OMLX_MOE_OFFLOAD_PREFETCH_MAX", 2, 2))
+_AHEAD_WORKERS = 9  # one expert's slabs at once
+_AHEAD_BUFFERS = 6  # host buffers read into, reused once their reads are done
 # Decode misses are read straight into their slots (_SlotCache._ensure_decode).
 # OMLX_MOE_OFFLOAD_READ_INTO_SLOT=0 keeps the read-then-install path.
 _INTO_SLOT = os.environ.get("OMLX_MOE_OFFLOAD_READ_INTO_SLOT", "1") != "0"
@@ -206,9 +212,9 @@ class _SlotCache(ExpertCache):
         oQ3.5e expert shapes, M5 Max: 0.3-0.38 ms less per miss, from the SSD
         and from page cache alike). Once a read is still running
         ``_KEEPALIVE_GRACE_S`` after they start, the rest of the wait keeps
-        the GPU clocked. A read started ahead (``pending``) holds bytes,
-        copied into the slot once done. A failed read waits out the others
-        and gives back the slots whose expert did not arrive. Falls back to
+        the GPU clocked. A read started ahead (``pending``) lands in a host
+        buffer, copied into the slot once done. A failed read waits out the
+        others and gives back the slots whose expert did not arrive. Falls back to
         :meth:`_ensure_ids` (with the keepalive) when reads are serial or a
         slab's checkpoint bytes are not its slot row's layout.
         """
@@ -269,10 +275,10 @@ class _SlotCache(ExpertCache):
                     keepalive.wait(futures)
                 else:
                     wait(futures)
-                for dst, future, copy_bytes in group:
+                for dst, future, ahead in group:
                     raw = future.result()
-                    if copy_bytes:
-                        dst[:] = raw
+                    if ahead:
+                        _copy_into(dst, raw)
                 self.map[e] = slot
                 self.misses += 1
                 self.fetched_bytes += self.expert_bytes
@@ -322,8 +328,9 @@ class _Prefetch:
     """Read-ahead state of one wrapper, kept out of the module tree.
 
     ``gate``/``next`` are the next offloaded MoE layer's router and wrapper;
-    ``staged`` is that router's prediction for the call in flight;
-    ``incoming`` holds the reads the previous layer started for this one.
+    ``staged`` is that router's ``(indices, scores)`` for the call in flight;
+    ``incoming`` maps each expert the previous layer started reading for this
+    one to its :class:`_Ahead`.
     """
 
     __slots__ = ("gate", "next", "staged", "incoming")
@@ -332,26 +339,105 @@ class _Prefetch:
         self.gate = self.next = self.staged = self.incoming = None
 
 
-def _fill_reads(store_view, items) -> None:
-    """One IO task for an expert's slabs, in plan order. ``store_view`` is
-    only held: it keeps the shard descriptors open while the task runs
-    (a dropped read may outlive the call that started it). A cancelled
-    slab is skipped."""
-    for plan, future in items:
-        if not future.set_running_or_notify_cancel():
-            continue
-        try:
-            future.set_result(CheckpointExpertStore.read(plan))
-        except BaseException as exc:
-            future.set_exception(exc)
+_AHEAD_LOCK = threading.Lock()
+_AHEAD_POOL: ThreadPoolExecutor | None = None
 
 
-def _read_expert(pool, cache: ExpertCache, e: int) -> list:
-    """Start reading expert ``e`` as one task; the group has the layout of
-    ``ExpertCache._submit`` (one future per slab)."""
-    group = [(name, field, plan, Future()) for name, field, plan in cache._plans(e)]
-    pool.submit(_fill_reads, cache.disk, [(plan, f) for _, _, plan, f in group])
-    return group
+def _ahead_pool() -> ThreadPoolExecutor | None:
+    """The read-ahead pool: apart from the demand pool, so a layer's own
+    misses never queue behind reads ahead. ``None`` when reads are serial."""
+    global _AHEAD_POOL
+    if _io_pool() is None:
+        return None
+    with _AHEAD_LOCK:
+        if _AHEAD_POOL is None:
+            _AHEAD_POOL = ThreadPoolExecutor(
+                max_workers=_AHEAD_WORKERS, thread_name_prefix="omlx-moe-ahead"
+            )
+        return _AHEAD_POOL
+
+
+def _shutdown_ahead_pool() -> None:
+    """Drop the read-ahead pool once its reads finish (tests)."""
+    global _AHEAD_POOL
+    with _AHEAD_LOCK:
+        pool, _AHEAD_POOL = _AHEAD_POOL, None
+    if pool is not None:
+        pool.shutdown(wait=True)
+
+
+class _Ahead:
+    """One expert read ahead into a host buffer. ``group`` has the layout of
+    ``ExpertCache._submit`` (one future per slab, in plan order), each
+    future's result the buffer's view of its slab."""
+
+    __slots__ = ("buf", "group", "released")
+
+    def __init__(self, nbytes: int):
+        # Written once, so the reads into it take no page faults.
+        self.buf = np.zeros(nbytes, dtype=np.uint8)
+        self.group = []
+        self.released = False
+
+    def idle(self) -> bool:
+        """Released, and nothing is still reading into it."""
+        return self.released and all(f.done() for *_, f in self.group)
+
+
+class _AheadBuffers:
+    """At most ``limit`` read-ahead buffers, shared by the layers. A buffer
+    is handed out again only once it was released and every read into it
+    (a dropped read may still be running) has finished."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self._lock = threading.Lock()
+        self._all: list[_Ahead] = []
+
+    def take(self, nbytes: int) -> _Ahead | None:
+        """A buffer of ``nbytes``, or ``None`` when all are busy."""
+        with self._lock:
+            idle = [i for i, a in enumerate(self._all) if a.idle()]
+            for i in idle:
+                a = self._all[i]
+                if a.buf.nbytes == nbytes:
+                    a.group, a.released = [], False
+                    return a
+            if len(self._all) >= self.limit and not idle:
+                return None
+            a = _Ahead(nbytes)
+            if len(self._all) < self.limit:
+                self._all.append(a)
+            else:  # an idle buffer of another layer's size makes room
+                self._all[idle[0]] = a
+            return a
+
+
+_AHEAD = _AheadBuffers(_AHEAD_BUFFERS)
+
+
+def _pread_ahead(store_view, plan, view):
+    """:func:`_pread_into` for a read ahead; the result is the view it filled."""
+    _pread_into(store_view, plan, view)
+    return view
+
+
+def _start_ahead(pool, cache: ExpertCache, e: int, ahead: _Ahead) -> None:
+    """Start reading expert ``e`` into ``ahead``'s buffer, a task per slab."""
+    buf = memoryview(ahead.buf)
+    pos = 0
+    for name, fi, plan in cache._plans(e):
+        view = buf[pos : pos + plan.nbytes]
+        pos += plan.nbytes
+        # Kept as each starts, so the buffer waits for every read into it.
+        ahead.group.append(
+            (name, fi, plan, pool.submit(_pread_ahead, cache.disk, plan, view))
+        )
+
+
+def _copy_into(dst, src) -> None:
+    """Copy a slab read ahead into its slot row (numpy releases the GIL)."""
+    np.copyto(np.frombuffer(dst, dtype=np.uint8), np.frombuffer(src, dtype=np.uint8))
 
 
 def _flat_ids(a: mx.array) -> list:
@@ -388,11 +474,13 @@ def _pread_into(store_view, plan, view) -> None:
 
 
 def _cancel_reads(reads) -> None:
-    """Drop read-ahead groups without waiting (a running slab finishes in
-    the background and its bytes are discarded)."""
-    for group in (reads or {}).values():
-        for _, _, _, future in group:
+    """Drop reads ahead without waiting: queued slabs are cancelled, a
+    running one finishes in the background, and its buffer is not handed
+    out again before it does."""
+    for ahead in (reads or {}).values():
+        for *_, future in ahead.group:
             future.cancel()
+        ahead.released = True
 
 
 class OffloadedSwitchGLU(nn.Module):
@@ -418,47 +506,55 @@ class OffloadedSwitchGLU(nn.Module):
 
         The residual stream changes little from one layer to the next, so
         the next layer's router applied to this layer's FFN input names
-        about half of the next layer's misses (54-57% on GLM-5.3 oQ2e at
-        85% residency, one wasted read per hit). After this layer's own
-        misses are installed, the decode branch starts reading the predicted
-        non-resident ones, which the next layer then finds in flight or
-        done. Reads only: nothing is installed or evicted on a prediction,
-        so the cache and every output stay as without it. Returns ``[]``
-        when nothing is predicted.
+        about half of the next layer's misses (53-56% on GLM-5.3 oQ3.5e at
+        54% residency, with about one unused read per used one). After this
+        layer's own misses are read, the decode branch starts reading the
+        predicted non-resident ones with the most routing weight, which the
+        next layer then finds done or in flight. Reads only: nothing is
+        installed or evicted on a prediction, so the cache and every output
+        stay as without it. Returns ``[]`` when nothing is predicted.
         """
         pf = self._prefetch
         pf.staged = None
-        if not _PREFETCH or pf.gate is None or _io_pool() is None:
+        if not _PREFETCH or pf.gate is None or _ahead_pool() is None:
             return []
-        pf.staged = pf.gate(x)[0]
-        return [pf.staged]
+        pf.staged = tuple(pf.gate(x))
+        return list(pf.staged)
 
     def _claim_reads(self, incoming, ids) -> dict | None:
-        """The read-ahead groups this call misses on; the rest are dropped."""
+        """The reads ahead this call misses on; the rest are dropped."""
         if not incoming:
             return None
         slot_of = self.cache.slot_of
         need = {e for e in ids if e not in slot_of}
-        pending = {e: g for e, g in incoming.items() if e in need}
-        _cancel_reads({e: g for e, g in incoming.items() if e not in pending})
-        return pending or None
+        claimed = {e: a for e, a in incoming.items() if e in need}
+        _cancel_reads({e: a for e, a in incoming.items() if e not in claimed})
+        return claimed or None
 
-    def _read_next(self, staged: mx.array) -> None:
-        """Start reading the next layer's predicted non-resident experts."""
+    def _read_next(self, staged) -> None:
+        """Start reading the next layer's predicted non-resident experts, the
+        ``_AHEAD_MAX`` with the most predicted routing weight over the rows."""
         nxt = self._prefetch.next
         cache = nxt.cache
-        pool = _io_pool()
-        if cache.warm or pool is None:
+        _cancel_reads(nxt._prefetch.incoming)
+        nxt._prefetch.incoming = None
+        pool = _ahead_pool()
+        # Only the read-into-slot path takes a buffer's bytes.
+        if cache.warm or pool is None or cache.rows is None or not _INTO_SLOT:
             return
-        cand = []
-        for e in dict.fromkeys(_flat_ids(staged)):
+        indices, weights = staged
+        weight = {}
+        for e, w in zip(_flat_ids(indices), _flat_ids(weights)):
             if e not in cache.slot_of:
-                cand.append(e)
-                if len(cand) >= _PREFETCH_MAX:
-                    break
-        if cand:
-            _cancel_reads(nxt._prefetch.incoming)
-            nxt._prefetch.incoming = {e: _read_expert(pool, cache, e) for e in cand}
+                weight[e] = weight.get(e, 0.0) + w
+        incoming = {}
+        for e in sorted(weight, key=weight.get, reverse=True)[:_AHEAD_MAX]:
+            ahead = _AHEAD.take(cache.expert_bytes)
+            if ahead is None:
+                break
+            _start_ahead(pool, cache, e, ahead)
+            incoming[e] = ahead
+        nxt._prefetch.incoming = incoming or None
 
     def overlaps_decode(self, n_routes: int) -> bool:
         """Whether a call of ``n_routes`` routes takes the decode branch.
@@ -673,8 +769,15 @@ class OffloadedSwitchGLU(nn.Module):
                         trace, self._layer, c, ids, n_tok, k, route_trace.ROUTES,
                         decode=True, x=x,
                     )
-                pending = self._claim_reads(incoming, ids)
-                c._ensure_decode(ids, pending=pending)
+                claimed = self._claim_reads(incoming, ids) or {}
+                try:
+                    c._ensure_decode(
+                        ids, pending={e: a.group for e, a in claimed.items()} or None
+                    )
+                finally:
+                    # Copied into their slots, or drained on the way out.
+                    for ahead in claimed.values():
+                        ahead.released = True
             else:
                 if trace is not None:
                     route_trace.record(
