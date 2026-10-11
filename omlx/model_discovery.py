@@ -989,11 +989,42 @@ _CONTEXT_LENGTH_KEYS = (
 _TOKENIZER_MAX_LENGTH_SENTINEL = 10**18
 
 
+def _qwen4_exp_yarn_context_length(model_config: dict) -> int | None:
+    """YaRN-extended context of a qwen4_exp config, or None.
+
+    The Qwen3.8-Flash-Next model card extends the window by adding
+    ``rope_type: yarn`` with ``factor`` and ``original_max_position_embeddings``
+    to ``text_config.rope_parameters`` and leaving ``max_position_embeddings``
+    alone, so the window is ``original * factor``. Only qwen4_exp, whose
+    oMLX implementation applies YaRN; other loaders may ignore the field.
+    """
+    if model_config.get("model_type") != "qwen4_exp":
+        return None
+    text_config = model_config.get("text_config")
+    if not isinstance(text_config, dict):
+        return None
+    rope = text_config.get("rope_parameters")
+    if not isinstance(rope, dict):
+        return None
+    if (rope.get("rope_type") or rope.get("type")) != "yarn":
+        return None
+    original = rope.get("original_max_position_embeddings") or text_config.get(
+        "max_position_embeddings"
+    )
+    factor = rope.get("factor")
+    if not isinstance(original, int) or original <= 0:
+        return None
+    if not isinstance(factor, (int, float)) or factor <= 0:
+        return None
+    return int(original * factor)
+
+
 def _read_model_context_length(model_path: Path) -> int | None:
     """Discover the declared context length from a model's config files.
 
     Resolution order:
 
+    0. A qwen4_exp YaRN ``rope_parameters`` (``original * factor``).
     1. Top-level ``config.json`` keys (``max_position_embeddings`` first,
        then the rest of :data:`_CONTEXT_LENGTH_KEYS`).
     2. Nested ``text_config`` / ``language_config`` keys (used by VLM
@@ -1015,6 +1046,10 @@ def _read_model_context_length(model_path: Path) -> int | None:
         except (OSError, json.JSONDecodeError) as e:
             logger.debug(f"Failed to read config.json for {model_path}: {e}")
             model_config = {}
+
+        yarn_length = _qwen4_exp_yarn_context_length(model_config)
+        if yarn_length is not None:
+            return yarn_length
 
         for key in _CONTEXT_LENGTH_KEYS:
             value = model_config.get(key)

@@ -1428,15 +1428,40 @@ class Qwen4ExpRMSNorm(nn.Module):
         # Plain attributes, not parameters: (weight the scale was built from, scale).
         self._cache_scale = cache_scale
         self._cached_scale = None
+        object.__setattr__(self, "_rope_scale", None)
+
+    def set_rope_attention_factor(self, rotary_dim: int, factor: float) -> None:
+        """Fold YaRN's cos/sin ``attention_factor`` into this norm's scale.
+
+        RoPE is linear in its input, so scaling the rotated channels before
+        the rotation equals scaling cos and sin, and every MRoPE path (the
+        fused kernels included) reads this scale.
+        """
+        dim = self.weight.shape[0]
+        rope_scale = mx.concatenate(
+            [
+                mx.full((rotary_dim,), factor, dtype=mx.float32),
+                mx.ones((dim - rotary_dim,), dtype=mx.float32),
+            ]
+        )
+        mx.eval(rope_scale)
+        object.__setattr__(self, "_rope_scale", rope_scale)
+        object.__setattr__(self, "_cached_scale", None)
+
+    def _build_scale(self, weight: mx.array) -> mx.array:
+        scale = 1.0 + weight.astype(mx.float32)
+        if self._rope_scale is not None:
+            scale = scale * self._rope_scale
+        return scale
 
     def _scale(self) -> mx.array:
         weight = self.weight
         if not self._cache_scale:
-            return 1.0 + weight.astype(mx.float32)
+            return self._build_scale(weight)
         cached = self._cached_scale
         if cached is None or cached[0] is not weight:
             # A reloaded weight is a new array; the old scale is dropped.
-            cached = (weight, 1.0 + weight.astype(mx.float32))
+            cached = (weight, self._build_scale(weight))
             object.__setattr__(self, "_cached_scale", cached)
         return cached[1]
 
@@ -1451,6 +1476,71 @@ class Qwen4ExpRMSNorm(nn.Module):
         y = x.astype(mx.float32).reshape(*x.shape[:-1], -1, self.group_size)
         y = mx.fast.rms_norm(y, None, self.eps) * scale.reshape(-1, self.group_size)
         return y.reshape(x.shape).astype(dtype)
+
+
+def _yarn_rope(config: TextConfig, dim: int) -> Optional[tuple[mx.array, float]]:
+    """``(inv_freq, attention_factor)`` of a YaRN ``rope_parameters``, or None.
+
+    Transformers' ``_compute_yarn_parameters``, which the Qwen3.8-Flash-Next
+    model card's long-context recipe (``rope_type: yarn``, ``factor``,
+    ``original_max_position_embeddings``) relies on.
+    """
+    params = config.rope_parameters or {}
+    if params.get("type") != "yarn":
+        return None
+    base = float(params["rope_theta"])
+    original = params.get("original_max_position_embeddings")
+    if original is None:
+        original = config.max_position_embeddings
+    factor = params.get("factor")
+    if factor is None:
+        factor = config.max_position_embeddings / original
+    factor = float(factor)
+
+    def get_mscale(scale, mscale=1.0):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    attention_factor = params.get("attention_factor")
+    if attention_factor is None:
+        mscale = params.get("mscale")
+        mscale_all_dim = params.get("mscale_all_dim")
+        if mscale and mscale_all_dim:
+            attention_factor = get_mscale(factor, mscale) / get_mscale(
+                factor, mscale_all_dim
+            )
+        else:
+            attention_factor = get_mscale(factor)
+    beta_fast = params.get("beta_fast") or 32
+    beta_slow = params.get("beta_slow") or 1
+
+    def correction_dim(num_rotations):
+        return (dim * math.log(original / (num_rotations * 2 * math.pi))) / (
+            2 * math.log(base)
+        )
+
+    low = correction_dim(beta_fast)
+    high = correction_dim(beta_slow)
+    if params.get("truncate", True):
+        low = math.floor(low)
+        high = math.ceil(high)
+    low, high = max(low, 0), min(high, dim - 1)
+    if low == high:
+        high += 0.001
+
+    pos_freqs = base ** (mx.arange(0, dim, 2).astype(mx.float32) / dim)
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+    ramp = mx.clip(
+        (mx.arange(dim // 2).astype(mx.float32) - low) / (high - low), 0, 1
+    )
+    extrapolation_factor = 1 - ramp
+    inv_freq = (
+        inv_freq_interpolation * (1 - extrapolation_factor)
+        + inv_freq_extrapolation * extrapolation_factor
+    )
+    return inv_freq, float(attention_factor)
 
 
 class Qwen4ExpRMSNormGated(nn.Module):
@@ -1829,6 +1919,23 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             self.head_dim, eps=config.rms_norm_eps, cache_scale=True
         )
         self.indexer = Qwen4ExpQSAIndexer(config, self.rotary_emb)
+        yarn = _yarn_rope(config, self.rotary_emb.dim)
+        if yarn is not None:
+            inv_freq, attention_factor = yarn
+            # The indexer shares this rotary, so it rotates with the same
+            # frequencies; its norms carry the attention factor like q/k.
+            self.rotary_emb._inv_freq = inv_freq
+            self.rotary_emb.eval_cached_arrays()
+            if attention_factor != 1.0:
+                for norm in (
+                    self.q_norm,
+                    self.k_norm,
+                    self.indexer.q_layernorm,
+                    self.indexer.k_layernorm,
+                ):
+                    norm.set_rope_attention_factor(
+                        self.rotary_emb.dim, attention_factor
+                    )
 
     @staticmethod
     def _batch_one_text_position_ids(

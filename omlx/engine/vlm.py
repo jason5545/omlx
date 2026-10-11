@@ -2623,6 +2623,19 @@ class VLMBatchedEngine(BaseEngine):
             scheduler_config.paged_ssd_cache_dir = str(
                 Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
             )
+        if (
+            self._adapter.model_type == "qwen4_exp"
+            and scheduler_config.paged_ssd_cache_dir
+        ):
+            # YaRN rotates keys with different frequencies: blocks written
+            # under one rope setting must not hit under another.
+            rope = getattr(self._adapter.config.text_config, "rope_parameters", None)
+            if isinstance(rope, dict) and rope.get("type") == "yarn":
+                original = rope.get("original_max_position_embeddings")
+                scheduler_config.paged_ssd_cache_dir = str(
+                    Path(scheduler_config.paged_ssd_cache_dir)
+                    / f"qwen4_exp_yarn_f{rope.get('factor')}_o{original}"
+                )
 
         engine_config = EngineConfig(
             model_name=self._model_name,

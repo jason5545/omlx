@@ -43,6 +43,7 @@ from .._version import __version__ as _omlx_version
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
+from ..model_discovery import _qwen4_exp_yarn_context_length
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import (
     EXCLUDED_FROM_PROFILES,
@@ -4352,6 +4353,10 @@ async def get_generation_config(
                         or text_config.get("seq_length")
                         or text_config.get("n_positions")
                     )
+
+            yarn_length = _qwen4_exp_yarn_context_length(model_config)
+            if yarn_length is not None:
+                max_pos = yarn_length
 
             if max_pos and isinstance(max_pos, int):
                 result["max_context_window"] = max_pos
