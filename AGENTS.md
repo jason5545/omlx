@@ -64,7 +64,7 @@ https://github.com/jason5545/omlx.git
 
 ## 快速部署（只改 omlx/ 的 Python）
 
-上面的整套重裝 2026-09-23 實測約 64 分鐘：主套件那步 pip 47 分鐘、mlx-audio 16 分鐘。Formula 帶 `--no-cache-dir`，每次都重建 venv、重新下載全部 wheel 和 git 依賴；Rust 套件（tokenizers、pydantic-core 等）的原始碼編譯只佔一兩分鐘。omlx 的依賴不必重建：只改 omlx 程式時，把 omlx 套件（連同 custom kernel 一起編）從 commit 重裝進現有 venv，再重啟 service 就好。
+上面的整套重裝 2026-10-11 實測約 6 分鐘：從 `brew update` 到 service 重新啟動共 5 分 45 秒，brew 顯示 omlx 本體 built in 5 minutes。Formula 帶 `--no-cache-dir`，每次都重建 venv、重新下載全部 wheel 和 git 依賴；Rust 套件（tokenizers、pydantic-core 等）的原始碼編譯只佔一兩分鐘。omlx 的依賴不必重建：只改 omlx 程式時，把 omlx 套件（連同 custom kernel 一起編）從 commit 重裝進現有 venv，再重啟 service 就好。
 
 可以走快速路徑：
 
