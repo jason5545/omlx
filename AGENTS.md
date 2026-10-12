@@ -62,13 +62,13 @@ brew info --json=v2 jason5545/omlx/omlx | jq '.formulae[0] | {full_name,tap,tap_
 https://github.com/jason5545/omlx.git
 ```
 
-## 快速部署（只改 omlx/ 的 Python）
+## 快速部署（只改 omlx/ 的 Python 或 web UI 套件）
 
 上面的整套重裝 2026-10-11 實測約 6 分鐘：從 `brew update` 到 service 重新啟動共 5 分 45 秒，brew 顯示 omlx 本體 built in 5 minutes。Formula 帶 `--no-cache-dir`，每次都重建 venv、重新下載全部 wheel 和 git 依賴；Rust 套件（tokenizers、pydantic-core 等）的原始碼編譯只佔一兩分鐘。omlx 的依賴不必重建：只改 omlx 程式時，把 omlx 套件（連同 custom kernel 一起編）從 commit 重裝進現有 venv，再重啟 service 就好。
 
 可以走快速路徑：
 
-- 要上線的改動只在 `omlx/` 底下（Python，以及 admin templates、static、i18n 這類套件內的檔案）。同一段 commit 裡 `tests/`、文件、`apps/`、`packaging/` 的改動不進 server，可以一起帶。`packaging/` 只影響 DMG／Mac app 的建置，brew venv 不使用它。
+- 要上線的改動只在 `omlx/` 底下的 Python，或 `apps/omlx-web/omlx_web/` 底下的 templates、static、i18n。`pyproject.toml` 把 `omlx` 和 `omlx_web` 打進同一個 wheel，所以 web UI 會隨快速部署上線；Mac app 的 `build.sh` 也會把 `omlx_web` 複製進 app。同一段 commit 裡 `tests/`、`apps/omlx-web/tests/`、文件、`apps/omlx-mac/`、`packaging/` 的改動不進 brew 的 server，可以一起帶。`apps/omlx-mac/` 和 `packaging/` 只影響 Mac app 的建置，brew venv 不使用它們。
 
 一定要整套重裝：
 
@@ -89,7 +89,7 @@ scripts/deploy_fast.sh --no-app     # 只部署 brew service
 scripts/deploy_fast.sh --status     # 看目前部署的 commit，以及 Mac app 是否同步
 ```
 
-app 內建的 omlx 是從 working tree 複製的，所以 app 那一步要求 HEAD 的 `omlx/` 跟剛部署的 commit 相同、`omlx/`、`apps/`、`packaging/` 沒有未 commit 的改動；不符合時 brew service 照樣部署完成，腳本停下來說明兩邊不同步。回滾到舊 commit 時，先 checkout 那個 commit 再跑，app 才會一起退回。
+app 內建的 omlx 和 omlx_web 是從 working tree 複製的，所以 app 那一步要求 HEAD 的 `omlx/` 跟剛部署的 commit 相同、`omlx/`、`apps/`、`packaging/` 沒有未 commit 的改動；不符合時 brew service 照樣部署完成，腳本停下來說明兩邊不同步。回滾到舊 commit 時，先 checkout 那個 commit 再跑，app 才會一起退回。
 
 腳本做的事，也就是手動操作的等價指令：
 
@@ -266,18 +266,29 @@ git log --oneline --left-right --graph main...upstream/main
 git merge upstream/main
 ```
 
-合併後要重新跑驗證，推回 fork：
+衝突落在本地保留的功能時，照 [`PATCHES.md`](PATCHES.md) 的「合併衝突檢查」逐項確認，其餘一律取 upstream 版本。
+
+合併後照「最小驗證」檢查，再推回 fork：
 
 ```bash
 git push origin main
+```
+
+部署照「快速部署」的判斷，merge 本身不是整套重裝的理由。先跑快速部署。它只部署已經在 `origin/main` 上的 commit，並拿 `pyproject.toml`、`setup.py`、`Formula` 跟 venv 依賴基準比對；沒變就部署 origin/main，並接著部署 Mac app：
+
+```bash
+scripts/deploy_fast.sh
+```
+
+快速部署拒絕（依賴或 Formula 有變），或快速路徑失敗、`/health` 回不到 healthy，才改走整套重裝，最後一行 `scripts/deploy_app.sh` 照跑：
+
+```bash
 brew update
 brew uninstall jason5545/omlx/omlx
 brew install --HEAD --with-grammar --with-custom-kernel jason5545/omlx/omlx
 brew services restart jason5545/omlx/omlx
 scripts/deploy_app.sh      # Mac app 同步部署
 ```
-
-衝突落在本地保留的功能時，照 [`PATCHES.md`](PATCHES.md) 的「合併衝突檢查」逐項確認，其餘一律取 upstream 版本。
 
 ## 最小驗證
 
@@ -323,6 +334,6 @@ Request policy active: client=voco source=api-sub-key ... max_context_window<=16
 - 不要把 API key 印到 log 或回覆裡。
 - 不要把 `jundot/omlx` tap 裝回來，除非 Jason 明確要求。
 - 不要把 Homebrew cache 裡的 checkout 當主要 repo 修改。
-- 做完實質變更後，commit 並 push 到 `origin/main`。要上線時先看「快速部署」的判斷：只改 `omlx/` 的 Python 用 `scripts/deploy_fast.sh`；改到依賴、`Formula/omlx.rb` 或需要編譯的東西，才照「Homebrew 操作」整套重裝。
+- 做完實質變更後，commit 並 push 到 `origin/main`。要上線時先看「快速部署」的判斷：只改 `omlx/` 的 Python 或 `apps/omlx-web/omlx_web/` 的 web UI 檔案，用 `scripts/deploy_fast.sh`；改到依賴、`Formula/omlx.rb` 或需要編譯的東西，才照「Homebrew 操作」整套重裝。
 - brew service 和 Mac app 一律同步部署，同一份 `omlx/`：`deploy_fast.sh` 預設會接著部署 app，整套重裝之後手動跑 `scripts/deploy_app.sh`。只有 Jason 明說只部署一邊時才分開（Jason 2026-09-30 定）。部署完用 `scripts/deploy_fast.sh --status` 確認兩邊同步。
 - 回覆 Jason 時用自然、簡短的繁體中文，少模板感。
