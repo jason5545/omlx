@@ -200,6 +200,20 @@ class TestGetMaxContextWindow:
             # Fallback (32768) returned, not the policy (16_000).
             assert get_max_context_window("no-native-model") == 32_768
 
+    def test_loaded_engine_plan_lowers_the_limit(self):
+        """An engine that fits its context to memory (Splash) caps the limit,
+        so a longer prompt gets the standard overflow error from oMLX."""
+        from omlx.server import get_max_context_window
+
+        state = self._mount_native_and_policy(native_ctx=262_144, policy_cap=None)
+        engine = state.engine_pool.get_entry.return_value.engine
+        engine.max_context_tokens = 77_817
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("splash-model") == 77_817
+        engine.max_context_tokens = 300_000
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("splash-model") == 262_144
+
 
 class TestValidateContextWindow:
     """Tests for validate_context_window()."""
@@ -239,9 +253,12 @@ class TestValidateContextWindow:
         with patch("omlx.server._server_state", state):
             with pytest.raises(HTTPException) as exc_info:
                 validate_context_window(1001)
+            # Overflow markers that clients match before compacting.
+            detail = exc_info.value.detail.lower()
             assert exc_info.value.status_code == 400
-            assert "1001 tokens" in exc_info.value.detail
-            assert "1000 tokens" in exc_info.value.detail
+            assert exc_info.value.code == "context_length_exceeded"
+            assert "prompt is too long: 1001 tokens > 1000" in detail
+            assert "maximum context length" in detail
 
     def test_raises_with_model_specific_limit(self):
         """Test uses model-specific limit when available."""
@@ -258,8 +275,7 @@ class TestValidateContextWindow:
             with pytest.raises(HTTPException) as exc_info:
                 validate_context_window(200, "test-model")
             assert exc_info.value.status_code == 400
-            assert "200 tokens" in exc_info.value.detail
-            assert "100 tokens" in exc_info.value.detail
+            assert "200 tokens > 100" in exc_info.value.detail
 
     def test_raises_with_request_policy_limit(self):
         """Test request policy limit is used during validation."""
@@ -274,7 +290,9 @@ class TestValidateContextWindow:
                     request_policy={"max_context_window": 8192},
                 )
             assert exc_info.value.status_code == 400
-            assert "8192 tokens" in exc_info.value.detail
+            assert "9000 tokens > 8192 maximum context length" in (
+                exc_info.value.detail.lower()
+            )
 
 
 class TestRequestPolicy:

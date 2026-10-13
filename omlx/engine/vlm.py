@@ -4918,6 +4918,7 @@ class VLMBatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
+            stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -5032,6 +5033,7 @@ class VLMBatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
+            stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
         )
 
         # SpecPrefill: pass per-request overrides
