@@ -525,6 +525,7 @@ class ThinkingBudgetProcessor:
         # In new mlx-lm API, tokens is the full history list.
         # Accept each genuinely generated token exactly once (see grammar.py).
         n = len(tokens)
+        is_new_position = n > getattr(self, "_accepted_up_to", -1)
         if not hasattr(self, "_accepted_up_to"):
             self._accepted_up_to = n  # skip prompt tokens
         elif n > self._accepted_up_to:
@@ -545,7 +546,8 @@ class ThinkingBudgetProcessor:
         if self._waiting_utf8:
             return logits
 
-        if self._in_thinking:
+        # Resuming a dropped decode step repeats the same sampling position.
+        if self._in_thinking and is_new_position:
             self._thinking_tokens += 1
             if self._close_due():
                 return self._start_forcing("close", logits, mx)
