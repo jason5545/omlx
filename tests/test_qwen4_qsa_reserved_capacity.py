@@ -133,13 +133,15 @@ def _reserve_kv(cache, tokens: int) -> None:
     assert Scheduler._reserve_prefill_capacity(ns, [cache], tokens) == 1
 
 
-def test_unreserved_kv_doubles_past_the_prompt():
+def test_unreserved_kv_grows_on_the_ladder_past_the_prompt():
     cache = _kv_cache_after(_STEP)
     _append_kv(cache, _STEP, 4 * _STEP)
     _append_kv(cache, 4 * _STEP, 5 * _STEP)
 
-    # Crossing 4 steps doubles to 8 steps for a 5-step prompt.
-    assert cache.keys.shape[2] == 8 * _STEP
+    # Local patch: unreserved growth follows kv_capacity_bucket instead of
+    # doubling, so a 5-step prompt lands on 5 steps, not 8.
+    assert cache.keys.shape[2] == language.kv_capacity_bucket(5 * _STEP, _STEP)
+    assert cache.keys.shape[2] == 5 * _STEP
 
 
 def test_scheduler_reserves_kv_once_and_decode_grows_in_steps():
