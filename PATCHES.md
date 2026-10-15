@@ -12,7 +12,7 @@
 
 自 0.6.3rc1 merge 起，這個 fork 盡量貼齊 upstream，只保留三十二個本地功能；其他一律 follow upstream（舊的 VLM/MTP、MTPLX、thinking-budget patch stack 已整批丟棄，存在 `backup/pre-upstream-merge` 分支僅供查閱，不要回移植）：
 
-- API sub-key 可以套 request policy（`identify_api_key` → `DEFAULT_SUB_KEY_POLICIES`）。`voco` 預設是 `max_context_window<=16384` 且 `enable_thinking=false`。相關檔案：`omlx/server.py`、`omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`。
+- API sub-key 可以套 request policy（`identify_api_key` → `DEFAULT_SUB_KEY_POLICIES`）。`voco` 預設是 `max_context_window<=16384` 且 `enable_thinking=false`。有接的端點：`/v1/completions`、`/v1/chat/completions`、`/v1/messages`、`/v1/responses`、`/v1/decisions`（decisions 的讀出一律關 thinking，所以只有 `max_context_window` 有作用；decision model 走自己的 encoder，不套）。追 upstream 時新的推論端點要記得接。相關檔案：`omlx/server.py`、`omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`。測試：`tests/test_context_window.py` 的 `TestRequestPolicy`、`tests/integration/test_server_endpoints.py` 的 `test_decisions_sub_key_*`。
 - Mac app attach mode：`8000` 上已有健康 oMLX server 時 app 直接 attach，不顯示 port conflict；細節見下面 Mac app 章節。相關檔案：`apps/omlx-mac/Sources/Server/ServerProcess.swift` 等 6 個 Swift 檔。
 - `Formula/omlx.rb` 的 homepage/HEAD 指向 `https://github.com/jason5545/omlx.git`（xgrammar macOS arm64 post-install patch 已被 upstream 吸收，不需再維護本地版）。
 - qwen3_5_moe VLM 強制 sanitize（`omlx/engine/vlm.py` 的 `_force_qwen35_moe_sanitize_on_load`）：mlx-vlm 用第一個 glob 到的 shard metadata 判斷 `is_mlx_format`，mixed-metadata checkpoint（如 Ornith-1.5 MXFP8）會跳過 sanitize，per-expert MTP MoE 權重沒堆疊成 switch_mlp，strict load 失敗 → 退回純 LLM、視覺被靜默丟掉。追 upstream 時守住這段。

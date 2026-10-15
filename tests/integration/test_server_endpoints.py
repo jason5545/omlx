@@ -2111,6 +2111,72 @@ class TestDecisionsEndpoint:
         assert response.json()["error"]["code"] == "context_length_exceeded"
         assert mock_engine_pool.release_calls == ["test-model"]
 
+    @staticmethod
+    def _use_sub_key(monkeypatch, **policy):
+        from omlx import server
+        from omlx.settings import SubKeyEntry
+
+        build = server._build_request_policy
+
+        def build_with_sub_key(http_request, request_user=None):
+            http_request.state.omlx_api_key_name = "voco"
+            http_request.state.omlx_sub_key = SubKeyEntry(
+                key="secret", name="voco", **policy
+            )
+            return build(http_request, request_user=request_user)
+
+        monkeypatch.setattr(server, "_build_request_policy", build_with_sub_key)
+
+    def test_decisions_sub_key_shrinks_context_window(
+        self, client, mock_llm_engine, mock_engine_pool, monkeypatch
+    ):
+        self._letter_chat(mock_llm_engine)
+        monkeypatch.setattr(
+            "omlx.server._configured_max_context_window", lambda model_id=None: 100
+        )
+        body = {
+            "model": "test-model",
+            "input": "Checkout is down",
+            "questions": self._QUESTIONS,
+        }
+        assert client.post("/v1/decisions", json=body).status_code == 200
+
+        self._use_sub_key(monkeypatch, max_context_window=6)
+        response = client.post("/v1/decisions", json=body)
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "context_length_exceeded"
+        assert "7 tokens > 6 maximum context length" in response.text
+
+    @pytest.mark.parametrize("enable_thinking", [None, True])
+    def test_decisions_sub_key_keeps_thinking_off(
+        self, client, mock_llm_engine, monkeypatch, enable_thinking
+    ):
+        # The voco default policy disables thinking; a sub-key that enables
+        # it still cannot turn thinking on for a next-token readout.
+        self._letter_chat(mock_llm_engine)
+        letter_chat = mock_llm_engine.chat
+        template_kwargs = []
+
+        async def chat(messages, **kwargs):
+            template_kwargs.append(kwargs["chat_template_kwargs"])
+            return await letter_chat(messages, **kwargs)
+
+        mock_llm_engine.chat = chat
+        self._use_sub_key(monkeypatch, enable_thinking=enable_thinking)
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "test-model",
+                "input": "Checkout is down",
+                "questions": self._QUESTIONS,
+            },
+        )
+
+        assert response.status_code == 200
+        assert template_kwargs
+        assert all(kw["enable_thinking"] is False for kw in template_kwargs)
+
     def test_decisions_with_decision_model(
         self, client, mock_engine_pool, mock_decision_engine
     ):

@@ -4372,6 +4372,13 @@ async def create_decisions(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
     _reject_lone_surrogates(request)
+    # The readout always renders with thinking off, so of the sub-key policy
+    # only max_context_window changes anything here; a policy that enables
+    # thinking cannot turn it on.
+    request_policy = _build_request_policy(
+        http_request, request_user=getattr(request, "user", None)
+    )
+    _log_request_policy(request_policy, request.model)
 
     # The lease keeps the model loaded until the response is sent.
     lease = _LLMEngineLease()
@@ -4415,7 +4422,9 @@ async def create_decisions(
                             status_code=400, detail=f"Chat template error: {e}"
                         ) from e
                     raise
-                validate_context_window(num_prompt_tokens, request.model)
+                validate_context_window(
+                    num_prompt_tokens, request.model, request_policy=request_policy
+                )
                 return {} if prepared is None else {"_prepared_prompt": prepared}
 
             async def _decide():
