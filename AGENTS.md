@@ -114,8 +114,8 @@ scripts/deploy_app.sh                                                           
 細節：
 
 - 用 venv 自己的 `pip`（shebang 是 Cellar 的 `python3.11`），重新產生的 `bin/omlx` 才會跟 brew 裝的一樣。
-- 預先建置確認 wheel 建得起來、5 組 custom kernel（bonsai、decode_fast、glm_moe_dsa、minimax_m3、qwen35_prefill，跟 Formula 的 `CUSTOM_KERNELS` 同一份）的 `_ext*.so` 都在，也把建置依賴（`pyproject.toml` build-system 的 mlx、cmake、nanobind）抓進下載快取。第一次要下載，這台實測 224 秒；之後主要是編 kernel，約 35～95 秒。
-- custom kernel 的處理：腳本 export `OMLX_WITH_CUSTOM_KERNEL=1` 和 `CMAKE_ARGS=-DPython_EXECUTABLE=<venv python>`（跟 formula `--with-custom-kernel` 同一套），找不到 Metal 編譯器就停。pip 的 wheel 快取每次換一個空目錄、`http`／`http-v2` 下載快取連回原本的：舊的純 Python wheel 是 `py3-none-any`，同一個 commit 以前建過會被直接拿來裝，kernel 就悄悄不見。帶 kernel 的 wheel 是 `macosx_27_0` tag，pip 不會從快取拿，所以停 service 後的安裝會再編一次。裝完用 formula `verify_custom_kernels` 同一套檢查（`fast.is_native_available()`），失敗就停、service 開回來（沒有 kernel），照訊息回滾。
+- 預先建置確認 wheel 建得起來、4 組 custom kernel（attention、lowbit、quant_matmul、sparse_index，對應 `omlx.custom_kernels.NATIVE_KERNEL_PACKAGES`）的 `_ext*.so` 都在，也把建置依賴（`pyproject.toml` build-system 的 mlx、cmake、nanobind）抓進下載快取。第一次要下載，這台實測 224 秒；之後主要是編 kernel，約 35～95 秒。
+- custom kernel 的處理：腳本 export `OMLX_WITH_CUSTOM_KERNEL=1` 和 `CMAKE_ARGS=-DPython_EXECUTABLE=<venv python>`（跟 formula `--with-custom-kernel` 同一套），找不到 Metal 編譯器就停。pip 的 wheel 快取每次換一個空目錄、`http`／`http-v2` 下載快取連回原本的：舊的純 Python wheel 是 `py3-none-any`，同一個 commit 以前建過會被直接拿來裝，kernel 就悄悄不見。帶 kernel 的 wheel 是 `macosx_27_0` tag，pip 不會從快取拿，所以停 service 後的安裝會再編一次。裝完用 formula `verify_custom_kernels` 同一套檢查（`native_kernel_status()` 全部回報 `available`），失敗就停、service 開回來（沒有 kernel），照訊息回滾。
 - 2026-10-07 實測帶 kernel 部署 248acc2a：預建 93 秒（那次關了全部快取，含下載），install 65 秒，停 service 到 healthy 70 秒（不帶 kernel 時約 12 秒）。
 - 2026-09-23 實測部署 0a34f284：整支腳本 18.6 秒，其中 install 7 秒，停 service 到 `/health` healthy 11 秒。healthy 時模型還沒載入（`loaded_count: 0`），第一個請求才載入 Ornith（`model_load_duration` 5.83 秒）。所以部署後要送一題短請求，確認模型真的載得起來。
 - 先停 service 再換檔案：pip 會先移除舊檔再放新檔，舊程序在這段時間 lazy import 會拿到新舊混雜的模組，甚至找不到模組。停掉之後任何一步失敗，腳本都會把 service 開回來；pip 安裝失敗會自動還原舊版。

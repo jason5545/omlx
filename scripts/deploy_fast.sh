@@ -27,8 +27,8 @@ PY=${CELLAR}/libexec/bin/python
 # 用 venv 自己的 pip（shebang 是 Cellar 的 python3.11），重新產生的 bin/omlx 才跟 brew 裝的一樣。
 PIP=${CELLAR}/libexec/bin/pip
 RECEIPT=${CELLAR}/INSTALL_RECEIPT.json
-# 跟 Formula/omlx.rb 的 CUSTOM_KERNELS 同一份清單。
-CUSTOM_KERNELS="bonsai decode_fast glm_moe_dsa minimax_m3 qwen35_prefill"
+# 跟 omlx.custom_kernels.NATIVE_KERNEL_PACKAGES 同一份清單。
+CUSTOM_KERNELS="attention lowbit quant_matmul sparse_index"
 
 T0=$(date +%s)
 say() { printf '[deploy_fast +%ds] %s\n' "$(($(date +%s) - T0))" "$*"; }
@@ -232,16 +232,20 @@ T_INSTALL=$(date +%s)
 say "安裝完成，花 $(($(date +%s) - T_INSTALL)) 秒"
 # 跟 Formula/omlx.rb 的 verify_custom_kernels 同一套檢查：載得起來、ABI 對得上。
 # 失敗時 cleanup 會把 service 開回來（跑的是新版但沒有 kernel），照訊息回滾。
-"${PY}" -I - ${CUSTOM_KERNELS} <<'PY' || die "custom kernel 載入失敗，service 會以沒有 kernel 的狀態開回來；回滾：scripts/deploy_fast.sh ${PREV}"
-import importlib, sys
-failed = {}
-for package in sys.argv[1:]:
-    fast = importlib.import_module(f"omlx.custom_kernels.{package}.fast")
-    if not fast.is_native_available():
-        failed[package] = str(fast.import_error())
+"${PY}" -I <<'PY' || die "custom kernel 載入失敗，service 會以沒有 kernel 的狀態開回來；回滾：scripts/deploy_fast.sh ${PREV}"
+from omlx.custom_kernels import native_kernel_status
+
+status = native_kernel_status()
+failed = {
+    name: report["import_error"]
+    for name, report in status.items()
+    if not report["available"]
+}
+if not status:
+    failed = {"all": "no native kernel packages were reported"}
 if failed:
     print(failed)
-    sys.exit(1)
+    raise SystemExit(1)
 PY
 say "custom kernel 驗證通過（${CUSTOM_KERNELS}）"
 
