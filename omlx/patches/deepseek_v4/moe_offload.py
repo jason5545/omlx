@@ -209,9 +209,38 @@ class _SlotCache(ExpertCache):
 
     def __init__(self, glu, capacity: int, view: _GLUStoreView):
         self.glu = glu  # read by _allocate, which the base constructor calls
+        # ModelOpt NVFP4 tensor scales are small enough to keep resident. Each
+        # slot still needs the scale belonging to its expert.
+        self.global_scales = {
+            proj: glu[proj]["global_scale"]
+            for proj in _PROJS
+            if "global_scale" in glu[proj]
+        }
+        self._global_scale_slots = {}
         super().__init__(glu, capacity, view)
         self.rows = self._row_layout()
         self._ahead_layout = None  # see ahead_slabs
+
+    def _allocate(self, capacity: int) -> None:
+        super()._allocate(capacity)
+        for proj in self.projs:
+            lin = self.glu[proj]
+            for field, slots in zip(("weight", "scales", "biases"), self.resident[proj]):
+                if slots is not None:
+                    setattr(lin, field, slots)  # drops the lazy full-size array
+            if proj in self.global_scales:
+                slots = mx.ones((capacity,), dtype=mx.float32)
+                self._global_scale_slots[proj] = slots
+                lin.global_scale = slots
+
+    def _set_global_scale(self, expert: int, slot: int) -> None:
+        for proj, scales in self.global_scales.items():
+            self._global_scale_slots[proj][slot] = scales[expert]
+
+    def _install(self, expert: int, payload=None, protected=frozenset()) -> int:
+        slot = super()._install(expert, payload, protected)
+        self._set_global_scale(expert, slot)
+        return slot
 
     def _row_layout(self):
         """Per projection field ``(name, fi)``: ``(shape, dtype, row bytes)``
@@ -341,6 +370,7 @@ class _SlotCache(ExpertCache):
 
     def _landed(self, e: int, slot: int) -> None:
         """Expert ``e``'s bytes are in ``slot``: route to it."""
+        self._set_global_scale(e, slot)
         self.map[e] = slot
         self.misses += 1
         self.fetched_bytes += self.expert_bytes
@@ -370,14 +400,6 @@ class _SlotCache(ExpertCache):
                 return None
             out.append((a.fd, a.offset, a.nbytes))
         return out
-
-    def _allocate(self, capacity: int) -> None:
-        super()._allocate(capacity)
-        for proj in self.projs:
-            lin = self.glu[proj]
-            for field, slots in zip(("weight", "scales", "biases"), self.resident[proj]):
-                if slots is not None:
-                    setattr(lin, field, slots)  # drops the lazy full-size array
 
     def release_slots(self) -> int:
         # Prefill memory borrowing is not wired for this module: the cache
@@ -838,6 +860,10 @@ class OffloadedSwitchGLU(nn.Module):
                 arrays, _ = ring[g % len(ring)]
                 for (name, fi), a in arrays.items():
                     glu[name][_FIELDS[fi]] = a
+                if c.global_scales:
+                    local_experts = mx.array(group, dtype=mx.int32)
+                    for name, scales in c.global_scales.items():
+                        glu[name].global_scale = mx.take(scales, local_experts)
                 a = n_res + int(np.searchsorted(tail, group[0], side="left"))
                 b = n_res + int(np.searchsorted(tail, group[-1], side="right"))
                 local = np.searchsorted(group, sorted_ids[a:b])
