@@ -282,6 +282,14 @@ final class ModelSettingsScreenVM {
     /// External engine serving the model; empty runs it in-process.
     var externalEngine: String = ""
 
+    /// The engine that serves the model: the setting, or for a GGUF, which
+    /// only an external engine runs, the first engine that can serve it.
+    var effectiveExternalEngine: String {
+        guard externalEngine.isEmpty, model?.isGGUF == true else { return externalEngine }
+        let engines = model?.externalEngines ?? []
+        return engines.first(where: { $0.compatible })?.id ?? engines.first?.id ?? ""
+    }
+
     // Embedding audio tower. Empty seconds keeps the 30 s processor default.
     var embeddingAudioEnabled: Bool = false
     var embeddingAudioMaxSeconds: String = ""
@@ -1464,7 +1472,7 @@ final class ModelSettingsScreenVM {
             }
             return profileDisplayName(scope: activeProfileScope, name: name)
         case .acceleration, .memory, .experimental:
-            if !externalEngine.isEmpty { return Self.summaryExternalEngine }
+            if !effectiveExternalEngine.isEmpty { return Self.summaryExternalEngine }
             return Self.summary(enabledFeatures(on: page), empty: Self.summaryOff)
         case .advanced:
             return Self.summary(enabledFeatures(on: .advanced), empty: Self.summaryOff)
@@ -1526,9 +1534,10 @@ final class ModelSettingsScreenVM {
                                     comment: "TurboQuant KV in the Memory Saving row value; placeholder is the bit width"))
             }
         case .advanced:
-            if !isDiffusionModel, !externalEngine.isEmpty {
-                let label = model?.externalEngines?.first(where: { $0.id == externalEngine })?.label
-                items.append(label ?? externalEngine)
+            if !isDiffusionModel, !effectiveExternalEngine.isEmpty {
+                let engine = effectiveExternalEngine
+                let label = model?.externalEngines?.first(where: { $0.id == engine })?.label
+                items.append(label ?? engine)
             }
             if trustRemoteCode {
                 items.append(String(localized: "settings.advanced.trust_remote_code.label",

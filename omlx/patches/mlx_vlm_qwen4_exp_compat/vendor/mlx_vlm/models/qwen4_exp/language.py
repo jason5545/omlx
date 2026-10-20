@@ -29,7 +29,11 @@ from omlx.memory_monitor import (
 )
 
 from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
-from omlx.patches.vlm_batch_kv_capacity import _ladder_capacity, _roll_logical_prefix
+from omlx.patches.vlm_batch_kv_capacity import (
+    _ladder_capacity,
+    _roll_logical_prefix,
+    install_capacity_methods,
+)
 from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
@@ -64,6 +68,10 @@ from .qsa_fast import (
 from . import attn_fused, hc_fused
 
 logger = logging.getLogger(__name__)
+
+# This package carries its own BatchKVCache class, which the stock-class
+# capacity patch (#4312) does not reach.
+install_capacity_methods(BatchKVCache)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"

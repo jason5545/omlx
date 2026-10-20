@@ -2942,31 +2942,18 @@ class Scheduler:
                 store_tail_terminal = getattr(
                     intermediate_snapshots, "tail_terminal_token_count", None
                 ) == len(token_sequence_to_store)
-                if hot_cache_write_back:
-                    block_table = self.block_aware_cache.store_cache(
-                        request_id,
-                        token_sequence_to_store,
-                        cache_to_store,
-                        model_cache_config=model_cache_config,
-                        boundary_snapshots=intermediate_snapshots,
-                        extra_keys=extra_keys,
-                        extra_key_token_start=extra_key_token_start,
-                        extra_key_ranges=extra_key_ranges,
-                        _store_tail_terminal=store_tail_terminal,
-                    )
-                else:
-                    block_table = self.block_aware_cache.store_cache(
-                        request_id,
-                        token_sequence_to_store,
-                        cache_to_store,
-                        model_cache_config=model_cache_config,
-                        boundary_snapshots=intermediate_snapshots,
-                        extra_keys=extra_keys,
-                        extra_key_token_start=extra_key_token_start,
-                        extra_key_ranges=extra_key_ranges,
-                        hot_cache_write_back=False,
-                        _store_tail_terminal=store_tail_terminal,
-                    )
+                block_table = self.block_aware_cache.store_cache(
+                    request_id,
+                    token_sequence_to_store,
+                    cache_to_store,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots=intermediate_snapshots,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                    hot_cache_write_back=hot_cache_write_back,
+                    _store_tail_terminal=store_tail_terminal,
+                )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -10684,15 +10671,10 @@ class Scheduler:
                 original_tokens = block_table.num_tokens
                 reconstruct_started = time.perf_counter()
                 with self._phase_timer("prefix_cache_reconstruct"):
-                    if bypass_hot_cache:
-                        reconstructed = self.block_aware_cache.reconstruct_cache(
-                            block_table,
-                            promote_to_hot_cache=False,
-                        )
-                    else:
-                        reconstructed = self.block_aware_cache.reconstruct_cache(
-                            block_table
-                        )
+                    reconstructed = self.block_aware_cache.reconstruct_cache(
+                        block_table,
+                        promote_to_hot_cache=not bypass_hot_cache,
+                    )
                 reconstruct_ms = (time.perf_counter() - reconstruct_started) * 1000.0
                 if block_table.num_tokens < minimum_prefix:
                     reconstructed = None
@@ -11510,6 +11492,7 @@ class Scheduler:
             extract_cache_states=self._extract_cache_states,
             sync_and_clear_cache=lambda: Scheduler._clear_cache(self),
             log=logger,
+            use_hot_cache=not self._bypass_hot_cache_under_pressure(),
         )
 
     def _cleanup_specprefill(self, request_id: str) -> None:

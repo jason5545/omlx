@@ -926,6 +926,10 @@ class ClaudeCodeSettings:
     opus_model: str | None = None
     sonnet_model: str | None = None
     haiku_model: str | None = None
+    # When True, oMLX exposes derived Claude Desktop tier aliases
+    # (claude-opus / claude-sonnet / claude-haiku)
+    # that resolve at runtime to the configured tier models.
+    desktop_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -934,6 +938,7 @@ class ClaudeCodeSettings:
             "opus_model": self.opus_model,
             "sonnet_model": self.sonnet_model,
             "haiku_model": self.haiku_model,
+            "desktop_enabled": self.desktop_enabled,
         }
 
     @classmethod
@@ -944,6 +949,7 @@ class ClaudeCodeSettings:
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),
             haiku_model=data.get("haiku_model"),
+            desktop_enabled=data.get("desktop_enabled", False),
         )
 
 

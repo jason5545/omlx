@@ -468,7 +468,9 @@ class TestLoginRejectsSubKey:
         try:
             request = admin_routes.LoginRequest(api_key="sub-key-1")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.login(request, MagicMock(), _loopback_http_request())
+                )
             assert exc_info.value.status_code == 401
         finally:
             _restore_getter(original)
@@ -485,7 +487,9 @@ class TestLoginRejectsSubKey:
         original = _patch_getter(mock_settings)
         try:
             request = admin_routes.LoginRequest(api_key="main-key")
-            result = asyncio.run(admin_routes.login(request, mock_response))
+            result = asyncio.run(
+                admin_routes.login(request, mock_response, _loopback_http_request())
+            )
             assert result["success"] is True
         finally:
             _restore_getter(original)
@@ -854,7 +858,9 @@ class TestLoginEndpoint:
         try:
             request = admin_routes.LoginRequest(api_key="anykey")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.login(request, MagicMock(), _loopback_http_request())
+                )
             assert exc_info.value.status_code == 400
             assert "No API key configured" in exc_info.value.detail
         finally:
@@ -869,7 +875,9 @@ class TestLoginEndpoint:
         try:
             request = admin_routes.LoginRequest(api_key="wrong-key")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.login(request, MagicMock(), _loopback_http_request())
+                )
             assert exc_info.value.status_code == 401
         finally:
             _restore_getter(original)
@@ -881,7 +889,9 @@ class TestLoginEndpoint:
         original = _patch_getter(mock_settings)
         try:
             request = admin_routes.LoginRequest(api_key="correct-key")
-            result = asyncio.run(admin_routes.login(request, mock_response))
+            result = asyncio.run(
+                admin_routes.login(request, mock_response, _loopback_http_request())
+            )
             assert result["success"] is True
             mock_response.set_cookie.assert_called_once()
         finally:

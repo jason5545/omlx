@@ -1552,31 +1552,18 @@ class BlockAwarePrefixCache(CacheManager):
                         block_meta = per_block
 
                     # Save to paged SSD via PagedSSDCacheManager with cache type info
-                    if hot_cache_write_back:
-                        saved = self.paged_ssd_cache.save_block(
-                            block_hash=block.block_hash,
-                            cache_data=block_kv_data,
-                            token_count=block.token_count,
-                            model_name=self.paged_cache.model_name,
-                            layer_cache_types=layer_cache_types,
-                            layer_meta_states=block_meta,
-                            replace_existing=False,
-                            parent_hash=parent_hash,
-                            tail_terminal=is_tail_terminal,
-                        )
-                    else:
-                        saved = self.paged_ssd_cache.save_block(
-                            block_hash=block.block_hash,
-                            cache_data=block_kv_data,
-                            token_count=block.token_count,
-                            model_name=self.paged_cache.model_name,
-                            layer_cache_types=layer_cache_types,
-                            layer_meta_states=block_meta,
-                            hot_cache_write_back=False,
-                            replace_existing=False,
-                            parent_hash=parent_hash,
-                            tail_terminal=is_tail_terminal,
-                        )
+                    saved = self.paged_ssd_cache.save_block(
+                        block_hash=block.block_hash,
+                        cache_data=block_kv_data,
+                        token_count=block.token_count,
+                        model_name=self.paged_cache.model_name,
+                        layer_cache_types=layer_cache_types,
+                        layer_meta_states=block_meta,
+                        hot_cache_write_back=hot_cache_write_back,
+                        replace_existing=False,
+                        parent_hash=parent_hash,
+                        tail_terminal=is_tail_terminal,
+                    )
                     if saved:
                         if split_gdn_layout:
                             if is_exact_split_block:
@@ -1722,7 +1709,9 @@ class BlockAwarePrefixCache(CacheManager):
                         if superseded in self._tail_hashes:
                             self._discard_tail_block(superseded, layer_cache_types)
                         elif rotating_layout:
-                            self._strip_rotating_payload(superseded)
+                            self._strip_rotating_payload(
+                                superseded, hot_cache_write_back
+                            )
                     self._tip_lineage[new_tip.block_hash] = prev_tip_hash
                     if len(self._tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
                         self._tip_lineage.clear()
@@ -2177,7 +2166,9 @@ class BlockAwarePrefixCache(CacheManager):
         self._tail_hashes.discard(block_hash)
         return True
 
-    def _strip_rotating_payload(self, block_hash: bytes) -> bool:
+    def _strip_rotating_payload(
+        self, block_hash: bytes, hot_cache_write_back: bool = True
+    ) -> bool:
         """Replace a superseded tip block's rotating payload with placeholders.
 
         Sliceable layers (KVCache/TurboQuant slices) in the block are kept —
@@ -2192,7 +2183,8 @@ class BlockAwarePrefixCache(CacheManager):
         via ``_hot_cache_put`` (which re-registers it), so the hot-cache and
         shared-budget byte counters stay consistent. In SSD mode the slim
         payload is re-enqueued and overwrites the same hash-derived file
-        path.
+        path. With ``hot_cache_write_back=False`` it goes through the SSD
+        writer and is not retained in the hot cache.
 
         Returns:
             True if the block was rewritten with at least one layer stripped.
@@ -2200,7 +2192,12 @@ class BlockAwarePrefixCache(CacheManager):
         if self.paged_ssd_cache is None or not HAS_MLX:
             return False
         try:
-            data, meta = self.paged_ssd_cache.load_block_with_metadata(block_hash)
+            # Inspection load only: forget_block() drops the entry right after,
+            # so promoting the full rotating payload would only evict live blocks.
+            data, meta = self.paged_ssd_cache.load_block_with_metadata(
+                block_hash,
+                promote_to_hot_cache=False,
+            )
             if not data or not meta:
                 return False
             types = meta.get("layer_cache_types") or []
@@ -2240,6 +2237,7 @@ class BlockAwarePrefixCache(CacheManager):
                 model_name=meta.get("model_name", self.paged_cache.model_name),
                 layer_cache_types=types or None,
                 layer_meta_states=meta.get("layer_meta_states"),
+                hot_cache_write_back=hot_cache_write_back,
             )
             if saved:
                 logger.debug(
@@ -3360,17 +3358,12 @@ class BlockAwarePrefixCache(CacheManager):
                     break  # Stop here, use valid prefix
 
                 # Load with metadata for type information
-                if promote_to_hot_cache:
-                    block_data, block_metadata = (
-                        self.paged_ssd_cache.load_block_with_metadata(block.block_hash)
+                block_data, block_metadata = (
+                    self.paged_ssd_cache.load_block_with_metadata(
+                        block.block_hash,
+                        promote_to_hot_cache=promote_to_hot_cache,
                     )
-                else:
-                    block_data, block_metadata = (
-                        self.paged_ssd_cache.load_block_with_metadata(
-                            block.block_hash,
-                            promote_to_hot_cache=False,
-                        )
-                    )
+                )
                 if block_data is None:
                     logger.debug(
                         f"Failed to load block {block_id} from tiered cache, "

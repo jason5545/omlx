@@ -1458,6 +1458,7 @@ def _upload_model_repo(
             getattr(entry, "model_path", None),
             list(model_dirs or []),
             source_repo_id=getattr(entry, "source_repo_id", None),
+            source_path=getattr(entry, "source_path", None),
         )
     except Exception as e:  # noqa: BLE001
         logger.debug(f"Benchmark: repo derivation failed: {e}")

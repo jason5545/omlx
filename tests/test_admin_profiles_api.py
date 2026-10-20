@@ -70,6 +70,9 @@ class _FakePool:
     def splash_target(self, model_id, model_settings):
         return None, ""
 
+    def splash_draft_to_download(self, model_id, model_settings):
+        return None
+
     @staticmethod
     def _clear_load_failure(entry):
         entry.load_failed = False

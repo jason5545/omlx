@@ -674,6 +674,10 @@ def test_head_count_is_read_from_the_model_config(tmp_path):
             "model_type": "llama",  # a real mlx-lm module that implements shard()
             "hidden_size": 4096,
             "num_attention_heads": 32,
+            "num_hidden_layers": 2,
+            "intermediate_size": 11008,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 32000,
         })
     )
     header = {
