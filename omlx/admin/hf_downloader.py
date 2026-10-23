@@ -726,7 +726,7 @@ def _is_local_copy(path: Path, size: int) -> bool:
 def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
     """Add download hints to model-info file rows; return the repo layout.
 
-    Only root GGUFs are models (subfolders hold split copies and MTP heads).
+    GGUFs can be at the root or split across a VARIANT/ folder.
     """
     names = [row["name"] for row in files]
     layout = _repo_layout(names)
@@ -742,12 +742,13 @@ def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
         lower = name.lower()
         row["group"] = None
         row["mmproj"] = None
-        if lower.endswith(".gguf") and "/" not in name:
+        if lower.endswith(".gguf") and ("/" not in name or gguf.is_split_variant(name)):
             row["kind"] = gguf.file_kind(name)
             if row["kind"] == "gguf":
                 split = gguf.SPLIT_RE.match(name)
                 row["group"] = split["prefix"] if split else None
-                row["mmproj"] = projectors.get(name.rpartition("/")[0])
+                # Discovery pairs every GGUF with a root projector.
+                row["mmproj"] = projectors.get("")
         elif lower.endswith(".safetensors"):
             row["kind"] = "weights"
         else:

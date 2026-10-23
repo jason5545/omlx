@@ -61,6 +61,18 @@ from omlx.settings import GlobalSettings
 from omlx.utils.proc_memory import list_process_group_pids
 
 QWEN38_TEXT = dict(splash_mod.SPLASH_FAMILIES["Qwen3.8-27B"])
+FLASH_NEXT_TEXT = {
+    "model_type": "qwen4_exp_text",
+    "max_position_embeddings": 262144,
+    "hidden_size": 2560,
+    "num_hidden_layers": 48,
+    "vocab_size": 248320,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+}
 REPO_ID = splash_repo_id("Qwen3.8-27B-4bit")
 MLX_4BIT = {"mode": "affine", "bits": 4, "group_size": 64}
 GIB = 1024**3
@@ -94,6 +106,23 @@ def _write_draft(path: Path, text=None) -> Path:
     (path / "config.json").write_text(json.dumps(config))
     (path / "model.safetensors").write_bytes(b"0" * 64)
     return path
+
+
+def _add_optiq_vision(model: Path) -> dict:
+    """OptiQ's layout: the vision tower in optiq/, listed by the index, and no
+    processor file. Returns the index's weight map."""
+    config = json.loads((model / "config.json").read_text())
+    vision = {"patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2}
+    (model / "config.json").write_text(json.dumps({**config, "vision_config": vision}))
+    (model / "optiq").mkdir()
+    (model / "optiq" / "optiq_vision.safetensors").write_bytes(b"0" * 512)
+    weight_map = {
+        "lm_head.weight": "model.safetensors",
+        "vision_tower.blocks.0.attn.qkv.weight": "optiq/optiq_vision.safetensors",
+    }
+    index = model / "model.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": weight_map}))
+    return weight_map
 
 
 def _fake_launcher(path: Path, version: str = "1.3.1", body: str = "exit 0\n") -> Path:
@@ -208,6 +237,19 @@ class TestBinary:
 
 
 class TestCompatibility:
+
+    def test_flash_next_mlx_checkpoint_explains_gguf_requirement(
+        self, tmp_path, launchers
+    ):
+        launchers("splash", version="1.4.0")
+        model = _write_model(tmp_path / "Flash-Next-MLX", FLASH_NEXT_TEXT)
+
+        target, reason = resolve_splash_target(model, None, [])
+
+        assert target is None
+        assert "Qwen3.8-Flash-Next needs a GGUF" in reason
+        assert splash_mod.splash_draft_to_download(model, None, []) is None
+
     def test_supported_checkpoint_resolves_with_its_draft(self, tmp_path, launchers):
         launchers("splash")
         model = _write_model(tmp_path / "Qwen3.8-27B-4bit")
@@ -343,6 +385,110 @@ def _qwen38_gguf(vocab: list[str]) -> dict:
 
 
 class TestGguf:
+
+    @pytest.mark.parametrize("layout", ["single", "split", "variant"])
+    def test_flash_next_gguf_discovery_draft_and_engine(
+        self, tmp_path, monkeypatch, launchers, write_gguf, global_settings, layout
+    ):
+        vocab = sorted(pre_tokenizers.ByteLevel.alphabet()) + [
+            "<|im_start|>",
+            "<|im_end|>",
+        ]
+        repo = tmp_path / "models" / "ISTA-DASLab" / "Flash-Next-GGUF"
+        metadata = {
+            key: value
+            for key, value in _qwen38_gguf(vocab).items()
+            if key.startswith("tokenizer.")
+        }
+        metadata.update(
+            {
+                "general.architecture": "qwen4exp",
+                "qwen4exp.block_count": 49,
+                "qwen4exp.nextn_predict_layers": 1,
+                "qwen4exp.context_length": 262144,
+                "qwen4exp.embedding_length": 2560,
+                "qwen4exp.attention.head_count": 24,
+                "qwen4exp.attention.head_count_kv": 2,
+                "qwen4exp.attention.key_length": 256,
+                "qwen4exp.full_attention_interval": 4,
+                "qwen4exp.expert_count": 512,
+                "qwen4exp.expert_used_count": 10,
+            }
+        )
+        name = "Flash-Next-Q2_0"
+        source_folder = repo / "Q2_0" if layout == "variant" else repo
+        first = f"{name}.gguf" if layout == "single" else f"{name}-00001-of-00002.gguf"
+        write_gguf(source_folder / first, metadata)
+        if layout != "single":
+            write_gguf(source_folder / f"{name}-00002-of-00002.gguf", {})
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        model = models[name]
+        text = {**FLASH_NEXT_TEXT, "vocab_size": len(vocab)}
+        folder = Path(model.model_path)
+        config = json.loads((folder / "config.json").read_text())
+        assert config["model_type"] == "qwen4_exp"
+        assert config["text_config"] == {**text, "full_attention_interval": 4}
+        assert model.model_format == "gguf"
+        family = splash_mod.SPLASH_FAMILIES["Qwen3.8-Flash-Next"]
+        monkeypatch.setitem(family, "vocab_size", len(vocab))
+
+        launchers("splash", version="1.3.2")
+        target, reason = resolve_splash_target(folder, None, [])
+        assert target is None
+        assert "Splash 1.4.0 or later" in reason
+        assert splash_mod.splash_draft_to_download(folder, None, []) is None
+
+        launchers("splash", version="1.4.0")
+        wrong_draft = _write_draft(tmp_path / "27B-draft")
+        assert (
+            splash_mod.splash_draft_to_download(folder, None, [str(wrong_draft)])
+            == "incoai/Qwen3.8-Flash-Next-DFlash2"
+        )
+        _, reason = resolve_splash_target(folder, None, [str(wrong_draft)])
+        assert "incoai/Qwen3.8-Flash-Next-DFlash2" in reason
+        draft = _write_draft(
+            tmp_path / "models" / "incoai" / "Qwen3.8-Flash-Next-DFlash2", text
+        )
+        target, reason = resolve_splash_target(
+            folder, None, [str(wrong_draft), str(draft)]
+        )
+        assert reason == ""
+        assert target.family == "Qwen3.8-Flash-Next"
+        assert target.draft_path == draft
+
+        tokenizer = AutoTokenizer.from_pretrained(folder)
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        assert tokenizer.decode(tokenizer.encode(prompt)) == prompt
+        staged = stage_model(folder, "omlx/Flash-Next", tmp_path / "hub")
+        for part in config["omlx_gguf"]["parts"]:
+            assert (staged / part).resolve() == (
+                source_folder / Path(part).name
+            ).resolve()
+
+        pool = EnginePool()
+        pool.discover_models([str(tmp_path / "models")])
+        assert pool._entries[draft.name].is_helper
+        engine = pool._external_engine_for(
+            pool._entries[name], ModelSettings(), model.engine_type
+        )
+        assert isinstance(engine, SplashEngine)
+        assert engine._target.draft_path == draft
+        command = engine._serve_command(9000)
+        model_arg = command[command.index("--model") + 1]
+        assert model_arg == engine._repo_id + (":split" if layout != "single" else "")
+        if layout != "single":
+            assert command[command.index("--served-model-name") + 1] == engine._repo_id
+        assert "--offline" in command
+        assert "--language-only" in command
+        assert command[command.index("--draft-model") + 1] == str(draft.resolve())
+        assert engine._options.max_memory_bytes == splash_memory_estimate(
+            folder, draft, 262144, "int8"
+        )
+
     def test_qwen_gguf_serves_on_splash_with_a_derived_tokenizer(
         self, tmp_path, monkeypatch, launchers, write_gguf
     ):
@@ -373,7 +519,7 @@ class TestGguf:
         split = models["Qwen3.8-27B-BF16"].model_path
         assert resolve_splash_target(split, None, [str(draft)]) == (
             None,
-            "Splash serves single-file GGUFs only",
+            "Split GGUFs need Splash 1.4.0 or later",
         )
 
         # The tokenizer comes from the GGUF header, chat template included.
@@ -451,6 +597,32 @@ class TestStaging:
         staged = stage_model(snapshot, "omlx/m", tmp_path / "hub")
 
         assert (staged / "config.json").resolve().parent == blobs.resolve()
+
+    def test_optiq_layout_stages_as_splash_reads_it(self, tmp_path):
+        # Splash refuses index shards outside the snapshot root and a vision
+        # checkpoint without a processor file.
+        model = _write_model(tmp_path / "m")
+        weight_map = _add_optiq_vision(model)
+
+        snapshot = stage_model(model, "omlx/m", tmp_path / "hub")
+
+        index = snapshot / "model.safetensors.index.json"
+        assert not index.is_symlink()
+        assert set(json.loads(index.read_text())["weight_map"].values()) == {
+            "model.safetensors",
+            "optiq-optiq_vision.safetensors",
+        }
+        sidecar = (model / "optiq" / "optiq_vision.safetensors").resolve()
+        assert (snapshot / "optiq-optiq_vision.safetensors").resolve() == sidecar
+        assert json.loads((snapshot / "preprocessor_config.json").read_text()) == {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+        }
+        model_index = json.loads((model / "model.safetensors.index.json").read_text())
+        assert model_index["weight_map"] == weight_map
 
 
 # -- request translation -----------------------------------------------------------
@@ -683,6 +855,33 @@ class TestStreaming:
         assert body["reasoning_effort"] == "high"
         assert body["stream"] is True and body["return_progress"] is True
         assert engine.has_active_requests() is False
+
+    @pytest.mark.parametrize(
+        "kwargs, expected",
+        [
+            ({"preserve_thinking": True}, True),
+            ({"preserve_thinking": False}, False),
+            ({"reasoning_effort": "high"}, None),
+            (None, None),
+        ],
+    )
+    async def test_preserve_thinking_is_forwarded(self, tmp_path, kwargs, expected):
+        # Qwen 3.6+ templates drop reasoning from turns before the latest user
+        # message unless preserve_thinking is set, which defeats prefix caching.
+        seen = {}
+
+        def handler(request):
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, content=_sse({"choices": [{"delta": {"content": "x"}}]})
+            )
+
+        engine = _engine_with_transport(tmp_path, handler)
+        async for _ in engine.stream_chat(
+            [{"role": "user", "content": "hi"}], chat_template_kwargs=kwargs
+        ):
+            pass
+        assert seen["body"].get("preserve_thinking") is expected
 
     async def test_unfinished_reasoning_is_closed(self, tmp_path):
         def handler(request):
@@ -1487,6 +1686,15 @@ class TestMemoryEstimate:
         assert splash_memory_estimate(model, draft, None, "int8") == int8
         assert splash_memory_estimate(model, draft, 10**6, "int8") == int8
 
+    def test_counts_a_vision_tower_in_a_subdirectory(self, tmp_path):
+        model = _write_model(tmp_path / "m")
+        draft = _write_draft(tmp_path / "draft")
+        before = splash_memory_estimate(model, draft, 1024, "int8")
+
+        _add_optiq_vision(model)
+
+        assert splash_memory_estimate(model, draft, 1024, "int8") == before + 512
+
 
 class TestProcessMemory:
     def test_list_process_group_pids(self):
@@ -1837,3 +2045,47 @@ class TestVision:
             {"type": "text", "text": "?"},
             {"type": "image_url", "image_url": {"url": url, "detail": "auto"}},
         ]
+
+
+# -- later system messages (#4697) -------------------------------------------------
+
+
+class TestLaterSystem:
+    @pytest.mark.parametrize(
+        ("later_system", "expected"),
+        [
+            ("native", True),
+            ("patched", True),
+            ("unsupported", False),
+            ({"default": "patched", "tool_use": "native"}, None),
+        ],
+    )
+    async def test_status_sets_the_tokenizer_capability(
+        self, tmp_path, later_system, expected
+    ):
+        status = {"chat_template": {"later_system": later_system}}
+        engine = _engine_with_transport(
+            tmp_path, lambda request: httpx.Response(200, json=status)
+        )
+        engine._tokenizer = SimpleNamespace()
+
+        await engine._refresh_status()
+
+        assert engine._tokenizer._omlx_supports_mid_system_messages is expected
+
+    def test_token_count_folds_later_system_messages(self, tmp_path):
+        class StrictTemplate:
+            def apply_chat_template(self, messages, **kwargs):
+                if any(m["role"] == "system" for m in messages[1:]):
+                    raise ValueError("System message must be at the beginning.")
+                return list("".join(f"<{m['role']}>{m['content']}" for m in messages))
+
+        engine = _engine(tmp_path)
+        engine._tokenizer = StrictTemplate()
+        messages = [
+            {"role": "system", "content": "lead"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "note"},
+        ]
+
+        assert engine.count_chat_tokens(messages) == len("<system>lead\n\nnote<user>hi")

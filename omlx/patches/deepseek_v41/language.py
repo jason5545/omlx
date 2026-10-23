@@ -21,7 +21,11 @@ from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
 from ..deepseek_v4.switch_layers import _block_config, _build_mxfp4_blocks
 from . import decode_fused, growth
-from .activation import quantize_paired_swiglu_activation, quantize_swiglu_activation
+from .activation import (
+    quantize_paired_swiglu_activation,
+    quantize_swiglu_activation,
+    rope_activation,
+)
 from .cache import DeepseekV41Cache
 from .engram import Engram, NgramHash, build_compressed_token_map
 from .head import project_logits
@@ -31,7 +35,12 @@ from .hyper_connection import (
     fused_hc_projection,
     sinkhorn,
 )
-from .kernels import packed_index_scores, packed_index_topk, packed_sparse_attention
+from .kernels import (
+    index_select,
+    packed_index_scores,
+    packed_index_topk,
+    packed_sparse_attention,
+)
 from .mtp import DSparkMixin
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 from .routing import combine_sorted_experts
@@ -136,7 +145,9 @@ def _rope_apply(x, cos, sin, inverse):
     return mx.concatenate([x[..., :-d], rotated.reshape(*x.shape[:-1], d).astype(x.dtype)], -1)
 
 
-def rope(x, positions, config, compressed, inverse=False):
+def rope(x, positions, config, compressed, inverse=False, quantize=False, heads_major=False):
+    """RoPE of x [B, L, ..., D] at positions; quantize: act_quant of the result; heads_major:
+    x is [B, H, L, D] and the result [B, L, H, D]."""
     params = (
         config.rope_head_dim,
         config.compress_rope_theta if compressed else config.rope_theta,
@@ -146,7 +157,20 @@ def rope(x, positions, config, compressed, inverse=False):
         config.beta_slow,
     )
     cos, sin = _rope_table(params, _rope_positions(positions))
-    return _rope_apply(x, cos, sin, inverse)
+    if (
+        mx.default_device() == mx.gpu
+        and x.size
+        and x.ndim >= 3
+        and (x.ndim == 4 or not heads_major)
+        and x.shape[-1] % 32 == 0
+        and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+        and cos.shape[0] == x.shape[2 if heads_major else 1]
+    ):
+        return rope_activation(x, cos, sin, inverse, quantize, heads_major)
+    if heads_major:
+        x = x.transpose(0, 2, 1, 3)
+    out = _rope_apply(x, cos, sin, inverse)
+    return quantize_activation(out) if quantize else out
 
 
 def candidate_block_ids(scores, lengths, count, block):
@@ -289,6 +313,8 @@ class Indexer(nn.Module):
             return idx
         scores = packed_index_scores(q, key, weights, start, ratio, candidates)
         count = min(c.index_topk, scores.shape[-1])
+        if x.shape[1] <= 8:
+            return index_select(scores, count, candidates)
         order = mx.argsort(-scores, axis=-1)[..., :count].astype(mx.int32)
         valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
         idx = mx.take_along_axis(candidates, order, -1)
@@ -410,16 +436,20 @@ class Attention(nn.Module):
                 start,
                 max(ratio, 1),
                 c.window_size,
-            ).transpose(0, 2, 1, 3)
+            )
+            heads_major = True
         else:
             out = packed_sparse_attention(
                 q, kv, pooled, idx, ci, self.attn_sink, c.head_dim**-0.5
             )
-        out = rope(out, rope_positions, c, bool(ratio), inverse=True)
+            heads_major = False
         # DeepSeek-V4.1-Flash model.py Attention.forward (1017, and the current Flash repo):
         # "quantize/dequantize o before einsum", act_quant(o, 32, ue8m0, inplace=True) over
         # each group's values. At df42c109 it fed bf16 o to wo_a directly, as upstream oMLX did.
-        grouped = quantize_activation(out.reshape(1, length, c.o_groups, -1))
+        # The 32-groups of a head's o equal those of o.reshape(1, length, o_groups, -1).
+        grouped = rope(
+            out, rope_positions, c, bool(ratio), inverse=True, quantize=True, heads_major=heads_major
+        ).reshape(1, length, c.o_groups, -1)
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
         return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
 
@@ -1109,8 +1139,8 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                 h, pre = decode_fused.decode_block_nb(
                     layer, h, pre, [rcs[r][j] for r in range(b_n)], shareds, starts, c
                 )
-                if prefetch is not None and "engram" in layer:
-                    mx.async_eval(h, pre)
+                # Submit each layer: the GPU runs it while the next one is built.
+                mx.async_eval(h, pre)
                 for r in range(b_n):
                     rc = rcs[r]
                     rc[j][0] = mx.array([starts[r] + 1], mx.int32)
@@ -1239,7 +1269,7 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             # intermediates retire as the GPU progresses, and clear the pool at
             # the same points (per-layer widths vary across the ratio switch,
             # CED tail and 2047/2048 chunk widths, so size classes never
-            # reuse). Decode/verify widths stay lazy for latency.
+            # reuse). Decode/verify widths are only submitted (async_eval).
             prefill_backpressure = end - begin >= 256
             with prefetch.forward() if prefetch is not None else nullcontext():
                 first = self._next_engram(stage, -1)
@@ -1275,11 +1305,12 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                         image_mask,
                         ced_tail=ced_tail if ced_tail is not None and i >= ced_mid else None,
                     )
-                    if prefetch is not None and "engram" in layer:
-                        mx.async_eval(h, pre)
                     if prefill_backpressure:
                         mx.eval(h, pre)
                         mx.clear_cache()
+                    else:
+                        # The GPU runs this layer while the next one is built.
+                        mx.async_eval(h, pre)
                     rc[j][0] = mx.array([start + end - begin], mx.int32)
                     if history is not None and j == 0:
                         rc[j][6] = mx.array(history, mx.int64)

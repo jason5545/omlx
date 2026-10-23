@@ -18,9 +18,8 @@ import numpy as np
 from . import decode_layer as DL
 from . import decode_moe as DM
 from . import growth
-from .quantization import QuantizedProjection, pack_activation
-
-_TPG = 256
+from .kernels import index_select, packed_index_scores, packed_index_topk
+from .quantization import QuantizedProjection, pack_activation, quantize_activation
 
 
 def _cos_sin(c, compressed, start):
@@ -63,7 +62,8 @@ def _empty(shape, dtype):
 
 
 def _dummy(dtype):
-    return _const((0,), dtype)
+    # 8 elements: smaller inputs are passed in constant address space.
+    return _const((0,) * 8, dtype)
 
 
 def _scalars(c):
@@ -89,50 +89,53 @@ def _woa_mxfp8(att):
     return cached or None
 
 
-def _mxfp8_projection(p):
-    """A projection the fused GEMVs can read: MXFP8, group 32, FP8-quantized input."""
+def _fused_projection(p):
+    """A projection the fused GEMVs can read: MXFP8 or affine, FP8-quantized input."""
     return (
         isinstance(p, QuantizedProjection)
-        and p.mode == "mxfp8"
-        and p.group_size == 32
         and getattr(p, "quantize_input", False)
-        and "biases" not in p
+        and DM.weight_format(p) not in (None, DM.MXFP4)
     )
+
+
+def _wb(p):
+    """(weight, scales, biases) kernel inputs of a projection; MXFP passes a dummy bias."""
+    return p.weight, p.scales, DM._biases(p)
 
 
 def mix(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
     """(optional hc_post of the previous sublayer) + hc_mixes + hc_pre + RMSNorm + act_quant.
     Returns (coefficients[24] = pre, post, comb), normed input bf16, its act_quant, h."""
-    hc, dim = c.hc_mult, c.dim
-    n = hc * dim
-    nparts = (n + _TPG - 1) // _TPG
-    mixw = (2 + hc) * hc
-    eps, hc_eps = _scalars(c)
-    dummy = _dummy(mx.float32)
-    posted = sub is not None
-    partial, hout = DL.kernel("mix_partial")(
-        inputs=[res, blk[f"hc_{kind}_fn"], sub if posted else dummy, post if posted else dummy, comb if posted else dummy],
-        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("TPG", _TPG), ("POST", posted)],
-        grid=(nparts * _TPG, 1, 1), threadgroup=(_TPG, 1, 1),
-        output_shapes=[(nparts * (mixw + 1),), (n if posted else 1,)],
-        output_dtypes=[mx.float32, mx.bfloat16])
-    h = hout if posted else res
-    norm = blk.attn_norm if kind == "attn" else blk.ffn_norm
-    coef, xn, xq = DL.kernel("mix_final")(
-        inputs=[partial, h, pre_in, norm.weight, blk[f"hc_{kind}_scale"], blk[f"hc_{kind}_base"], eps, hc_eps],
-        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("NPART", nparts), ("ITERS", c.hc_sinkhorn_iters)],
-        grid=(1024, 1, 1), threadgroup=(1024, 1, 1),
-        output_shapes=[(mixw,), (dim,), (dim,)], output_dtypes=[mx.float32, mx.bfloat16, mx.float32])
-    return coef, xn, xq, h
+    coef, xn, xq, h = mix_nb(blk, kind, c, res.reshape(1, -1), pre_in.reshape(1, -1),
+                             *(x.reshape(1, -1) if x is not None else None for x in (sub, post, comb)))
+    return coef.reshape(-1), xn.reshape(-1), xq.reshape(-1), h.reshape(-1)
 
 
-def gemv_fp8(x, a, b=None):
-    na, k = a.weight.shape[0], a.weight.shape[1] * 4
+def _pair_formats(a, b):
+    fa = DM.weight_format(a)
+    return (fa, fa if b is None else DM.weight_format(b))
+
+
+def _pair_inputs(x, a, b):
+    dummy = (_dummy(mx.uint32), _dummy(mx.uint8), _dummy(mx.float32))
+    return [x, *_wb(a), *(_wb(b) if b is not None else dummy)]
+
+
+def _affine(formats):
+    return any(f[0] == "affine" for f in formats)
+
+
+def gemv_fp8(x, a, b=None, tiles=False):
+    """MXFP8 / affine GEMV of one vector. tiles: affine projections take the matrix-tile
+    kernel of gemv_fp8_nb (as verify blocks do) instead of the faster rows kernel."""
+    if tiles and _affine(_pair_formats(a, b)):
+        ya, yb = gemv_fp8_nb(x.reshape(1, -1), a, b)
+        return ya.reshape(-1), (yb.reshape(-1) if b is not None else None)
+    na, k = a.weight.shape[0], a.input_dims
     nb = 0 if b is None else b.weight.shape[0]
     assert na % 4 == 0 and nb % 4 == 0, "4-row simdgroups must not straddle the two matrices"
-    dummy_w, dummy_s = _dummy(mx.uint32), _dummy(mx.uint8)
-    ya, yb = DL.kernel("gemv_fp8")(
-        inputs=[x, a.weight, a.scales, b.weight if b is not None else dummy_w, b.scales if b is not None else dummy_s],
+    ya, yb = DL.kernel("gemv_fp8", _pair_formats(a, b))(
+        inputs=_pair_inputs(x, a, b),
         template=[("NA", na), ("NB", nb), ("K", k)],
         grid=((na + nb + 7) // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(na,), (max(nb, 1),)], output_dtypes=[mx.bfloat16, mx.bfloat16])
@@ -149,16 +152,20 @@ def attn_mid(att, qa, kv_in, cos, sin, c):
         output_dtypes=[mx.bfloat16, mx.float32, mx.uint8])
 
 
-def wqb_rope(att, qrq, cos, sin, c):
+def wqb_rope(att, qrq, cos, sin, c, tiles=False):
+    if tiles and _affine((DM.weight_format(att.wq_b),)):
+        return wqb_rope_nb(att, qrq.reshape(1, -1), cos.reshape(1, -1), sin.reshape(1, -1), c, True).reshape(-1)
     nq = c.n_heads * c.head_dim
-    return DL.kernel("wqb_rope")(
-        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin],
+    return DL.kernel("wqb_rope", (DM.weight_format(att.wq_b),))(
+        inputs=[qrq, *_wb(att.wq_b), cos, sin],
         template=[("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim)],
         grid=(nq // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(nq,)], output_dtypes=[mx.bfloat16])[0]
 
 
-def woa(att, oq, c):
+def woa(att, oq, c, tiles=False):
+    if tiles:
+        return woa_nb(att, oq.reshape(1, -1), c, True).reshape(-1)
     wq, ws = _woa_mxfp8(att)
     rows = c.o_groups * c.o_lora_rank
     return DL.kernel("woa")(
@@ -228,6 +235,129 @@ def compress_index(att, x, qr, cache, shared, start, c):
     return shared["kv"], shared["idx"]
 
 
+def _rows(p, v):
+    """p applied to each row of v ([1, R, K]) on its own, as when each token decodes alone
+    (a multi-row MLX GEMV rounds its fp32 sums differently)."""
+    return mx.concatenate([p(v[:, j : j + 1]) for j in range(v.shape[1])], 1)
+
+
+def block_index_ok(c, start):
+    """Whether compress_index_block applies to a verify block from `start`: every token
+    then selects index_topk keys in every compressed layer, so the per-token selections
+    have the same width (the -1 padding of a narrower one would move its keys)."""
+    for r in {r for r in c.compress_ratios[: c.n_layers] if r}:
+        if (start + 1) // r < c.index_topk:
+            return False
+    src = c.candidate_source_layer
+    if src >= 0:
+        visible = (start + 1) // c.compress_ratios[src]
+        blocks = min(c.candidate_topk_blocks, -(-visible // c.candidate_block_size))
+        if blocks * c.candidate_block_size < c.index_topk:
+            return False
+    return True
+
+
+def _compress_block(comp, x, cache, start):
+    """Compressor.__call__ for the R tokens x [1, R, dim] at once."""
+    r = comp.ratio
+    if r == 1:
+        return comp.norm(_rows(comp.wkv, x))
+    x32 = x.astype(mx.float32)
+    kv, gate = _rows(comp.wkv, x32), _rows(comp.wgate, x32)
+    rem = start % r
+    if rem:
+        kv = mx.concatenate([cache[4][:, :rem], kv], 1)
+        gate = mx.concatenate([cache[5][:, :rem], gate], 1)
+    verify_state = getattr(cache, "_mtp_verify_state", None)
+    if verify_state is not None:
+        verify_state["compressor"] = (kv, gate)
+    cutoff = kv.shape[1] // r * r
+    cache[4], cache[5] = kv[:, cutoff:], gate[:, cutoff:]
+    if not cutoff:
+        return None
+    pooled = mx.sum(
+        kv[:, :cutoff].reshape(1, -1, r, kv.shape[-1])
+        * mx.softmax(gate[:, :cutoff].reshape(1, -1, r, gate.shape[-1]), axis=2),
+        axis=2,
+    )
+    return comp.norm(pooled.astype(x.dtype))
+
+
+def _index_block(idx, x, qr, latent, cache, shared, start, ratio):
+    """Indexer.__call__ for the R tokens x [1, R, dim], qr [1, R, q_lora] at once."""
+    from .language import rope
+
+    c, layer = idx._config, idx._layer
+    r_n = x.shape[1]
+    end = start + r_n
+    if layer in c.kv_source_layers:
+        previous = cache[3]
+        previous = (
+            previous[:, : start // ratio]
+            if previous is not None
+            else pack_activation(mx.zeros((1, 0, c.index_head_dim), x.dtype), bits=4)
+        )
+        if latent is not None:
+            pos = range(start // ratio * ratio, end // ratio * ratio, ratio)
+            key = pack_activation(rope(idx.k_norm(_rows(idx.wk, latent)), pos, c, True), bits=4)
+            previous = growth.append(cache, 3, previous, key, start // ratio)
+        shared["block_index_k"] = cache[3] = previous
+    key = shared["block_index_k"]
+    q = _rows(idx.wq_b, qr).reshape(1, r_n, c.index_n_heads, c.index_head_dim)
+    q = quantize_activation(rope(q, range(start, end), c, True), bits=4)
+    weights = (
+        _rows(idx.weights_proj, x)
+        * mx.array(c.index_head_dim**-0.5 * c.index_n_heads**-0.5, mx.float32)
+    ).astype(x.dtype).astype(mx.float32)
+    if not 0 <= c.candidate_source_layer < layer:
+        ids, blocks = packed_index_topk(
+            q, key, weights, start, ratio, c.index_topk,
+            block_count=c.candidate_topk_blocks if layer == c.candidate_source_layer else 0,
+            block_size=c.candidate_block_size,
+        )
+        if layer == c.candidate_source_layer:
+            # A token that sees fewer blocks than the block gets leading -1 slots; they
+            # only add -inf candidates and keep the order of the others.
+            shared["block_candidates"] = blocks
+        return ids
+    blocks = shared["block_candidates"]
+    candidates = blocks[..., None] * c.candidate_block_size + mx.arange(c.candidate_block_size)
+    candidates = mx.where(blocks[..., None] >= 0, candidates, -1).reshape(1, r_n, -1)
+    scores = packed_index_scores(q, key, weights, start, ratio, candidates)
+    return index_select(scores, c.index_topk, candidates)
+
+
+def compress_index_block(att, x, qr, cache, shared, start, c):
+    """compress_index for the R tokens of a verify block at once (x: [R, dim], qr:
+    [R, q_lora]; requires block_index_ok), with the cache updates and per-token indices of R
+    compress_index calls. Returns per token (the block's compressed rows, its indices)."""
+    from .language import rope
+
+    layer = att._layer
+    ratio = c.compress_ratios[layer]
+    kv_source, index_source = layer in c.kv_source_layers, layer in c.index_source_layers
+    if not (kv_source or index_source):
+        return shared["block_parts"]
+    r_n = x.shape[0]
+    x3 = x.reshape(1, r_n, -1)
+    latent = None
+    if kv_source:
+        latent = _compress_block(att.compressor, x3, cache, start)
+        if cache[2] is None:
+            cache[2] = pack_activation(mx.zeros((1, 0, c.head_dim), x.dtype), bits=4, group_size=16, e4m3_scale=True)
+        shared["block_kv"] = cache[2][:, : start // ratio]
+    if index_source:
+        shared["block_idx"] = _index_block(att.indexer, x3, qr.reshape(1, r_n, -1), latent, cache, shared, start, ratio)
+    if latent is not None:
+        first = start // ratio
+        compressed = rope(latent, range(first * ratio, (start + r_n) // ratio * ratio, ratio), c, True)
+        compressed = pack_activation(compressed, bits=4, group_size=16, e4m3_scale=True)
+        shared["block_kv"] = cache[2] = growth.append(cache, 2, shared["block_kv"], compressed, first)
+    kv, idx = shared["block_kv"], shared["block_idx"]
+    shared["block_parts"] = [(kv, idx[:, j : j + 1]) for j in range(r_n)]
+    return shared["block_parts"]
+
+
 def attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c):
     """One request's attention after its projections: window KV update, compressor, indexer,
     sparse attention and o epilogue. x: [dim] bf16, qr: [q_lora] bf16, q: [H*D] bf16 (RoPE'd),
@@ -242,16 +372,16 @@ def attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c):
     return split_attention(q.reshape(-1), kv, pooled, idx, ci, att.attn_sink, cos, sin, c)
 
 
-def decode_attention(att, x, xq, cache, shared, start, c):
+def decode_attention(att, x, xq, cache, shared, start, c, tiles=False):
     """Attention.__call__ for one token. x: [dim] bf16 (attn_norm output), xq: act_quant(x)."""
     ratio = c.compress_ratios[att._layer]
-    qa, kv_in = gemv_fp8(xq, att.wq_a, att.wkv)
+    qa, kv_in = gemv_fp8(xq, att.wq_a, att.wkv, tiles)
     cos, sin = _cos_sin(c, bool(ratio), start)
     qr, qrq, packed = attn_mid(att, qa, kv_in, cos, sin, c)
-    q = wqb_rope(att, qrq, cos, sin, c)
+    q = wqb_rope(att, qrq, cos, sin, c, tiles)
     oq = attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c)
-    yq = woa(att, oq, c)
-    return gemv_fp8(yq, att.wo_b)[0]
+    yq = woa(att, oq, c, tiles)
+    return gemv_fp8(yq, att.wo_b, tiles=tiles)[0]
 
 
 # ---- batched decode: B requests, one token each --------------------------------------------
@@ -260,27 +390,29 @@ MAX_BATCH = 8
 
 def mix_nb(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
     """mix() for B requests (rows of res [B, hc*dim], pre_in [B, hc], sub [B, dim], post [B, hc],
-    comb [B, hc*hc]); each request runs the single-request kernels on its own slice."""
+    comb [B, hc*hc]); each request runs the kernels on its own slice."""
     b_n = res.shape[0]
     hc, dim = c.hc_mult, c.dim
     n = hc * dim
-    nparts = (n + _TPG - 1) // _TPG
+    nparts = dim // 64
     mixw = (2 + hc) * hc
     eps, hc_eps = _scalars(c)
     dummy = _dummy(mx.float32)
     posted = sub is not None
-    partial, hout = DL.kernel("mix_partial_b")(
-        inputs=[res, blk[f"hc_{kind}_fn"], sub if posted else dummy, post if posted else dummy, comb if posted else dummy],
-        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("TPG", _TPG), ("POST", posted)],
-        grid=(nparts * _TPG, b_n, 1), threadgroup=(_TPG, 1, 1),
-        output_shapes=[(b_n * nparts * (mixw + 1),), (b_n * n if posted else 1,)],
-        output_dtypes=[mx.float32, mx.bfloat16])
+    partial, hout, xpre = DL.kernel("mix_partial_b")(
+        inputs=[res, blk[f"hc_{kind}_fn"], sub if posted else dummy, post if posted else dummy,
+                comb if posted else dummy, pre_in],
+        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("NPART", nparts), ("POST", posted)],
+        grid=(nparts * 64, b_n, 1), threadgroup=(64, 1, 1),
+        output_shapes=[(b_n * nparts * (mixw + 2),), (b_n * n if posted else 1,), (b_n * dim,)],
+        output_dtypes=[mx.float32, mx.bfloat16, mx.bfloat16])
     h = hout.reshape(b_n, n) if posted else res
     norm = blk.attn_norm if kind == "attn" else blk.ffn_norm
     coef, xn, xq = DL.kernel("mix_final_b")(
-        inputs=[partial, h, pre_in, norm.weight, blk[f"hc_{kind}_scale"], blk[f"hc_{kind}_base"], eps, hc_eps],
-        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("NPART", nparts), ("ITERS", c.hc_sinkhorn_iters)],
-        grid=(1024, b_n, 1), threadgroup=(1024, 1, 1),
+        inputs=[partial, xpre, norm.weight, blk[f"hc_{kind}_scale"], blk[f"hc_{kind}_base"], eps, hc_eps],
+        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("NPART", nparts), ("ITERS", c.hc_sinkhorn_iters),
+                  ("TPG", 1024)],
+        grid=((dim // 1024 + 1) * 1024, b_n, 1), threadgroup=(1024, 1, 1),
         output_shapes=[(b_n * mixw,), (b_n * dim,), (b_n * dim,)], output_dtypes=[mx.float32, mx.bfloat16, mx.float32])
     return coef.reshape(b_n, mixw), xn.reshape(b_n, dim), xq.reshape(b_n, dim), h
 
@@ -293,27 +425,41 @@ def _mma_split(tiles, groups):
     return 1
 
 
+def _aff_mma_split(tiles, groups):
+    """K split for aff_mma8 (fixed per matrix, so results do not depend on the vector count)."""
+    for ks in ((1,) if tiles >= 2048 else (4, 2, 1)):
+        if groups % ks == 0:
+            return ks
+    return 1
+
+
 def gemv_fp8_nb(x, a, b=None, mma=None):
-    """gemv_fp8 for x [B, K]: one weight read for all B vectors. Bit for bit gemv_fp8 per
-    vector without matrix tiles (mma=False); default DM.use_mma(B)."""
+    """gemv_fp8 for x [B, K]: one weight read for all B vectors. MXFP8: bit for bit gemv_fp8
+    per vector without matrix tiles (mma=False); default DM.use_mma(B). Affine projections
+    always run on matrix tiles (rows kernels are ALU bound there), which give a vector the
+    same result for any B, as gemv_fp8(tiles=True) does."""
     b_n = x.shape[0]
-    na, k = a.weight.shape[0], a.weight.shape[1] * 4
+    na, k = a.weight.shape[0], a.input_dims
     nb = 0 if b is None else b.weight.shape[0]
     assert na % 4 == 0 and nb % 4 == 0
-    if (DM.use_mma(b_n) if mma is None else mma) and na % 8 == 0 and nb % 8 == 0:
-        # 8-element dummies: inputs under 8 elements are passed in constant address space.
-        dw, ds = _const((0,) * 8, mx.uint32), _const((0,) * 8, mx.uint8)
+    formats = _pair_formats(a, b)
+    affine = _affine(formats)
+    if (
+        (affine or ((DM.use_mma(b_n) if mma is None else mma) and formats == (DM.MXFP8, DM.MXFP8)))
+        and na % 8 == 0
+        and nb % 8 == 0
+    ):
         tiles = (na + nb) // 8
-        ks = _mma_split(tiles, k // 32)
-        ya, yb = DL.kernel("gemv_fp8_mma")(
-            inputs=[x, a.weight, a.scales, b.weight if b is not None else dw, b.scales if b is not None else ds],
+        group = max(f[2] for f in formats)
+        ks = _aff_mma_split(tiles, k // group) if affine else _mma_split(tiles, k // 32)
+        ya, yb = DL.kernel("gemv_fp8_mma", formats)(
+            inputs=_pair_inputs(x, a, b),
             template=[("NA", na), ("NB_ROWS", nb), ("K", k), ("NB", b_n), ("KS", ks)],
             grid=(tiles * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
             output_shapes=[(b_n * na,), (b_n * max(nb, 1),)], output_dtypes=[mx.bfloat16, mx.bfloat16])
         return ya.reshape(b_n, na), (yb.reshape(b_n, nb) if b is not None else None)
-    dummy_w, dummy_s = _dummy(mx.uint32), _dummy(mx.uint8)
-    ya, yb = DL.kernel("gemv_fp8_nb")(
-        inputs=[x, a.weight, a.scales, b.weight if b is not None else dummy_w, b.scales if b is not None else dummy_s],
+    ya, yb = DL.kernel("gemv_fp8_nb", formats)(
+        inputs=_pair_inputs(x, a, b),
         template=[("NA", na), ("NB_ROWS", nb), ("K", k), ("NB", b_n)],
         grid=((na + nb + 7) // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(b_n * na,), (b_n * max(nb, 1),)], output_dtypes=[mx.bfloat16, mx.bfloat16])
@@ -339,18 +485,21 @@ def attn_mid_nb(att, qa, kv_in, cos, sin, c):
 
 
 def wqb_rope_nb(att, qrq, cos, sin, c, mma):
-    """wqb_rope for B rows: bit for bit per row without matrix tiles (mma=False)."""
+    """wqb_rope for B rows: bit for bit per row without matrix tiles (mma=False); affine
+    wq_b always runs on matrix tiles (as gemv_fp8_nb)."""
     b_n = qrq.shape[0]
     nq = c.n_heads * c.head_dim
     tmpl = [("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", b_n)]
-    if mma:
-        ks = _mma_split(nq // 8, c.q_lora_rank // 32)
-        return DL.kernel("wqb_rope_mma")(
-            inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin], template=tmpl + [("KS", ks)],
+    fmt = DM.weight_format(att.wq_b)
+    affine = _affine((fmt,))
+    if affine or (mma and fmt == DM.MXFP8):
+        ks = (_aff_mma_split if affine else _mma_split)(nq // 8, c.q_lora_rank // fmt[2])
+        return DL.kernel("wqb_rope_mma", (fmt,))(
+            inputs=[qrq, *_wb(att.wq_b), cos, sin], template=tmpl + [("KS", ks)],
             grid=(nq // 8 * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
             output_shapes=[(b_n * nq,)], output_dtypes=[mx.bfloat16])[0].reshape(b_n, nq)
-    return DL.kernel("wqb_rope_nb")(
-        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin], template=tmpl,
+    return DL.kernel("wqb_rope_nb", (fmt,))(
+        inputs=[qrq, *_wb(att.wq_b), cos, sin], template=tmpl,
         grid=(nq // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(b_n * nq,)], output_dtypes=[mx.bfloat16])[0].reshape(b_n, nq)
 
@@ -423,12 +572,18 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
         if cat is None or len(cat[0]) != len(key) or any(a is not b for a, b in zip(cat[0], key)):
             ncs = [int(p.shape[1]) for p, _ in parts]
             cs_ = [int(i.shape[-1]) for _, i in parts]
-            offs = [sum(ncs[:r]) for r in range(b_n)]
-            pooled = (mx.concatenate([p.reshape(-1, p.shape[-1]) for p, _ in parts if p.shape[1]], 0)
-                      if sum(ncs) else _dummy(mx.uint8))
+            if all(p is parts[0][0] for p, _ in parts):
+                # One array for the block (compress_index_block): a query's indices stay below
+                # its own row count, so all queries can read the block's rows.
+                offs = [0] * b_n
+                pooled = parts[0][0].reshape(-1, parts[0][0].shape[-1]) if ncs[0] else _dummy(mx.uint8)
+            else:
+                offs = [sum(ncs[:r]) for r in range(b_n)]
+                pooled = (mx.concatenate([p.reshape(-1, p.shape[-1]) for p, _ in parts if p.shape[1]], 0)
+                          if sum(ncs) else _dummy(mx.uint8))
             cmax = max(max(cs_), 1)
             ci = mx.concatenate([mx.pad(i.reshape(1, -1).astype(mx.int32), [(0, 0), (0, cmax - i.shape[-1])], constant_values=-1)
-                                 for _, i in parts], 0)
+                                 if i.shape[-1] < cmax else i.reshape(1, -1).astype(mx.int32) for _, i in parts], 0)
             cat = (key, pooled, ncs, cs_, offs, ci, cmax)
             memo["_batched_compressed"] = cat
         _, pooled, ncs, cs_, offs, ci, cmax = cat
@@ -476,11 +631,12 @@ def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
         oq = mx.concatenate([attention_core(att, xs[r].reshape(-1), qrs[r].reshape(-1), qs[r].reshape(-1), ps[r].reshape(-1),
                                             caches[r], shareds[r], starts[r], cs[r].reshape(-1), ss[r].reshape(-1), c)[None]
                              for r in range(b_n)])
-    yq = woa_nb(att, oq, c, DM.use_mma(b_n))
+    tiles = DM.use_mma(b_n) or getattr(blk, "_omlx_verify_exact", False)
+    yq = woa_nb(att, oq, c, tiles)
     a = blk.sum_ranks(gemv_fp8_nb(yq, att.wo_b)[0])
     coef_f, x2, _, h2 = mix_nb(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)
     fp, fo, fc = coef_f[:, :hc], coef_f[:, hc:2 * hc], coef_f[:, 2 * hc:]
-    f = blk.sum_ranks(DM.fused_decode_moe_nb(blk.ffn, x2, c)[0])
+    f = blk.sum_ranks(DM.fused_decode_moe_nb(blk.ffn, x2, c, mma=tiles)[0])
     h3 = hc_post_nb(f, h2, fo, fc, c)
     return h3.reshape(b_n, 1, hc, dim), fp.reshape(b_n, 1, hc)
 
@@ -493,8 +649,10 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
     decoded one at a time, so speculative decoding cannot change greedy output:
       * the stages that stream weights run once for the R rows with the batch-invariant
         kernels (no matrix tiles: each row is the single-token arithmetic);
-      * the compressor and indexer run token by token in order, each token with its own
-        shared-state dict, since a token only sees the cache up to itself;
+      * the compressor and indexer run once for the block (compress_index_block: projections
+        row by row, each token's selection masked to the keys it sees) when every token
+        selects index_topk keys, else token by token, each token with its own shared-state
+        dict, since a token only sees the cache up to itself;
       * the sparse attention runs once for the block, each token over the window
         attention_core would build for it (window_attention_bq), or token by token while
         the window is still filling.
@@ -529,7 +687,11 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
         win = mx.concatenate([full[:, j + 1 : j + 1 + w] for j in range(r_n)], 0)
         cache[1] = full[:, -w:]
         parts = None
-        if ratio:
+        if ratio and block_index_ok(c, start):
+            # Records the compressor's verify state itself.
+            parts = compress_index_block(att, x, qr, cache, tokens[0], start, c)
+            pooling = False
+        elif ratio:
             parts = []
             for j in range(r_n):
                 parts.append(compress_index(att, x[j], qr[j], cache, tokens[j], start + j, c))
@@ -552,20 +714,21 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
         state["window"] = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
         if pooling:
             state["compressor"] = tuple(mx.concatenate([p[i] for p in pending], 1) for i in (0, 1))
-    yq = woa_nb(att, oq, c, False)
+    tiles = getattr(blk, "_omlx_verify_exact", False)
+    yq = woa_nb(att, oq, c, tiles)
     a = blk.sum_ranks(gemv_fp8_nb(yq, att.wo_b, mma=False)[0])
     coef_f, x2, _, h2 = mix_nb(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)
     fp, fo, fc = coef_f[:, :hc], coef_f[:, hc:2 * hc], coef_f[:, 2 * hc:]
-    f = blk.sum_ranks(DM.fused_decode_moe_nb(blk.ffn, x2, c, mma=False)[0])
+    f = blk.sum_ranks(DM.fused_decode_moe_nb(blk.ffn, x2, c, mma=tiles)[0])
     h3 = hc_post_nb(f, h2, fo, fc, c)
     return h3.reshape(1, r_n, hc, dim), fp.reshape(1, r_n, hc)
 
 
 def supported(blk, c):
     """Static support check for a decoder block (cached on the block): the layouts the fused
-    kernels read (MXFP8 attention projections, an exactly MXFP8-representable bf16 wo_a, MXFP4
-    routed and MXFP8 shared experts) and the shapes they assume. Anything else, e.g. an oQ
-    export below oQ4 with affine-requantized projections, keeps the unfused path."""
+    kernels read (MXFP8 or affine attention projections with FP8-quantized inputs, an exactly
+    MXFP8-representable bf16 wo_a, MXFP4 / MXFP8 / affine routed and MXFP8 / affine shared
+    experts) and the shapes they assume. Anything else keeps the unfused path."""
     ok = getattr(blk, "_fused_decode_ok", None)
     if ok is None:
         att = blk.attn
@@ -574,7 +737,7 @@ def supported(blk, c):
             and c.dim % 1024 == 0
             and c.head_dim % 256 == 0   # split_attention's layout (V4.1: 512)
             and c.n_heads % 8 == 0
-            and all(_mxfp8_projection(getattr(att, n)) for n in ("wq_a", "wkv", "wq_b", "wo_b"))
+            and all(_fused_projection(getattr(att, n)) for n in ("wq_a", "wkv", "wq_b", "wo_b"))
             and DM.supported(blk.ffn, _empty((1, 1, c.dim), mx.bfloat16), c)
             and _woa_mxfp8(att) is not None
         )
@@ -588,9 +751,14 @@ def decode_block(blk, h, pre, cache, shared, start, c):
     hf = h.reshape(-1)
     coef_a, x, xq, _ = mix(blk, "attn", c, hf, pre.reshape(-1))
     ap, ao, ac = coef_a[:hc], coef_a[hc:2 * hc], coef_a[2 * hc:]
-    a = blk.sum_ranks(decode_attention(blk.attn, x, xq, cache, shared, start, c))
+    tiles = getattr(blk, "_omlx_verify_exact", False)
+    a = blk.sum_ranks(decode_attention(blk.attn, x, xq, cache, shared, start, c, tiles))
     coef_f, x2, _, h2 = mix(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)
     fp, fo, fc = coef_f[:hc], coef_f[hc:2 * hc], coef_f[2 * hc:]
-    f = blk.sum_ranks(DM.fused_decode_moe(blk.ffn, x2.reshape(1, 1, -1), c)[0].reshape(-1))
+    if tiles:
+        f = DM.fused_decode_moe_nb(blk.ffn, x2.reshape(1, -1), c, mma=True)[0].reshape(-1)
+    else:
+        f = DM.fused_decode_moe(blk.ffn, x2.reshape(1, 1, -1), c)[0].reshape(-1)
+    f = blk.sum_ranks(f)
     h3 = hc_post(f, h2, fo, fc, c)
     return h3.reshape(1, 1, hc, dim), fp.reshape(1, 1, hc)

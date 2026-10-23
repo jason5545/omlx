@@ -3273,6 +3273,10 @@ class Scheduler:
                     return 0
             if model_type.startswith("glm5_next"):
                 return _glm5_next_prefill_floor()
+            if model_type == "deepseek_v41":
+                # Top-6-of-384 routing leaves ~32 rows per expert at 2048 tokens;
+                # 8192 fills the gather_qmm tiles better.
+                return 8192
             if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
@@ -3686,7 +3690,12 @@ class Scheduler:
 
         # Convert stop tokens from Set[int] to Sequence[Sequence[int]]
         # for the new BatchGenerator API (each stop token is a sequence).
-        stop_tokens_set = self._get_stop_tokens()
+        # ignore_eos (forced-length bench): drop the model's own stop set;
+        # request-level stop_token_ids still apply.
+        stop_tokens_set = (
+            set() if getattr(sampling_params, "ignore_eos", False)
+            else self._get_stop_tokens()
+        )
         if sampling_params.stop_token_ids:
             stop_tokens_set.update(sampling_params.stop_token_ids)
         stop_tokens_seq = [[t] for t in stop_tokens_set] if stop_tokens_set else None
@@ -7645,7 +7654,10 @@ class Scheduler:
         machine that tells BatchGenerator when to stop generating for
         this request.
         """
-        stop_tokens_set = self._get_stop_tokens()
+        stop_tokens_set = (
+            set() if getattr(request.sampling_params, "ignore_eos", False)
+            else self._get_stop_tokens()
+        )
         if request.sampling_params.stop_token_ids:
             stop_tokens_set.update(request.sampling_params.stop_token_ids)
 
@@ -11230,7 +11242,10 @@ class Scheduler:
 
         # Combine base stop tokens (EOS, Harmony, generation_config) with
         # request-specific stop_token_ids — same shape as _build_state_machine.
-        eos_ids: set[int] = self._get_stop_tokens()
+        eos_ids: set[int] = (
+            set() if getattr(request.sampling_params, "ignore_eos", False)
+            else self._get_stop_tokens()
+        )
         if request.sampling_params.stop_token_ids:
             eos_ids.update(request.sampling_params.stop_token_ids)
 
@@ -12971,8 +12986,10 @@ class Scheduler:
             elif batch_specprefill_status != request_is_specprefill:
                 self.waiting.appendleft(request)
                 break
-            if request_is_specprefill and len(scheduled) > 0:
-                # SpecPrefill request must be alone
+            if request_is_specprefill and (
+                len(scheduled) > 0 or self.running or self.prefilling
+            ):
+                # The offset RoPE would also shift running and prefilling rows.
                 self.waiting.appendleft(request)
                 break
 

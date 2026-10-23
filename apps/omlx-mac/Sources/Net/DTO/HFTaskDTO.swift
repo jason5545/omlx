@@ -54,10 +54,20 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
 
     /// The GGUF model files a selection fetches, shown beside the repo.
     var ggufFilesText: String? {
-        let names = (files ?? []).filter {
-            !$0.contains("/") && $0.lowercased().hasSuffix(".gguf") && !$0.lowercased().contains("mmproj")
-        }
+        let names = (files ?? []).filter(Self.isGgufModelFile)
         return names.isEmpty ? nil : names.joined(separator: ", ")
+    }
+
+    /// A GGUF model file: at the repo root or split in its VARIANT/ folder.
+    static func isGgufModelFile(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        guard lower.hasSuffix(".gguf"), !lower.contains("mmproj") else { return false }
+        let components = lower.split(separator: "/", omittingEmptySubsequences: false)
+        if components.count == 1 { return true }
+        guard components.count == 2, !components[0].hasPrefix("."),
+              let split = components[1].wholeMatch(of: /(.+)-\d{5}-of-\d{5}\.gguf/)
+        else { return false }
+        return split.1.hasSuffix("-\(components[0])")
     }
 
     enum Status: String {

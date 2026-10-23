@@ -89,6 +89,7 @@ from .api.anthropic_utils import (
     create_message_stop_event,
     create_text_delta_event,
     create_thinking_delta_event,
+    is_auto_mode_classifier_request,
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
@@ -1027,7 +1028,7 @@ def _register_cluster_routes() -> None:
     from .cluster.routes import router as cluster_router
     from .cluster.routes import set_cluster_getters
 
-    set_cluster_getters(get_engine_pool)
+    set_cluster_getters(get_engine_pool, lambda: _server_state.settings_manager)
     app.include_router(
         cluster_router,
         dependencies=[
@@ -7734,6 +7735,11 @@ async def stream_anthropic_messages(
     yield create_message_stop_event()
 
 
+# Fits the first classifier stage in Claude Code's 60 s deadline at about
+# 10 tok/s. Reasoning models that skip thinking often break the verdict format.
+_AUTO_MODE_CLASSIFIER_THINKING_BUDGET = 256
+
+
 @app.post("/v1/messages")
 async def create_anthropic_message(
     request: AnthropicMessagesRequest,
@@ -7936,6 +7942,11 @@ async def create_anthropic_message(
             and "enable_thinking" not in merged_ct_kwargs
         ):
             merged_ct_kwargs["enable_thinking"] = True
+
+        if is_auto_mode_classifier_request(request):
+            # Claude Code sends no thinking field here for non-Claude model
+            # names. Bound reasoning to its deadline, but do not turn it on.
+            chat_kwargs["thinking_budget"] = _AUTO_MODE_CLASSIFIER_THINKING_BUDGET
 
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Gated on detection so other templates don't

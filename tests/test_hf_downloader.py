@@ -1951,6 +1951,103 @@ class TestHFDownloaderRoutes:
             assert not (models_dir / "unsloth").exists()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("cached, aliased", [(False, False), (True, False), (False, True)])
+    async def test_split_variant_delete_preserves_other_variants(
+        self, tmp_path, write_gguf, cached, aliased
+    ):
+        models_dir = tmp_path / "models"
+        if cached:
+            repo = models_dir / "models--ISTA-DASLab--Flash-Next-GGUF"
+            (repo / "refs").mkdir(parents=True)
+            (repo / "refs" / "main").write_text("c" * 40)
+            folder = repo / "snapshots" / ("c" * 40)
+        else:
+            repo = folder = models_dir / "ISTA-DASLab" / "Flash-Next-GGUF"
+        for variant in ("Q2_0", "Q4_K_M"):
+            for part in (1, 2):
+                write_gguf(
+                    folder / variant / f"Flash-Next-{variant}-{part:05d}-of-00002.gguf",
+                    {"general.architecture": "qwen4exp"},
+                )
+        write_gguf(folder / "mmproj-BF16.gguf", {"general.architecture": "clip"})
+        if aliased:
+            from omlx.model_discovery import discover_models
+
+            alias = tmp_path / "model-link"
+            alias.symlink_to(models_dir, target_is_directory=True)
+            discover_models(alias, tmp_path / "base" / "gguf")
+            alias.unlink()
+        pool = EnginePool()
+        settings = MagicMock()
+        settings.get_effective_model_dirs.return_value = [models_dir]
+        downloader = MagicMock()
+        downloader.cancel_download_for_dir = AsyncMock()
+        with (
+            patch(
+                "omlx.engine_pool.get_global_settings",
+                return_value=SimpleNamespace(base_path=tmp_path / "base"),
+            ),
+            patch.multiple(
+                admin_routes,
+                _get_global_settings=lambda: settings,
+                _get_engine_pool=lambda: pool,
+                _get_settings_manager=lambda: None,
+                _hf_downloader=downloader,
+            ),
+        ):
+            pool.discover_models([str(models_dir)])
+            assert set(pool._entries) == {"Flash-Next-Q2_0", "Flash-Next-Q4_K_M"}
+            rows = (await admin_routes.list_hf_models(is_admin=True))["models"]
+            assert {row["name"] for row in rows} == set(pool._entries)
+            await admin_routes.delete_hf_model("Flash-Next-Q2_0", is_admin=True)
+            assert not list((folder / "Q2_0").glob("*.gguf"))
+            assert len(list((folder / "Q4_K_M").glob("*.gguf"))) == 2
+            assert (folder / "mmproj-BF16.gguf").exists()
+            assert set(pool._entries) == {"Flash-Next-Q4_K_M"}
+            if not cached:
+                downloader.cancel_download_for_dir.assert_awaited_once_with(
+                    folder,
+                    [
+                        f"Q2_0/Flash-Next-Q2_0-{part:05d}-of-00002.gguf"
+                        for part in (1, 2)
+                    ],
+                )
+            await admin_routes.delete_hf_model("Flash-Next-Q4_K_M", is_admin=True)
+            assert not repo.exists()
+            assert pool._entries == {}
+
+    @pytest.mark.asyncio
+    async def test_gguf_delete_keeps_a_checkpoint_beside_it(self, tmp_path, write_gguf):
+        models_dir = tmp_path / "models"
+        org = models_dir / "unsloth"
+        write_gguf(org / "Q-Q4_K_M.gguf", {"general.architecture": "qwen35"})
+        checkpoint = org / "Tiny-4bit"
+        checkpoint.mkdir()
+        (checkpoint / "config.json").write_text('{"model_type": "llama"}')
+        (checkpoint / "model.safetensors").write_bytes(b"0" * 1000)
+        pool = EnginePool()
+        settings = MagicMock()
+        settings.get_effective_model_dirs.return_value = [models_dir]
+        with (
+            patch(
+                "omlx.engine_pool.get_global_settings",
+                return_value=SimpleNamespace(base_path=tmp_path / "base"),
+            ),
+            patch.multiple(
+                admin_routes,
+                _get_global_settings=lambda: settings,
+                _get_engine_pool=lambda: pool,
+                _get_settings_manager=lambda: None,
+                _hf_downloader=None,
+            ),
+        ):
+            pool.discover_models([str(models_dir)])
+            await admin_routes.delete_hf_model("Q-Q4_K_M", is_admin=True)
+
+        assert [path.name for path in org.iterdir()] == ["Tiny-4bit"]
+        assert (checkpoint / "model.safetensors").exists()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("target_inside_hub", [False, True])
     async def test_delete_refuses_symlinked_hf_cache_repo(
         self, tmp_path, target_inside_hub
@@ -4994,6 +5091,28 @@ class TestFileSelection:
         assert hf_downloader_mod._describe_repo_files(gguf, None) == "gguf"
         rows = {row["name"]: row for row in gguf}
         assert rows["Q-UD-Q4_K_M.gguf"]["mmproj"] == "mmproj-BF16.gguf"
-        # Subfolders hold copies no engine loads as a model.
-        assert rows["BF16/Q-BF16-00001-of-00002.gguf"]["kind"] == "other"
+        part = rows["BF16/Q-BF16-00001-of-00002.gguf"]
+        assert part["kind"] == "gguf"
+        assert part["group"] == "BF16/Q-BF16"
+        assert part["mmproj"] == "mmproj-BF16.gguf"
         assert not any(row["required"] for row in gguf)
+
+    def test_split_variants_group_their_parts_and_skip_draft_folders(self):
+        files = [
+            {"name": name, "size": 1}
+            for name in (
+                "Q2_0/Flash-Next-Q2_0-00001-of-00002.gguf",
+                "Q2_0/Flash-Next-Q2_0-00002-of-00002.gguf",
+                "MTP/draft.gguf",
+                "MTP/draft-00001-of-00002.gguf",
+                "other/Flash-Next-Q2_0-00001-of-00002.gguf",
+                "nested/Q2_0/Flash-Next-Q2_0-00001-of-00002.gguf",
+                "mmproj-BF16.gguf",
+            )
+        ]
+        assert hf_downloader_mod._describe_repo_files(files, None) == "gguf"
+        for row in files[:2]:
+            assert row["kind"] == "gguf"
+            assert row["group"] == "Q2_0/Flash-Next-Q2_0"
+            assert row["mmproj"] == "mmproj-BF16.gguf"
+        assert all(row["kind"] == "other" for row in files[2:6])

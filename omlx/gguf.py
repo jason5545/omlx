@@ -41,6 +41,8 @@ GGUF_MAGIC = b"GGUF"
 SPLIT_RE = re.compile(
     r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$", re.IGNORECASE
 )
+# Splash selects split files through a VARIANT/ folder and :VARIANT.
+SPLIT_VARIANT = "split"
 # Vision projector precisions in the order a GGUF is paired with them.
 PROJECTOR_PREFERENCE = ("bf16", "f16", "f32")
 
@@ -67,14 +69,18 @@ _ARRAY = 9
 
 # Hugging Face model types of the GGUF architectures oMLX names like their
 # safetensors checkpoints; any other architecture keeps its GGUF name.
-_HF_MODEL_TYPES = {"qwen35": "qwen3_5", "qwen35moe": "qwen3_5_moe"}
+_HF_MODEL_TYPES = {
+    "qwen35": "qwen3_5",
+    "qwen35moe": "qwen3_5_moe",
+    "qwen4exp": "qwen4_exp",
+}
 
 # The generated folder's files besides the links to the source files.
 CONFIG_FILE = "config.json"
 _CHAT_TEMPLATE_FILE = "chat_template.jinja"
 _GENERATION_CONFIG_FILE = "generation_config.json"
-# Changes the generated folders' names, so a new layout rebuilds them.
-_FOLDER_LAYOUT = 1
+# Rebuild generated folders with the Flash-Next model type and split layout.
+_FOLDER_LAYOUT = 2
 
 # The qwen35 pre-tokenizer: Qwen2's letter class extended to combining
 # marks, then byte-level BPE.
@@ -109,6 +115,7 @@ class GgufModel:
     model_id: str
     parts: tuple[Path, ...]
     projectors: tuple[Path, ...]
+    source_folder: Path
 
     @property
     def path(self) -> Path:
@@ -148,33 +155,80 @@ def _root_ggufs(folder: Path) -> list[Path]:
     ]
 
 
+def is_split_variant(name: str) -> bool:
+    """Whether a file is a split GGUF in its VARIANT/ folder."""
+    folder, _, base = name.rpartition("/")
+    split = SPLIT_RE.match(base)
+    return bool(
+        folder
+        and "/" not in folder
+        and not folder.startswith(".")
+        and split
+        and split["prefix"].lower().endswith(f"-{folder.lower()}")
+        and file_kind(base) == "gguf"
+    )
+
+
+def _variant_ggufs(folder: Path) -> list[Path]:
+    try:
+        variants = sorted(path for path in folder.iterdir() if path.is_dir())
+    except OSError:
+        return []
+    return [
+        path
+        for variant in variants
+        for path in _root_ggufs(variant)
+        if is_split_variant(f"{variant.name}/{path.name}")
+    ]
+
+
+def _model_ggufs(folder: Path) -> list[Path]:
+    return _root_ggufs(folder) + _variant_ggufs(folder)
+
+
+def holds_checkpoint(folder: Path) -> bool:
+    """Whether a subfolder of ``folder`` is a model checkpoint."""
+    try:
+        return any(
+            (path / "config.json").is_file()
+            for path in folder.iterdir()
+            if path.is_dir()
+        )
+    except OSError:
+        return False
+
+
 def find_models(folder: Path) -> list[GgufModel]:
-    """The GGUF models at the root of ``folder``.
+    """The GGUF models in ``folder``, including split VARIANT/ folders.
 
     A split GGUF is one model named by its prefix; projectors and imatrix
-    files are not models, and subfolders (split BF16 copies, MTP heads) are
-    not scanned.
+    files and MTP heads are not models.
     """
-    files = _root_ggufs(folder)
+    files = _model_ggufs(folder)
     projectors = tuple(
         sorted(
             (path for path in files if file_kind(path.name) == "mmproj"),
             key=lambda path: projector_rank(path.name),
         )
     )
-    split_parts: dict[str, list[Path]] = {}
+    split_parts: dict[tuple[Path, str], list[Path]] = {}
     models: list[GgufModel] = []
     for path in files:
         if file_kind(path.name) != "gguf":
             continue
         split = SPLIT_RE.match(path.name)
         if split:
-            split_parts.setdefault(split["prefix"], []).append(path)
+            split_parts.setdefault((path.parent, split["prefix"]), []).append(path)
             continue
-        models.append(GgufModel(path.name[: -len(".gguf")], (path,), projectors))
-    for prefix, parts in split_parts.items():
-        count = int(SPLIT_RE.match(parts[0].name)["count"])
-        if len(parts) != count:
+        models.append(
+            GgufModel(path.name[: -len(".gguf")], (path,), projectors, folder)
+        )
+    for (_, prefix), parts in split_parts.items():
+        splits = [SPLIT_RE.match(part.name) for part in parts]
+        count = int(splits[0]["count"])
+        if {int(split["count"]) for split in splits} != {count} or [
+            int(split["index"]) for split in splits
+        ] != list(range(1, count + 1)):
             logger.warning(
                 "Skipping incomplete split GGUF %s in %s: %d of %d parts",
                 prefix,
@@ -183,7 +237,7 @@ def find_models(folder: Path) -> list[GgufModel]:
                 count,
             )
             continue
-        models.append(GgufModel(prefix, tuple(parts), projectors))
+        models.append(GgufModel(prefix, tuple(parts), projectors, folder))
     return sorted(models, key=lambda model: model.model_id)
 
 
@@ -194,7 +248,10 @@ def is_gguf_folder(folder: Path) -> bool:
             return False
     except OSError:
         return False
-    return any(file_kind(path.name) == "gguf" for path in _root_ggufs(folder))
+    if any(file_kind(path.name) == "gguf" for path in _root_ggufs(folder)):
+        return True
+    # Split variants do not make an organization folder of checkpoints a repo.
+    return bool(_variant_ggufs(folder)) and not holds_checkpoint(folder)
 
 
 # -- header -------------------------------------------------------------------
@@ -416,8 +473,9 @@ def _generation_config(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 def _folder_name(model: GgufModel) -> str:
-    """Name that changes whenever the model's files change."""
-    digest = hashlib.sha1(f"layout {_FOLDER_LAYOUT}\n".encode())
+    """Name that changes whenever the model's files or source folder change."""
+    # The config records the source folder, so another path to it rebuilds.
+    digest = hashlib.sha1(f"layout {_FOLDER_LAYOUT}\n{model.source_folder}\n".encode())
     for path in (*model.parts, *model.projectors):
         stat = path.stat()
         line = f"{path.resolve()}\0{stat.st_size}\0{stat.st_mtime_ns}\n"
@@ -447,13 +505,24 @@ def prepare_model_folder(model: GgufModel, root: Path) -> Path:
     config = derive_config(metadata, projector)
     config["omlx_gguf"] = {
         "source": str(model.path),
-        "parts": [part.name for part in model.parts],
+        "parts": [
+            f"{SPLIT_VARIANT}/{part.name}" if len(model.parts) > 1 else part.name
+            for part in model.parts
+        ],
         "projectors": [path.name for path in model.projectors],
     }
+    config["omlx_gguf"]["directory"] = str(model.source_folder)
+    config["omlx_gguf"]["source_parts"] = [
+        part.relative_to(model.source_folder).as_posix() for part in model.parts
+    ]
     partial = root / f".{folder.name}.partial"
     shutil.rmtree(partial, ignore_errors=True)
     partial.mkdir(parents=True)
-    for path in (*model.parts, *model.projectors):
+    for part, name in zip(model.parts, config["omlx_gguf"]["parts"], strict=True):
+        link = partial / name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(part.resolve())
+    for path in model.projectors:
         (partial / path.name).symlink_to(path.resolve())
     (partial / CONFIG_FILE).write_text(json.dumps(config, indent=2))
     template = metadata.get("tokenizer.chat_template")

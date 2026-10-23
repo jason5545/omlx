@@ -2,9 +2,10 @@
 
 A five-layer model at the fused kernels' shapes (dim 1024, eight 512-wide heads, MXFP8
 attention and shared-expert projections, MXFP4 routed experts, an MXFP8-exact bf16 wo_a, the
-checkpoint's parameter dtypes) decodes the same tokens from identical caches with the fused
-path on and off. The fused kernels only change accumulation orders the DeepSeek reference
-leaves free, so the logits must agree to rounding noise.
+checkpoint's parameter dtypes) runs every decode layer with the fused path on and off from the
+same input. The fused kernels only change accumulation orders the DeepSeek reference leaves
+free, so each layer's output must agree to rounding noise. build(fmt="affine") gives the
+projections the affine layouts of oQ2-oQ3 exports instead.
 """
 
 import zlib
@@ -18,7 +19,7 @@ from mlx.utils import tree_flatten
 
 from omlx.patches.deepseek_v41 import decode_fused
 from omlx.patches.deepseek_v41.config import ModelConfig
-from omlx.patches.deepseek_v41.language import LanguageModel
+from omlx.patches.deepseek_v41.language import Block, LanguageModel
 from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan, OffloadedExpert
 from omlx.patches.deepseek_v41.quantization import QuantizedProjection
 from tests.test_deepseek_v41 import run_two_ranks
@@ -61,7 +62,12 @@ def config():
 _FP32 = ("hc_", "attn_sink", "gate.bias", "compressor.")
 
 
-def build(seed=4121, **overrides):
+# Every width oQ2-oQ3 exports use: affine attention projections of mixed widths, 2-bit w1 / w3
+# and 3-bit w2 routed experts (oQ2.5e), 8-bit shared experts.
+_AFFINE_BITS = {"wq_a": 8, "wkv": 4, "wq_b": 4, "wo_b": 6, "w1": 2, "w3": 2, "w2": 3, "shared_experts": 8}
+
+
+def build(seed=4121, fmt="mxfp", **overrides):
     model = LanguageModel(replace(config(), **overrides))
     weights = []
     for name, parameter in tree_flatten(model.parameters()):
@@ -76,25 +82,40 @@ def build(seed=4121, **overrides):
     model.load_weights(weights, strict=True)
 
     def quantized(weight, bits, mode):
+        if fmt == "affine":
+            bits = _AFFINE_BITS[role]
+            packed, scales, biases = mx.quantize(weight.astype(mx.bfloat16), group_size=64, bits=bits)
+            return QuantizedProjection(packed, scales, bits, "affine", biases=biases, group_size=64)
         packed, scales = mx.quantize(weight.astype(mx.bfloat16), group_size=32, bits=bits, mode=mode)[:2]
         return QuantizedProjection(packed, scales, bits, mode)
 
     for layer in model.layers:
         att, ffn = layer.attn, layer.ffn
         for name in ("wq_a", "wkv", "wq_b", "wo_b"):
+            role = name
             setattr(att, name, quantized(getattr(att, name).weight, 8, "mxfp8"))
         # convert.py dequantizes the FP8 checkpoint's wo_a to bf16: exactly MXFP8 values
         packed, scales = mx.quantize(att.wo_a.weight, group_size=32, bits=8, mode="mxfp8")[:2]
         att.wo_a.weight = mx.dequantize(packed, scales, None, group_size=32, bits=8, mode="mxfp8", dtype=mx.bfloat16)
         for name in ("w1", "w2", "w3"):
+            role = name
             setattr(ffn.experts, name, quantized(getattr(ffn.experts, name).weight, 4, "mxfp4"))
+            role = "shared_experts"
             setattr(ffn.shared_experts, name, quantized(getattr(ffn.shared_experts, name).weight, 8, "mxfp8"))
     mx.eval(model.parameters())
     return model
 
 
-def test_fused_decode_matches_unfused_block(monkeypatch):
-    model = build()
+def verify_exact(model):
+    """Decode on the verify blocks' kernels, as configure_mtp(True) sets it up."""
+    for layer in model.layers:
+        object.__setattr__(layer, "_omlx_verify_exact", True)
+    return model
+
+
+@pytest.mark.parametrize("fmt,tiles", [("mxfp", False), ("affine", False), ("affine", True)])
+def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles):
+    model = verify_exact(build(fmt=fmt)) if tiles else build(fmt=fmt)
     c = model._config
     assert all(decode_fused.supported(layer, c) for layer in model.layers)
     calls = {"fused": 0}
@@ -105,34 +126,40 @@ def test_fused_decode_matches_unfused_block(monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block", counted)
-    supported = decode_fused.supported
+    supported, fused_on = decode_fused.supported, [False]
+    monkeypatch.setattr(decode_fused, "supported", lambda layer, c: fused_on[0] and supported(layer, c))
     ids = np.random.default_rng(3).integers(3, 60, 24).tolist()
     caches = []
-    monkeypatch.setattr(decode_fused, "supported", lambda layer, c: False)
     for _ in range(2):
         cache = model.make_cache()
         mx.eval(model(mx.array([ids[:17]]), cache=cache))
         caches.append(cache)
-    token, worst = ids[17], 0.0
-    for step in range(6):
-        monkeypatch.setattr(decode_fused, "supported", lambda layer, c: False)
-        reference = model(mx.array([[token]]), cache=caches[0])[0, -1].astype(mx.float32)
-        monkeypatch.setattr(decode_fused, "supported", supported)
-        fused = model(mx.array([[token]]), cache=caches[1])[0, -1].astype(mx.float32)
-        reference, fused = np.asarray(reference), np.asarray(fused)
-        scale = np.abs(reference).max()
-        worst = max(worst, float(np.abs(fused - reference).max() / scale))
-        top2 = np.sort(reference)[-2:]
-        if top2[1] - top2[0] > 0.02 * scale:
-            assert fused.argmax() == reference.argmax()
-        token = ids[18 + step]
+    # The fused pass feeds every layer the unfused layer's input, so rounding differences do
+    # not compound through the layers (on this random model a one-ulp change per embedding row
+    # moves the logits by 30-50%).
+    unfused, worst = [], 0.0
+    block_call = Block.__call__
+
+    def layer_by_layer(self, h, pre, *args, **kwargs):
+        nonlocal worst
+        if not fused_on[0]:
+            unfused.append((h, pre, block_call(self, h, pre, *args, **kwargs)))
+            return unfused[-1][2]
+        h, pre, (expected, _) = unfused.pop(0)
+        out = block_call(self, h, pre, *args, **kwargs)
+        ref = np.asarray(expected.astype(mx.float32))
+        worst = max(worst, float(np.abs(np.asarray(out[0].astype(mx.float32)) - ref).max() / np.abs(ref).max()))
+        return out
+
+    monkeypatch.setattr(Block, "__call__", layer_by_layer)
+    for token in ids[17:23]:
+        for fused_on[0], cache in ((False, caches[0]), (True, caches[1])):
+            mx.eval(model(mx.array([[token]]), cache=cache))
+        assert not unfused
     assert calls["fused"] == 6 * c.n_layers
-    # Free-order rounding differences grow through the layers: on this random model the fused
-    # path stays within 0-3% of the largest logit (seeds 11-13, 4121), while a one-ulp change
-    # of a single element per embedding row already moves the logits by 30-50%. A wrong layout
-    # or kernel selection gives O(1) garbage. Rounding-point conformance per stage is checked
-    # on the released weights by the decode audit, not here.
-    assert worst < 0.08, worst
+    # Free-order rounding moves a layer's output by up to ~2.5% of its largest value (2-8 bit
+    # affine maps); a wrong layout or kernel selection gives O(1) errors.
+    assert worst < 0.05, worst
 
 
 def test_fused_decode_rejects_unsupported_layouts():
@@ -141,11 +168,11 @@ def test_fused_decode_rejects_unsupported_layouts():
     layer = model.layers[1]
     assert decode_fused.supported(layer, c)
     att = model.layers[2].attn
-    packed, scales, biases = mx.quantize(
+    packed, scales = mx.quantize(
         mx.dequantize(att.wq_b.weight, att.wq_b.scales, None, group_size=32, bits=8, mode="mxfp8", dtype=mx.bfloat16),
-        group_size=64, bits=4,
+        group_size=32, bits=4, mode="mxfp4",
     )
-    att.wq_b = QuantizedProjection(packed, scales, 4, "affine", biases=biases, group_size=64)
+    att.wq_b = QuantizedProjection(packed, scales, 4, "mxfp4")
     assert not decode_fused.supported(model.layers[2], c)
     other = model.layers[3].attn
     scaled = (other.wo_a.weight.astype(mx.float32) * 1.01).astype(mx.bfloat16)   # off the FP8 grid
@@ -176,8 +203,9 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
         plan.close()
 
 
+@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
 @pytest.mark.parametrize("batch", [2, 3, 8])
-def test_batched_decode_matches_single_requests(monkeypatch, batch):
+def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
     """On the row kernels (below decode_moe.MMA_MIN_BATCH requests, and in MTP verify blocks),
     B single-token requests through decode_block_nb give each request the logits it gets
     decoding alone (per-request arithmetic is the single-request kernels')."""
@@ -185,7 +213,7 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch):
     from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 
     monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
-    model = build()
+    model = verify_exact(build(fmt=fmt))   # affine batches always run on matrix tiles
     calls = {"nb": 0}
     real = decode_fused.decode_block_nb
 
@@ -240,7 +268,7 @@ def test_batched_fp8_mma_projection_within_fp32_summation_of_exact(monkeypatch, 
 
     names = []
     real_kernel = decode_layer.kernel
-    monkeypatch.setattr(decode_layer, "kernel", lambda name: (names.append(name), real_kernel(name))[1])
+    monkeypatch.setattr(decode_layer, "kernel", lambda name, *f: (names.append(name), real_kernel(name, *f))[1])
     att = build().layers[0].attn
     k = att.wq_a.weight.shape[1] * 4
     x = _aq(np.random.default_rng(nb), nb, k)
@@ -275,12 +303,12 @@ def test_batched_mma_kernels_match_rows_kernels(monkeypatch, nb):
     sin = mx.array(rng.normal(0, 1, (nb, c.rope_head_dim // 2)).astype(np.float32))
     ks = decode_fused._mma_split(nq // 8, c.q_lora_rank // 32)
     tmpl = [("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", nb)]
-    q_mma = DL.kernel("wqb_rope_mma")(
-        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin], template=tmpl + [("KS", ks)],
+    q_mma = DL.kernel("wqb_rope_mma", (decode_moe.MXFP8,))(
+        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, decode_moe._biases(att.wq_b), cos, sin], template=tmpl + [("KS", ks)],
         grid=(nq // 8 * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
         output_shapes=[(nb * nq,)], output_dtypes=[mx.bfloat16])[0]
-    q_rows = DL.kernel("wqb_rope_nb")(
-        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin], template=tmpl,
+    q_rows = DL.kernel("wqb_rope_nb", (decode_moe.MXFP8,))(
+        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, decode_moe._biases(att.wq_b), cos, sin], template=tmpl,
         grid=(nq // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(nb * nq,)], output_dtypes=[mx.bfloat16])[0]
     np.testing.assert_allclose(q_mma.astype(mx.float32), q_rows.astype(mx.float32), rtol=2**-6, atol=1e-6)
@@ -308,7 +336,7 @@ def test_small_batches_keep_rows_kernels(monkeypatch):
 
     names = []
     real_kernel = decode_layer.kernel
-    monkeypatch.setattr(decode_layer, "kernel", lambda name: (names.append(name), real_kernel(name))[1])
+    monkeypatch.setattr(decode_layer, "kernel", lambda name, *f: (names.append(name), real_kernel(name, *f))[1])
     att = build().layers[0].attn
     decode_fused.gemv_fp8_nb(_aq(np.random.default_rng(3), decode_moe.MMA_MIN_BATCH - 1, att.wq_a.weight.shape[1] * 4), att.wq_a, att.wkv)
     assert names == ["gemv_fp8_nb"]
@@ -346,15 +374,16 @@ def test_paired_weight_decoders_are_exact():
     assert np.array_equal(np.signbit(np.asarray(out4)), np.arange(16) >= 8)
 
 
+@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
 @pytest.mark.parametrize("nb", [2, 3, 8])
-def test_batched_moe_matches_single_token_moe(monkeypatch, nb):
+def test_batched_moe_matches_single_token_moe(monkeypatch, nb, fmt):
     """Without matrix tiles, each token of the batched MoE gets the single-token kernels'
     output, routing indices and weights bit for bit, also when tokens share experts: the
     routed kernels then dispatch every token of a row block together (see _UP_NB)."""
     from omlx.patches.deepseek_v41 import decode_moe
 
     monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
-    model = build(n_routed_experts=16, n_activated_experts=4)   # >2 slots: their sum order shows
+    model = build(fmt=fmt, n_routed_experts=16, n_activated_experts=4)   # >2 slots: their sum order shows
     c = model._config
     rng = np.random.default_rng(23 + nb)
     x = rng.normal(0, 1, (nb, c.dim)).astype(np.float32)
@@ -373,9 +402,9 @@ def test_batched_moe_matches_single_token_moe(monkeypatch, nb):
 
 @pytest.mark.parametrize("batch", [2, 8])
 def test_batched_engram_projects_each_request_like_a_single_request(batch):
-    """Batched decode feeds Engram one row per request. Each row is projected on its own
-    (mxfp8_gemv, as when the request decodes alone); a B-row quantized_matmul rounds its fp32
-    sums differently, which made a request's tokens depend on its batch."""
+    """Batched decode feeds Engram one row per request. Each row gets the one-row arithmetic
+    (mxfp8_gemv_each, as when the request decodes alone); a B-row quantized_matmul rounds its
+    fp32 sums differently, which made a request's tokens depend on its batch."""
     from test_deepseek_v41 import tiny
 
     from omlx.patches.deepseek_v41.engram import Engram
@@ -404,13 +433,14 @@ def test_batched_engram_projects_each_request_like_a_single_request(batch):
     assert mx.array_equal(batched, single).item()
 
 
+@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
 @pytest.mark.parametrize("prompt_length", [11, 2])   # full window (batched attention) / filling
 @pytest.mark.parametrize("rows,accepted", [(2, 0), (3, 2), (4, 1), (6, 3)])
-def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted, prompt_length):
+def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted, prompt_length, fmt):
     """An MTP verify block through the fused kernels gives every token bit for bit the
     logits of decoding it alone, and after a partial rollback the cache continues exactly
     like one that decoded only the accepted tokens."""
-    model = build(vocab_size=4096)   # the vocab head kernel (per-row exact) needs >= 4096 rows
+    model = verify_exact(build(fmt=fmt, vocab_size=4096))   # the vocab head kernel (per-row exact) needs >= 4096 rows
     calls = []
     real = decode_fused.decode_block_verify
 
@@ -419,6 +449,9 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block_verify", counted)
+    blocks = []
+    real_block = decode_fused.compress_index_block
+    monkeypatch.setattr(decode_fused, "compress_index_block", lambda *a: (blocks.append(1), real_block(*a))[1])
     rng = np.random.default_rng(29 + rows)
     prompt = rng.integers(3, 60, prompt_length).tolist()
     tokens = rng.integers(3, 60, rows + 1).tolist()   # confirmed token, drafts, next step
@@ -430,6 +463,8 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
     for j in range(rows):
         assert mx.array_equal(got[0, j], expected[j]).item(), f"row {j}"
     assert len(calls) == model._config.n_layers
+    # A full window with enough index keys runs the compressor and indexer once per block.
+    assert len(blocks) == (4 if prompt_length == 11 else 0)
     assert model.mtp_partial_rollback(verified, accepted, rows - 1)
     for t in tokens[: accepted + 1]:
         mx.eval(model(mx.array([[t]]), cache=accepted_only))
@@ -438,7 +473,8 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
     assert mx.array_equal(model(nxt, cache=verified), model(nxt, cache=accepted_only)).item()
 
 
-def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch):
+@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
+def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch, fmt):
     """DSpark speculation over the fused decode kernels reproduces greedy decoding token for
     token (verify blocks are token-exact, rejected drafts roll back exactly)."""
     from mlx_lm.generate import BatchGenerator
@@ -447,6 +483,7 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch):
 
     batch_generator.apply()
     model = build(
+        fmt=fmt,
         vocab_size=4096,
         preserve_mtp=True,
         n_mtp_layers=1,
@@ -456,8 +493,12 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch):
         dspark_markov_rank=32,
     )
     prompt = [3, 4, 5, 6, 7, 8, 9, 10, 11]
+    model.configure_mtp(True, 3)
     expected, cache = [], model.make_cache()
-    ids = mx.array([prompt])
+    # The generator prefills prompt[:-1] in steps of 4; other prefill chunks round differently.
+    for s in range(0, len(prompt) - 1, 4):
+        model(mx.array([prompt[s : min(s + 4, len(prompt) - 1)]]), cache=cache)
+    ids = mx.array([prompt[-1:]])
     for _ in range(24):
         token = int(mx.argmax(model(ids, cache=cache)[0, -1]).item())
         expected.append(token)
@@ -470,7 +511,6 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block_verify", counted)
-    model.configure_mtp(True, 3)
     generator = BatchGenerator(model, max_tokens=24, prefill_step_size=4, sampler=lambda logits: mx.argmax(logits, -1))
     result = []
     try:
@@ -569,7 +609,7 @@ for r, g in zip(reference, got):
     error = (mx.abs(g - r).max() / mx.abs(r.astype(mx.float32)).max()).item()
     assert error < 0.02, error
 
-# Pipeline. Layer 4's affine wo_b is a layout the fused kernels do not cover,
+# Pipeline. Layer 4's MXFP4 wo_b is a layout the fused kernels do not cover,
 # so only rank 0's stage [3, 5) lacks fused decode.
 def mixed():
     model = t.build()
@@ -577,8 +617,8 @@ def mixed():
     weight = mx.dequantize(
         att.wo_b.weight, att.wo_b.scales, None, group_size=32, bits=8, mode="mxfp8"
     )
-    packed, scales, biases = mx.quantize(weight, group_size=64, bits=4)
-    att.wo_b = QuantizedProjection(packed, scales, 4, "affine", biases, group_size=64)
+    packed, scales = mx.quantize(weight, group_size=32, bits=4, mode="mxfp4")
+    att.wo_b = QuantizedProjection(packed, scales, 4, "mxfp4")
     return model
 
 def pipeline_run(model):
