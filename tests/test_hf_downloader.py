@@ -1321,7 +1321,7 @@ class TestHFDownloaderRoutes:
         assert result["disk"]["free_bytes"] > 0
 
     @pytest.mark.asyncio
-    async def test_list_models(self, model_dir_with_models):
+    async def test_list_models(self, model_dir_with_models, monkeypatch):
         """Test the list_hf_models endpoint logic."""
         from omlx.admin.routes import list_hf_models, _get_global_settings
 
@@ -1341,6 +1341,7 @@ class TestHFDownloaderRoutes:
 
         import omlx.admin.routes as routes_module
 
+        monkeypatch.setattr(routes_module, "_get_engine_pool", lambda: None)
         original = routes_module._get_global_settings
         routes_module._get_global_settings = lambda: mock_settings
 
