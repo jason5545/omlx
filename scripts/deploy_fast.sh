@@ -82,7 +82,7 @@ fi
 
 # 印 server.log 最近 5 分鐘的摘要，再用 /api/status 判斷有沒有進行中的請求。
 # server.log 只在請求結束時寫一行，看不到進行中的請求，所以以 active/waiting 為準；
-# 最後一行 log 在 30 秒內也當作忙碌，避免切在連續請求中間。
+# 最後一筆非拒絕請求 log 在 30 秒內也當作忙碌，避免切在連續請求中間；4xx 拒絕不算。
 # 回傳 0 = 閒置（或 server 沒在跑），1 = 忙碌，2 = 查不到狀態。
 idle_check() {
   "${PY}" -I - "${SERVER_LOG}" <<'PY'
@@ -105,9 +105,10 @@ for line in lines:
     if now - ts <= dt.timedelta(minutes=5):
         recent.append((ts, line))
 finished = sum(bool(re.search(r"tokens in [0-9.]+s", line)) for _, line in recent)
-last_age = (now - recent[-1][0]).total_seconds() if recent else None
+activity = [(ts, line) for ts, line in recent if not re.search(r"→ 4\d\d:", line)]
+last_age = (now - activity[-1][0]).total_seconds() if activity else None
 print(f"server.log 最近 5 分鐘：{len(recent)} 行，完成的請求 {finished} 筆"
-      + (f"，最後一行在 {last_age:.0f} 秒前" if recent else ""))
+      + (f"，最後一行在 {last_age:.0f} 秒前" if last_age is not None else ""))
 for _, line in recent[-3:]:
     print("  " + line[:200])
 
