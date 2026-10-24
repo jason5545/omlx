@@ -183,7 +183,12 @@ from .api.decisions import (
 )
 from .api.decisions_models import DecisionRequest
 from .api.systemone_models import SystemOneRequest
-from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
+from .api.thinking import (
+    ThinkingParser,
+    extract_thinking,
+    leading_thinking_only,
+    prompt_opens_thinking,
+)
 from .api.tool_calling import (
     ToolCallExtraction,
     ToolCallStreamSegment,
@@ -5482,6 +5487,7 @@ async def create_chat_completion(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
                 raw_text,
+                leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
                 start_in_thinking=(
                     output.finish_reason == "length"
@@ -6398,6 +6404,10 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+def _leading_thinking_only(engine: BaseEngine) -> bool:
+    return leading_thinking_only(getattr(engine, "tokenizer", None))
+
+
 def _chat_prompt_opens_thinking(
     engine: BaseEngine,
     messages: list,
@@ -6486,7 +6496,9 @@ def _nonstream_recovery_text(
     # Judge the text the stream filter would see, before special tokens are
     # cleaned out of it.
     _, generated = extract_thinking(
-        output.text or "", truncated=output.finish_reason == "length"
+        output.text or "",
+        truncated=output.finish_reason == "length",
+        leading_only=leading_thinking_only(tokenizer),
     )
     probe = ToolCallStreamFilter(tokenizer, tools=tools)
     probe.feed(generated)
@@ -6620,7 +6632,10 @@ async def stream_chat_completion(
             )
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    leading_only = _leading_thinking_only(engine)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking, leading_only=leading_only
+    )
 
     def mark_visible_delta() -> None:
         nonlocal first_visible_time
@@ -6966,6 +6981,7 @@ async def stream_chat_completion(
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         extraction = extract_tool_calls_with_thinking(
@@ -7330,7 +7346,10 @@ async def stream_anthropic_messages(
             )
     except Exception as exc:
         logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    leading_only = _leading_thinking_only(engine)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking, leading_only=leading_only
+    )
     thinking_block_started = False
     text_block_started = False
     block_index = 0
@@ -7574,6 +7593,7 @@ async def stream_anthropic_messages(
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         extraction = extract_tool_calls_with_thinking(
@@ -8123,6 +8143,7 @@ async def create_anthropic_message(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
                 raw_text,
+                leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
                 start_in_thinking=(
                     output.finish_reason == "length"
@@ -8917,6 +8938,7 @@ async def create_response(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
                 raw_text,
+                leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
                 start_in_thinking=(
                     output.finish_reason == "length"
@@ -9095,7 +9117,10 @@ async def stream_responses_api(
                 )
         except Exception as exc:
             logger.debug("Could not detect Responses stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    leading_only = _leading_thinking_only(engine)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking, leading_only=leading_only
+    )
     stream_state = stream_state or _ResponsesStreamState()
     seq = 0
 
@@ -9486,6 +9511,7 @@ async def stream_responses_api(
     elif has_tools and accumulated_text:
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         extraction = extract_tool_calls_with_thinking(
@@ -9526,6 +9552,7 @@ async def stream_responses_api(
         # No tools — use raw accumulated text minus thinking.
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
