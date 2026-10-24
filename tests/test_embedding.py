@@ -2543,4 +2543,3 @@ class TestMlxVlmEmbeddingGemma2:
         model.embed([{"text": "a cat", "image": IMAGE_DATA_URI}])
 
         assert "audio_kwargs" not in processor.apply_chat_template.call_args.kwargs
-
