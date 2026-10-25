@@ -143,6 +143,10 @@ class Omlx < Formula
     # Install the spaCy English model required by misaki for Kokoro TTS.
     # Homebrew's cached resource path is hash-prefixed, which pip rejects
     # as an invalid wheel filename. Copy it back to the canonical basename.
+    # preshed 3.0.14 (2026-10-24) breaks spaCy 3.8.16's tokenizer load with
+    # "OverflowError: Python int too large to convert to C ssize_t" in
+    # _flush_specials. Hold it below 3.0.14 until a fixed release ships.
+    system(*pip_install, "preshed<3.0.14")
     spacy_model_wheel = buildpath/"en_core_web_sm-3.8.0-py3-none-any.whl"
     cp resource("en-core-web-sm").cached_download, spacy_model_wheel
     system libexec/"bin/pip", "install", "--no-deps",
