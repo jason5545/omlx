@@ -609,26 +609,24 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
         return n
 
     def extract(self, idx):
+        # Views of the row, not copies. A finished request's cache is only
+        # read: the store slices its new blocks out of it. A contiguous copy
+        # of the whole prefix (about 5.5 GB at 200k tokens) held up every
+        # reply. MLX never writes into a buffer another array still
+        # references, and the extracted cache's first append grows into a new
+        # buffer, so the views stay exact.
         cache = QSAKVCache()
         if self.keys is not None:
-            cache.keys = mx.contiguous(
-                self.keys[idx : idx + 1, :, : self.offset, :]
-            )
-            cache.values = mx.contiguous(
-                self.values[idx : idx + 1, :, : self.offset, :]
-            )
+            cache.keys = self.keys[idx : idx + 1, :, : self.offset, :]
+            cache.values = self.values[idx : idx + 1, :, : self.offset, :]
             cache.offset = self.offset
             cache._geometric_capacity_managed = False
         if self.index_keys is not None:
-            index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
+            index_keys = self.index_keys[idx : idx + 1]
             if self.index_position_ids.ndim == 3:
-                index_position_ids = mx.contiguous(
-                    self.index_position_ids[:, idx : idx + 1]
-                )
+                index_position_ids = self.index_position_ids[:, idx : idx + 1]
             else:
-                index_position_ids = mx.contiguous(
-                    self.index_position_ids[idx : idx + 1]
-                )
+                index_position_ids = self.index_position_ids[idx : idx + 1]
             cache._restore_indexer_state(index_keys, index_position_ids)
         return cache
 
@@ -1265,27 +1263,27 @@ class BatchQSAKVCache:
             )
 
     def extract(self, idx):
+        # Views of the row, as in QSAKVCache.extract. ``kv_cache.extract``
+        # would copy the row into a fresh ladder-capacity bank first.
         cache = QSAKVCache()
-        base = self.kv_cache.extract(idx)
-        cache.keys, cache.values, cache.offset = base.keys, base.values, base.offset
-        # Caller-sized copy, as in QSAKVCache.extract: its first append rounds
-        # to one step instead of doubling the row.
+        kv = self.kv_cache
+        padding = int(self.left_padding[idx].item())
+        cache.keys = kv.keys[idx : idx + 1, :, padding : kv._idx]
+        cache.values = kv.values[idx : idx + 1, :, padding : kv._idx]
+        cache.offset = kv._idx - padding
         cache._geometric_capacity_managed = False
         if self.index_keys is not None:
-            padding = int(self.left_padding[idx].item())
-            cache.index_keys = mx.contiguous(
-                self.index_keys[idx : idx + 1, padding : self.index_offset]
-            )
+            cache.index_keys = self.index_keys[
+                idx : idx + 1, padding : self.index_offset
+            ]
             if self.index_position_ids.ndim == 3:
-                cache.index_position_ids = mx.contiguous(
-                    self.index_position_ids[
-                        :, idx : idx + 1, padding : self.index_offset
-                    ]
-                )
+                cache.index_position_ids = self.index_position_ids[
+                    :, idx : idx + 1, padding : self.index_offset
+                ]
             else:
-                cache.index_position_ids = mx.contiguous(
-                    self.index_position_ids[idx : idx + 1, padding : self.index_offset]
-                )
+                cache.index_position_ids = self.index_position_ids[
+                    idx : idx + 1, padding : self.index_offset
+                ]
         return cache
 
     @classmethod
