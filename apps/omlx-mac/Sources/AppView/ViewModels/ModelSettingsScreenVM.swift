@@ -39,9 +39,10 @@ final class ModelSettingsScreenVM {
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, ssdNgramOffload
-        case deepseekV41CedPrefill, qwen4GdnDecodeWideProj
+        case deepseekV41CedPrefill, qwen4GdnDecodeWideProj, activationFp16
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
+        case limitGpuPower, gpuPowerLimitWatts
         case forceSampling, isPinned, isFavorite
         case trustRemoteCode, externalEngine
         case embeddingAudioEnabled, embeddingAudioMaxSeconds
@@ -264,6 +265,7 @@ final class ModelSettingsScreenVM {
     var deepseekV41EngramSsdOffloadForced: Bool = false
     var deepseekV41CedPrefillEnabled: Bool = false
     var qwen4GdnDecodeWideProj: Bool = false
+    var activationFp16Enabled: Bool = false
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -272,6 +274,8 @@ final class ModelSettingsScreenVM {
     /// sensible number instead of zero (which the server interprets as
     /// "disabled").
     var toolResultLimitTokens: String = "4096"
+    var limitGpuPower: Bool = false
+    var gpuPowerLimitWatts: String = "10"
     var forceSampling: Bool = false
     var isPinned: Bool = false
     var isFavorite: Bool = false
@@ -477,6 +481,9 @@ final class ModelSettingsScreenVM {
     /// Embedding requests without max_length truncate input to the context window.
     var showsEmbeddingContextWindow: Bool { model?.modelType == "embedding" }
 
+    /// Rerank requests without max_length use the context window as their limit.
+    var showsRerankerContextWindow: Bool { model?.modelType == "reranker" }
+
     /// Acceleration, Memory Saving and Experimental only apply to the MLX
     /// LLM engines.
     var showsEnginePages: Bool { isLLMLike && !isDiffusionModel }
@@ -544,17 +551,24 @@ final class ModelSettingsScreenVM {
     }
 
     var embeddingAudioSupported: Bool { model?.embeddingAudioSupported == true }
+    var gpuPowerLimitSupported: Bool { model?.gpuPowerLimitSupported == true }
+    /// The watt value when it is in the range the server accepts.
+    private var validGpuPowerLimitWatts: Int? {
+        Int(gpuPowerLimitWatts).flatMap { (2...1000).contains($0) ? $0 : nil }
+    }
 
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
         case .enableThinking, .ssdNgramOffload,
-             .deepseekV41CedPrefill, .qwen4GdnDecodeWideProj,
+             .deepseekV41CedPrefill, .qwen4GdnDecodeWideProj, .activationFp16,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
             return true
+        case .limitGpuPower, .gpuPowerLimitWatts:
+            return false
         case .forceSampling, .reasoningParser:
             return true
         case .turboquantKvEnabled, .turboquantKvScheme, .turboquantKvBits:
@@ -725,6 +739,7 @@ final class ModelSettingsScreenVM {
                     || (s?.deepseekV41EngramSsdOffload ?? false)
                 self.deepseekV41CedPrefillEnabled = s?.deepseekV41CedPrefillEnabled ?? false
                 self.qwen4GdnDecodeWideProj = s?.qwen4GdnDecodeWideProj ?? false
+                self.activationFp16Enabled = s?.activationFp16Enabled ?? false
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -732,6 +747,13 @@ final class ModelSettingsScreenVM {
                     self.toolResultLimitTokens = String(n)
                 } else {
                     self.toolResultLimitTokens = "4096"
+                }
+                if let watts = s?.gpuPowerLimitW, watts > 0 {
+                    self.limitGpuPower = true
+                    self.gpuPowerLimitWatts = String(watts)
+                } else {
+                    self.limitGpuPower = false
+                    self.gpuPowerLimitWatts = "10"
                 }
                 self.forceSampling = s?.forceSampling ?? false
                 self.isPinned = s?.isPinned ?? false
@@ -884,6 +906,7 @@ final class ModelSettingsScreenVM {
         case .qwen4GdnDecodeWideProj:
             guard isQwen4Exp else { return }
             patch.qwen4GdnDecodeWideProj = qwen4GdnDecodeWideProj
+        case .activationFp16:          patch.activationFp16Enabled = activationFp16Enabled
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:
@@ -900,6 +923,11 @@ final class ModelSettingsScreenVM {
             guard limitToolResults else { return }
             guard let n = Int(toolResultLimitTokens), n > 0 else { return }
             patch.maxToolResultTokens = n
+        case .limitGpuPower:
+            patch.gpuPowerLimitW = limitGpuPower ? (validGpuPowerLimitWatts ?? 10) : 0
+        case .gpuPowerLimitWatts:
+            guard limitGpuPower, let n = validGpuPowerLimitWatts else { return }
+            patch.gpuPowerLimitW = n
         case .forceSampling:           patch.forceSampling = forceSampling
         case .isPinned:                patch.isPinned = isPinned
         case .isFavorite:              patch.isFavorite = isFavorite
@@ -1319,7 +1347,20 @@ final class ModelSettingsScreenVM {
     /// Streamed experts cannot back a speculative decoder, except the
     /// Lightning MTP head of families that keep it resident. Mirrors
     /// `validate_moe_expert_offload` on the server.
+    /// The server rejects the recast together with MoE expert offload.
+    var activationFp16ConflictReason: String? {
+        guard moeExpertOffloadEnabled else { return nil }
+        return String(localized: "settings.advanced.activation_fp16.conflict.moe_offload",
+                      defaultValue: "Disable MoE Expert Offload before enabling Float16 Activations.",
+                      comment: "Sublabel shown when the float16 activation recast can't be enabled because MoE expert offload is on")
+    }
+
     var moeExpertOffloadConflictReason: String? {
+        if activationFp16Enabled {
+            return String(localized: "settings.moe_offload.conflict.activation_fp16",
+                          defaultValue: "Disable Float16 Activations before enabling MoE Expert Offload.",
+                          comment: "Tooltip / sublabel shown when MoE expert offload can't be enabled because the float16 activation recast is on")
+        }
         if mtpEnabled && model?.moeOffloadAllowsMtp != true {
             return String(localized: "settings.moe_offload.conflict.mtp",
                           defaultValue: "Disable Lightning MTP before enabling MoE Expert Offload.",
@@ -1544,12 +1585,17 @@ final class ModelSettingsScreenVM {
                                     defaultValue: "Trust Remote Code",
                                     comment: "Row label for the security-sensitive trust-remote-code toggle"))
             }
+            if isLLMLike && !isDiffusionModel && thinkingBudgetEnabled {
+                items.append(String(localized: "settings.advanced.thinking_budget.label",
+                                    defaultValue: "Thinking Budget",
+                                    comment: "Row label for the thinking budget field"))
+            }
+            if isLLMLike && limitGpuPower {
+                items.append(String(localized: "settings.summary.gpu_power_limit",
+                                    defaultValue: "GPU \(gpuPowerLimitWatts) W",
+                                    comment: "GPU power limit in the Advanced row value; placeholder is the watt value"))
+            }
             if isLLMLike && !isDiffusionModel {
-                if thinkingBudgetEnabled {
-                    items.append(String(localized: "settings.advanced.thinking_budget.label",
-                                        defaultValue: "Thinking Budget",
-                                        comment: "Row label for the thinking budget field"))
-                }
                 if limitToolResults {
                     items.append(String(localized: "settings.summary.tool_result_limit",
                                         defaultValue: "Tool Result Limit",
@@ -1684,6 +1730,9 @@ final class ModelSettingsScreenVM {
                 limitToolResults ? (Int(toolResultLimitTokens) ?? 4096) : 0
             )
         }
+        out[ProfileSettingsKey.gpuPowerLimitW] = AnyCodable(
+            limitGpuPower ? (Int(gpuPowerLimitWatts) ?? 10) : 0
+        )
 
         // Universal — chat template kwargs. AnyCodable's encode walks a
         // [String: AnyCodable] / [AnyCodable] explicitly, so nest those
@@ -2150,6 +2199,12 @@ final class ModelSettingsScreenVM {
     }
 
     private func validateWorkingSettings() -> Bool {
+        if limitGpuPower, validGpuPowerLimitWatts == nil {
+            lastError = String(localized: "settings.advanced.gpu_power_limit.range",
+                               defaultValue: "GPU power limit must be between 2 and 1000 W.",
+                               comment: "Error when the GPU power limit is outside the accepted range")
+            return false
+        }
         if moeExpertOffloadSupported, moeExpertOffloadEnabled,
            moeExpertOffloadResidentFraction == nil {
             lastError = moeResidentRangeError

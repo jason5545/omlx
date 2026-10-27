@@ -53,6 +53,12 @@ def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -
         raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
     if not settings.get("moe_expert_offload_enabled"):
         return
+    # Offload slots live outside the module tree, so the recast leaves them bf16.
+    if settings.get("activation_fp16_enabled"):
+        raise ValueError(
+            "MoE expert offload cannot be combined with the float16 activation "
+            "recast; disable one of them first."
+        )
     # VLM MTP and DFlash have no offload-aware draft path at all.
     if any(settings.get(key) for key in ("vlm_mtp_enabled", "dflash_enabled")):
         raise ValueError(
@@ -252,6 +258,8 @@ class ModelSettings:
         enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
         thinking_budget_enabled: Whether a thinking token budget is active.
         thinking_budget_tokens: Max tokens for thinking/reasoning.
+        gpu_power_limit_w: System-wide GPU power cap in watts while this model
+            generates (None = no cap).
         reasoning_parser: xgrammar builtin name: "qwen", "harmony", "llama", etc.
         guided_grammar_enabled: Whether a default guided grammar is active.
         guided_grammar: Default EBNF grammar for constrained decoding.
@@ -388,6 +396,10 @@ class ModelSettings:
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
     deepseek_v41_ced_prefill_enabled: bool = False
+    # Recast the checkpoint's bfloat16 leaves (scales, norms, embeddings) to
+    # float16 after load, so the forward runs on the GPU's native float16 path
+    # instead of the emulated bfloat16 one. Quantized payloads are untouched.
+    activation_fp16_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
@@ -396,6 +408,7 @@ class ModelSettings:
     )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
+    gpu_power_limit_w: Optional[int] = None
     reasoning_parser: Optional[str] = (
         None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
     )

@@ -33,6 +33,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "cache_reasoning_output",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
+    "gpu_power_limit_w",
     "reasoning_parser",
     "guided_grammar_enabled",
     "guided_grammar",
@@ -107,6 +108,9 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "deepseek_v41_engram_ssd_offload",
         # Architecture-level prefill strategy; explicit per model.
         "deepseek_v41_ced_prefill_enabled",
+        # Only meaningful for checkpoints that carry bfloat16 leaves; the
+        # dashboard gates it per model, so a profile must not carry it over.
+        "activation_fp16_enabled",
         # Gain and memory cost depend on the checkpoint's GDN recipe.
         "qwen4_gdn_decode_wide_proj",
         # Which engine serves the model depends on what this Mac has installed.

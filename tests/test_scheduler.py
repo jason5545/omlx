@@ -29,6 +29,7 @@ from unittest.mock import MagicMock, call, patch
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import BatchKVCache, CacheList, KVCache
+from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer, SPMStreamingDetokenizer
 
 import omlx.scheduler as scheduler_module
 from omlx.adapter import output_parser as output_parser_module
@@ -7198,6 +7199,47 @@ class TestOutputParserSmoke:
         assert "<channel|>" not in full_stream
         assert full_stream == "<think>\nreasoning</think>\nanswer"
 
+    def test_gemma4_session_reports_one_logprob_per_token(self, mock_model):
+        mock_model.config.model_type = "gemma4"
+        tokens = {11: "<|channel>", 12: "thought\n", 13: "r", 14: "<channel|>"}
+        tokens.update({15: "answer", 16: "<turn|>"})
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=self._GemmaTokenizer(tokens),
+            config=SchedulerConfig(model_name="google/gemma-4b"),
+        )
+        request = Request(
+            request_id="gemma-req",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=6, logprobs=True, top_logprobs=2),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        def response(token):
+            logits = mx.where(mx.arange(32) == token, 4.0, -4.0)
+            row = (logits - mx.logsumexp(logits)).astype(mx.bfloat16)
+            finish = "length" if token == 16 else None
+            return SimpleNamespace(
+                uid=99, token=token, finish_reason=finish, logprobs=row
+            )
+
+        outputs, _ = scheduler._process_batch_responses([response(t) for t in tokens])
+
+        entries = [entry for output in outputs for entry in output.logprobs or []]
+        assert [entry.token_id for entry in entries] == list(tokens)
+        assert entries[4].text == "answer"
+        for entry in entries:
+            assert entry.logprob == pytest.approx(-0.0104, abs=0.002)
+            assert [alt.token_id for alt in entry.top][0] == entry.token_id
+            assert len(entry.top) == 2
+
     def test_gemma4_prefilled_thought_after_tool_response(self, mock_model):
         """Tool continuations open the thought channel in the prompt.
 
@@ -9196,3 +9238,23 @@ def test_post_completion_clear_keeps_a_reusable_pool(pool_gb, cleared):
     holder._periodic_clear_threshold_bytes = lambda: scheduler_module.Scheduler._periodic_clear_threshold_bytes(holder)
     with patch.object(scheduler_module.mx, "get_cache_memory", return_value=pool_gb * 1024**3):
         assert scheduler_module.Scheduler._deferred_clear_needed(holder) is cleared
+
+
+def test_token_bytes_follow_the_detokenizer_vocab():
+    class Vocab:
+        def __init__(self, tokens):
+            self.tokens = tokens
+
+        def __len__(self):
+            return len(self.tokens)
+
+        def convert_ids_to_tokens(self, ids):
+            return [self.tokens[i] for i in ids]
+
+    # U+0120 and U+00EC are the byte-level BPE spellings of 0x20 and 0xEC.
+    for detokenizer in (
+        SPMStreamingDetokenizer(Vocab(["\u2581hi", "<0xEC>"])),
+        BPEStreamingDetokenizer(Vocab(["\u0120hi", "\u00ec"])),
+    ):
+        assert scheduler_module._token_bytes(detokenizer, None, 0) == b" hi"
+        assert scheduler_module._token_bytes(detokenizer, None, 1) == b"\xec"

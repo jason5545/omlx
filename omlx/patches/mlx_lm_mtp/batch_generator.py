@@ -69,11 +69,39 @@ def _row_exact_verify(model: Any) -> bool:
     return False
 
 
+def _exact_verify_host(model: Any) -> Optional[Any]:
+    """Return the model object whose verify forward must be decode-exact.
+
+    Embedded DSpark hosts always qualify. A Lightning MTP head on a model
+    whose module ships the DeepSeek exact-verify kernels (``set_dspark_verify_armed``,
+    i.e. ``deepseek_v4``) qualifies too: its multi-row verify would otherwise
+    run MLX's M>1 kernels, whose reduction order differs from one-row decode
+    at rounding level and flips greedy argmax at exact ties.
+    """
+    host = _dspark_host(model)
+    if host is not None:
+        return host
+    import sys
+
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    for candidate in candidates:
+        if not getattr(candidate, "_omlx_mtp_decode_enabled", False):
+            continue
+        module = sys.modules.get(type(candidate).__module__)
+        if getattr(module, "set_dspark_verify_armed", None) is not None:
+            return candidate
+    return None
+
+
 def _set_dspark_target_verify(model: Any, flag: bool) -> None:
     try:
         import sys
 
-        host = _dspark_host(model)
+        host = _exact_verify_host(model)
         if host is None:
             return
         module = sys.modules.get(type(host).__module__)
@@ -2263,21 +2291,24 @@ def _call_backbone_impl(
         kwargs["n_confirmed"] = n_confirmed
     if capture_layer_ids:
         kwargs["capture_layer_ids"] = list(capture_layer_ids)
-    dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
+    # Decode-exact verify: embedded DSpark hosts and Lightning heads on
+    # deepseek_v4 (see _exact_verify_host) run every projection and attention
+    # row with one-row decode arithmetic, so greedy MTP output equals MTP-off.
+    exact_verify = bool(n_confirmed and _exact_verify_host(model) is not None)
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
     # DeepSeek target on its architecture-native quantized linear path.
     # Row-exact runs each row as a one-row matvec. Batched decode has no
     # one-row baseline, so B > 1 verify keeps the multi-row kernels.
     _set_verify_qmm_armed(
-        not dspark_verify,
+        not exact_verify,
         row_exact=inputs.shape[0] == 1 and _row_exact_verify(model),
     )
-    _set_dspark_target_verify(model, dspark_verify)
+    _set_dspark_target_verify(model, exact_verify)
     try:
         result = model(inputs, **kwargs)
     finally:
-        if dspark_verify:
+        if exact_verify:
             _set_dspark_target_verify(model, False)
         _set_verify_qmm_armed(False)
         _rollback_mod.set_undo_armed(False)
@@ -4019,6 +4050,8 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
         _bump_emit_stat(state, source)
         return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
+    # Another request's prefill may have cleared the shared adapter state.
+    _set_singleton_mrope_delta(gen_batch)
     _run_verify_cycle(gen_batch, state)
     if not state.queue:
         # Verify cycle should always populate the queue with at least the
@@ -4328,6 +4361,19 @@ def _predraft(gen_batch, state, drafter, captured, host_arr, m_arr, anchor) -> b
     return bool(predraft(gen_batch, state, captured, m_arr + 1, anchor))
 
 
+def _max_verify_rows(model: Any) -> Optional[int]:
+    """The target's ``_omlx_mtp_max_verify_rows`` cap, or None without one."""
+    for candidate in (
+        model,
+        getattr(model, "_language_model", None),
+        getattr(model, "language_model", None),
+    ):
+        rows = getattr(candidate, "_omlx_mtp_max_verify_rows", None)
+        if rows is not None:
+            return int(rows)
+    return None
+
+
 def _context_copy_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -4345,8 +4391,12 @@ def _context_copy_drafts(
     of exactly that many tokens replaces the drafter's block.
     """
     if state.context_copy is None:
+        # A wide copy verifies MAX_COPY + 1 rows, so it must fit the target's
+        # verify cap (GLM-5.3's indexer pool rolls back at most 8 rows).
+        cap = _max_verify_rows(gen_batch.model)
         state.context_copy = _context_copy.ContextCopy(
             wide_window=_row_exact_verify(gen_batch.model)
+            and (cap is None or cap > _context_copy.MAX_COPY)
         )
     copier = state.context_copy
     state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)
@@ -4737,10 +4787,8 @@ def _run_verify_cycle_chain(
         finish_t0 = time.perf_counter()
         # --- commit: queue emits + cache rollback ---
         for j in range(m):
-            # Block drafters carry no draft distribution; the target row is
-            # the distribution the accepted token was verified against.
-            draft_lp = state.draft_lps[j] if state.draft_lps else combined_lp[j]
-            state.queue.append((int(draft_ids[j]), draft_lp, "draft"))
+            # Report the target row each accepted draft was verified against.
+            state.queue.append((int(draft_ids[j]), combined_lp[j], "draft"))
         state.queue.append(
             (int(emit_last_id), emit_last_lp, "bonus" if m == k else "verify")
         )
@@ -5031,10 +5079,9 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
             prev_buf=prev_draft if procs is not None else None,
             stats=state.stats,
         )
-        # Queue the two emitted tokens. Per PR 990: the accepted draft uses
-        # the *MTP head's* original draft distribution as its logprobs; the
-        # bonus uses the verify forward's bonus distribution.
-        state.queue.append((draft_id, state.draft_lp, "draft"))
+        # Queue both tokens with the target rows they were verified against,
+        # the same row the reject path reports.
+        state.queue.append((draft_id, verify_lp_2d.squeeze(0), "draft"))
         state.queue.append((bonus_id, bonus_lp_2d.squeeze(0), "bonus"))
         state.next_main = _ensure_uint32(bonus_tok)
         state.draft_tok = new_draft

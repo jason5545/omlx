@@ -32,6 +32,7 @@
 import Foundation
 import AppKit
 import Darwin
+import IOKit
 
 struct AutoRestartBudget {
     let maxAttempts: Int
@@ -392,11 +393,12 @@ final class ServerProcess: @unchecked Sendable {
         let pid = proc.processIdentifier
         kill(pid, SIGTERM)
         let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if kill(pid, 0) != 0 { return }     // process gone
+        while Date() < deadline, kill(pid, 0) == 0 {
             usleep(100_000)                     // 100 ms
         }
-        kill(pid, SIGKILL)
+        if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+        // The app is quitting, so the async exit handler may never run.
+        removeLeftoverGPUPowerCap(serverPID: pid)
     }
 
     // MARK: - Internal — spawn
@@ -428,7 +430,7 @@ final class ServerProcess: @unchecked Sendable {
         proc.standardError  = handle
         proc.terminationHandler = { [weak self] term in
             DispatchQueue.main.async {
-                self?.handleProcessExit(code: term.terminationStatus)
+                self?.handleProcessExit(code: term.terminationStatus, pid: term.processIdentifier)
             }
         }
 
@@ -444,13 +446,14 @@ final class ServerProcess: @unchecked Sendable {
         startHealthCheckLoop()
     }
 
-    private func handleProcessExit(code: Int32) {
+    private func handleProcessExit(code: Int32, pid: Int32) {
         let wasExpectingExit = expectingExit
         expectingExit = false
         attachedExternally = false
         attachedOwnerPID = nil
         process = nil
         closeLog()
+        removeLeftoverGPUPowerCap(serverPID: pid)
         Task { @MainActor [weak self] in self?.presentStartupNotice() }
 
         if wasExpectingExit {
@@ -466,6 +469,24 @@ final class ServerProcess: @unchecked Sendable {
         default:
             // Unexpected — log and stop.
             update(.stopped)
+        }
+    }
+
+    /// A killed server cannot remove its system-wide GPU power cap. While a
+    /// cap is set the server keeps this marker with its PID
+    /// (omlx/utils/gpu_power.py); a marker from another server is left alone.
+    private func removeLeftoverGPUPowerCap(serverPID: Int32) {
+        let marker = basePath.appendingPathComponent("gpu_power_cap.active")
+        guard let owner = try? String(contentsOf: marker, encoding: .utf8),
+              Int32(owner.trimmingCharacters(in: .whitespacesAndNewlines)) == serverPID
+        else { return }
+        let service = IOServiceGetMatchingService(
+            kIOMainPortDefault, IOServiceMatching("AGXAccelerator"))
+        guard service != 0 else { return }
+        defer { IOObjectRelease(service) }
+        let uncap: [String: Any] = ["SetMaxGPUAbsolutePower": true, "AbsoluteTarget": -1000]
+        if IORegistryEntrySetCFProperties(service, uncap as CFDictionary) == KERN_SUCCESS {
+            try? FileManager.default.removeItem(at: marker)
         }
     }
 

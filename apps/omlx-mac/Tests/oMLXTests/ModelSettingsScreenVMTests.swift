@@ -621,14 +621,17 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(vm.showsEnginePages)
 
         XCTAssertFalse(vm.showsEmbeddingContextWindow)
+        XCTAssertFalse(vm.showsRerankerContextWindow)
 
         vm.model = makeModel(id: "embed", configModelType: "bert", modelType: "embedding")
         XCTAssertFalse(vm.showsGenerationSection)
         XCTAssertFalse(vm.showsEnginePages)
         XCTAssertTrue(vm.showsEmbeddingContextWindow)
+        XCTAssertFalse(vm.showsRerankerContextWindow)
 
         vm.model = makeModel(id: "rerank", configModelType: "xlm-roberta", modelType: "reranker")
         XCTAssertFalse(vm.showsEmbeddingContextWindow)
+        XCTAssertTrue(vm.showsRerankerContextWindow)
 
         vm.model = makeModel(id: "diffusion", configModelType: "diffusion_gemma")
         XCTAssertTrue(vm.showsGenerationSection)
@@ -811,6 +814,20 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(object?["reasoning_parser"] is NSNull)
         XCTAssertTrue(object?["mtp_fixed_depth"] is NSNull)
         XCTAssertEqual(object?["qwen35_ane_prefill_enabled"] as? Bool, false)
+    }
+
+    func testGPUPowerLimitSendsZeroWhenOff() throws {
+        let vm = ModelSettingsScreenVM()
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 0)
+        vm.limitGpuPower = true
+        vm.gpuPowerLimitWatts = "12"
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 12)
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        vm.model = try decoder.decode(ModelDTO.self, from: Data(#"{"id":"q","loaded":false,"is_loading":false,"estimated_size":0,"gpu_power_limit_supported":true,"settings":{"gpu_power_limit_w":20}}"#.utf8))
+        XCTAssertTrue(vm.gpuPowerLimitSupported)
+        XCTAssertEqual(vm.model?.settings?.gpuPowerLimitW, 20)
     }
 
     func testQwenInt8RowNeedsSupportedHardwareUnlessAlreadyOn() throws {

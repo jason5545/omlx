@@ -72,10 +72,14 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var deepseekV41EngramResidentBytes: Int64? = nil
     var deepseekV41EngramMmapBytes: Int64? = nil
     var moeExpertOffloadSupported: Bool? = nil
+    /// True on M1/M2 for checkpoints that still carry bfloat16 leaves.
+    var activationFp16Supported: Bool? = nil
     /// True for families whose MTP draft head stays resident while experts stream.
     var moeOffloadAllowsMtp: Bool? = nil
     /// True when this Mac can run the Qwen INT8 activation prefill kernels.
     var qwen35OqA8Supported: Bool? = nil
+    /// True when this Mac's GPU accepts a power cap.
+    var gpuPowerLimitSupported: Bool? = nil
     /// "hf_cache" for models found in the shared Hugging Face Hub cache.
     var sourceType: String? = nil
     /// "gguf" for a GGUF file, which only an external engine serves.
@@ -126,10 +130,12 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let enableThinking: Bool?
     let qwen4PleSsdOffload: Bool?
     var qwen4GdnDecodeWideProj: Bool? = nil
+    var activationFp16Enabled: Bool? = nil
     var deepseekV41EngramSsdOffload: Bool? = nil
     var deepseekV41CedPrefillEnabled: Bool? = nil
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
+    var gpuPowerLimitW: Int? = nil
     let reasoningParser: String?
     let ttlSeconds: Int?
     let isPinned: Bool?
@@ -220,11 +226,13 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
     var qwen4PleSsdOffload: Bool? = nil
     var qwen4GdnDecodeWideProj: Bool? = nil
+    var activationFp16Enabled: Bool? = nil
     var deepseekV41EngramSsdOffload: Bool? = nil
     var deepseekV41CedPrefillEnabled: Bool? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
+    var gpuPowerLimitW: Int? = nil // 0 turns the limit off.
     var forceSampling: Bool? = nil
     var isPinned: Bool? = nil
     var isFavorite: Bool? = nil
