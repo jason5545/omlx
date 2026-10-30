@@ -49,8 +49,8 @@
         'qwen35_ane_prefill_cpu_shared_resource',
         'moe_expert_offload_enabled',
         'moe_expert_offload_resident_fraction',
-        'qwen35_oq_a8_enabled',
-        'qwen35_oq_a8_min_tokens',
+        'a8_prefill_enabled',
+        'a8_prefill_min_tokens',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -165,7 +165,7 @@
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_unavailable: false, ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
                 usage: { usage_history: true },
@@ -299,8 +299,8 @@
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 moe_expert_offload_enabled: false,
                 moe_expert_offload_resident_fraction: 0.25,
-                qwen35_oq_a8_enabled: false,
-                qwen35_oq_a8_min_tokens: 128,
+                a8_prefill_enabled: false,
+                a8_prefill_min_tokens: 128,
                 external_engine: '',
                 external_engines: [],
                 model_format: null,
@@ -384,6 +384,7 @@
                 runtime_cache: {
                     base_path: '',
                     ssd_cache_dir: '',
+                    ssd_cache_unavailable: false,
                     response_state_dir: '',
                     models: [],
                     total_num_files: 0,
@@ -488,6 +489,10 @@
             hfTokenInvalid: false,
             _hfRefreshTimer: null,
             hfDeleteConfirm: null,
+            // Lowercased repo ID -> {files, size} from the last update check.
+            hfUpdates: {},
+            hfUpdatesChecking: false,
+            hfUpdatesStatus: '',
 
             // Recommended models state
             hfRecommended: { trending: [], popular: [] },
@@ -2193,8 +2198,8 @@
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
                     moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
-                    qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
-                    qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
+                    a8_prefill_enabled: s.a8_prefill_enabled || false,
+                    a8_prefill_min_tokens: s.a8_prefill_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
@@ -3065,20 +3070,20 @@
                 return null;
             },
 
-            isQwenOqA8Model(model) {
+            isA8PrefillModel(model) {
                 const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
-                // qwen4_exp (Qwen3.8-Flash-Next) is an exact match: only that
-                // validated family has routed-expert A8, not every qwen4*.
-                return type === 'qwen4_exp'
+                // qwen4_exp (Qwen3.8-Flash-Next) and deepseek_v41 are exact
+                // matches: only those validated families have routed-expert A8.
+                return type === 'qwen4_exp' || type === 'deepseek_v41'
                     || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 
             // The kernels need native INT8 tensor ops (M5-series or newer).
             // A saved "on" keeps the toggle so it can be turned off.
-            showsQwenOqA8(model) {
-                return this.isQwenOqA8Model(model)
-                    && (model?.qwen35_oq_a8_supported === true
-                        || model?.settings?.qwen35_oq_a8_enabled === true);
+            showsA8Prefill(model) {
+                return this.isA8PrefillModel(model)
+                    && (model?.a8_prefill_supported === true
+                        || model?.settings?.a8_prefill_enabled === true);
             },
 
             validateGpuPowerLimit() {
@@ -3090,15 +3095,15 @@
                 return null;
             },
 
-            validateQwenOqA8Settings() {
-                if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
+            validateA8PrefillSettings() {
+                if (!this.modelSettings.a8_prefill_enabled) return null;
                 // Both wrap the same MLP call, so the combination silently
                 // disables one of them. Caught here so the modal explains it
                 // instead of surfacing the server's 400.
                 if (this.modelSettings.qwen35_ane_prefill_enabled) {
                     return window.t('js.error.ane_oq_a8_conflict');
                 }
-                const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
+                const minTokens = Number(this.modelSettings.a8_prefill_min_tokens);
                 if (!Number.isInteger(minTokens) || minTokens < 1) {
                     return window.t('js.error.oq_a8_min_tokens_positive');
                 }
@@ -3270,8 +3275,8 @@
                         : 4,
                     moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
-                    qwen35_oq_a8_enabled: !!ms.qwen35_oq_a8_enabled,
-                    qwen35_oq_a8_min_tokens: Number(ms.qwen35_oq_a8_min_tokens) || 128,
+                    a8_prefill_enabled: !!ms.a8_prefill_enabled,
+                    a8_prefill_min_tokens: Number(ms.a8_prefill_min_tokens) || 128,
                     qwen35_ane_prefill_enabled: !!ms.qwen35_ane_prefill_enabled,
                     // Validation only runs when the feature is enabled, so a
                     // blank numeric input must fall back to the server default
@@ -3415,9 +3420,9 @@
             async saveModelSettings() {
                 if (!this.selectedModel) return;
 
-                const qwenOqA8ValidationError = this.validateQwenOqA8Settings();
-                if (qwenOqA8ValidationError) {
-                    alert(qwenOqA8ValidationError);
+                const a8PrefillValidationError = this.validateA8PrefillSettings();
+                if (a8PrefillValidationError) {
+                    alert(a8PrefillValidationError);
                     return;
                 }
 
@@ -7187,6 +7192,8 @@
                     });
 
                     if (response.ok) {
+                        const { [repoId.toLowerCase()]: _done, ...updates } = this.hfUpdates;
+                        this.hfUpdates = updates;
                         this.hfSuccess = window.t('js.success.download_started').replace('{repo_id}', repoId);
                         if (this.hfRepoId.trim().toLowerCase() === repoId.toLowerCase()) this.hfRepoId = '';
                         this.closeModelDetail();
@@ -7251,6 +7258,61 @@
                     }
                 } catch (err) {
                     console.error('Failed to load HF models:', err);
+                }
+            },
+
+            // Folders the downloader writes, which an update check can compare.
+            get hfUpdateRepoIds() {
+                return this.hfModels
+                    .filter(m => m.repo_id && m.source_type === 'local')
+                    .map(m => m.repo_id);
+            },
+
+            hfUpdateFor(model) {
+                if (!model.repo_id || !this.isModelDownloaded(model.repo_id)) return null;
+                return this.hfUpdates[model.repo_id.toLowerCase()];
+            },
+
+            async checkHFUpdates() {
+                this.hfUpdatesChecking = true;
+                this.hfUpdatesStatus = '';
+                try {
+                    const response = await fetch('/admin/api/hf/updates', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ repo_ids: this.hfUpdateRepoIds, hf_token: this.hfToken }),
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    const data = response.ok ? await response.json() : null;
+                    if (!data || (data.checked && data.failed.length === data.checked)) {
+                        this.hfUpdatesStatus = window.t('models.manager.update_check_failed');
+                        return;
+                    }
+                    if (!data.checked) {
+                        this.hfUpdatesStatus = window.t('models.manager.nothing_to_check');
+                        return;
+                    }
+                    const updates = {};
+                    for (const [repoId, info] of Object.entries(data.updates)) {
+                        updates[repoId.toLowerCase()] = info;
+                    }
+                    this.hfUpdates = updates;
+                    const count = Object.keys(updates).length;
+                    const status = [count
+                        ? window.t('models.manager.updates_found').replace('{count}', count)
+                        : window.t('models.manager.no_updates')];
+                    if (data.failed.length) {
+                        status.push(window.t('models.manager.update_check_partial').replace('{count}', data.failed.length));
+                    }
+                    this.hfUpdatesStatus = status.join(' · ');
+                } catch (err) {
+                    this.hfUpdatesStatus = window.t('models.manager.update_check_failed');
+                    console.error('Failed to check for model updates:', err);
+                } finally {
+                    this.hfUpdatesChecking = false;
                 }
             },
 
@@ -8361,11 +8423,11 @@
                 this.msModelDetailLoading = false;
             },
 
-            // A selection starts from what "download all" fetches; GGUF repos start empty.
+            // A selection starts from what "download all" fetches (nothing for GGUF repos) and changed local files.
             resetHfSelection() {
                 const picked = {};
                 for (const file of this.hfModelDetail?.files || []) {
-                    if (file.preselected && !file.local) picked[file.name] = true;
+                    if ((file.preselected || file.outdated) && !file.local) picked[file.name] = true;
                 }
                 this.hfSelectedFiles = picked;
             },
@@ -8397,6 +8459,20 @@
                 return (this.hfModelDetail?.files || [])
                     .filter(file => this.isHfFileSelected(file))
                     .map(file => file.name);
+            },
+
+            // A downloaded checkpoint with Hub changes offers Update instead of the download buttons.
+            hfShowsUpdate() {
+                const detail = this.hfModelDetail;
+                return !!(detail && !detail.is_adapter && !detail.unsupported_reason && detail.layout !== 'gguf'
+                    && detail.update_files?.length && this.isModelDownloaded(detail.repo_id));
+            },
+
+            hfUpdateSize() {
+                const names = new Set(this.hfModelDetail?.update_files || []);
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => names.has(file.name))
+                    .reduce((total, file) => total + (file.size || 0), 0);
             },
 
             hfSelectionSize() {

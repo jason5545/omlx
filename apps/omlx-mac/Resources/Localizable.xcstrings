@@ -6439,6 +6439,30 @@
         }
       }
     },
+    "downloads.card.files.outdated" : {
+      "comment" : "Marker on a file in the model card's Files tab whose copy in the model folder differs from the Hub",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Changed"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Изменён"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已更改"
+          }
+        }
+      }
+    },
     "downloads.card.files.required" : {
       "comment" : "Marker on a file in the model card's Files tab that the model cannot load without",
       "extractionState" : "manual",
@@ -6651,6 +6675,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "无标签。"
+          }
+        }
+      }
+    },
+    "downloads.card.update" : {
+      "comment" : "Primary button in the model card sheet that fetches the files changed on the Hub since the model was downloaded",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обновить"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "更新"
           }
         }
       }
@@ -11729,6 +11777,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "冷溢出块存储位置。空 = base_path/cache。"
+          }
+        }
+      }
+    },
+    "performance.cache.ssd_dir.unavailable" : {
+      "comment" : "Warning under the SSD cache directory when it was unavailable at server start",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Not available when the server started. SSD cache is off until the server restarts."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Был недоступен при запуске сервера. SSD-кэш отключён до перезапуска сервера."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器启动时不可用。在服务器重启之前，SSD 缓存保持关闭。"
           }
         }
       }
@@ -27831,6 +27903,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "位置"
+          }
+        }
+      }
+    },
+    "status.runtime_cache.location.unavailable" : {
+      "comment" : "Warning under the SSD cache location when it was unavailable at server start",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD cache is off because this directory was not available when the server started. Restart the server after reconnecting the drive."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD-кэш отключён, потому что этот каталог был недоступен при запуске сервера. Перезапустите сервер после повторного подключения диска."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器启动时此目录不可用，因此 SSD 缓存已关闭。请重新连接驱动器后重启服务器。"
           }
         }
       }

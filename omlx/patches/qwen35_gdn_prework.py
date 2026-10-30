@@ -87,6 +87,8 @@ _QWEN4_VERIFY_ENGAGED_LOGGED = False
 # The fused verify's norm-gate stage runs step t on simdgroup t of its
 # head_v_dim // 8 = 16 simdgroups, so a window holds at most 16 rows.
 _QWEN4_VERIFY_MAX_ROWS = 16
+# The widest block the fused and replay verify commits record.
+_VERIFY_PREWORK_MAX_ROWS = 32
 _VERIFY_REJECT_DIAG = 0
 _DTYPE_TRACE_EMBED_LOGGED = False
 _DTYPE_TRACE_LAYER0_NORM_LOGGED = False
@@ -2356,7 +2358,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             (compatible_norm or l2_norm)
             and cache is not None
             and cache.is_speculating
-            and min_length <= length <= 9
+            and min_length <= length <= _VERIFY_PREWORK_MAX_ROWS
             and mask is None
             and input_dtype_supported
             and layer.conv_kernel_size == 4
@@ -2378,7 +2380,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                     for name, ok in (
                         ("norm", compatible_norm or l2_norm),
                         ("speculating", cache.is_speculating),
-                        ("length", min_length <= length <= 9),
+                        ("length", min_length <= length <= _VERIFY_PREWORK_MAX_ROWS),
                         ("mask", mask is None),
                         ("inputs_dtype_supported", input_dtype_supported),
                         ("conv_kernel", layer.conv_kernel_size == 4),
@@ -2448,6 +2450,10 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         fused = not l2_norm and qwen35_gdn_verify_fused.fused_eligible(
             layer, q, cache, length
         )
+        # The stock recording keeps an fp32 state per position and row each cycle.
+        replayed = not fused and qwen35_gdn_verify_fused.replay_eligible(
+            layer, q, cache, length
+        )
         if fused and 0 not in cache._speculation["records"]:
             qwen35_gdn_verify_fused.record_window(
                 cache, 0, cache[0], mixed_qkv, layer.conv_kernel_size - 1
@@ -2458,6 +2464,34 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         cache[0] = conv_state
         if fused:
             out = qwen35_gdn_verify_fused.verify_block(layer, cache, q, k, v, a, b, z)
+        elif replayed:
+            batch = inputs.shape[0]
+            start = cache[1]
+            if start is None:
+                start = mx.zeros(
+                    (batch, layer.num_v_heads, layer.head_v_dim, layer.head_k_dim),
+                    dtype=mx.float32,
+                )
+            out, final = q35.gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                layer.A_log,
+                layer.dt_bias,
+                state=start,
+                use_kernel=not layer.training,
+            )
+            rows = (
+                k,
+                v,
+                a.reshape(batch, length, layer.num_v_heads),
+                b.reshape(batch, length, layer.num_v_heads),
+            )
+            qwen35_gdn_verify_fused.record_replay(
+                cache, 1, layer, start, rows, length, final
+            )
         else:
             out, _ = q35.gated_delta_update(
                 q,

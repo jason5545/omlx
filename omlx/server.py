@@ -46,6 +46,7 @@ import inspect
 import json
 import logging
 import os
+import shutil
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -647,6 +648,29 @@ def _reset_boundary_snapshots_for_server() -> None:
         logger.warning("Failed to reset boundary snapshot directory: %s", exc)
 
 
+def _remove_legacy_ced_ssd_cache_for_server() -> None:
+    """Remove the retired DeepSeek V4.1 CED SSD cache directory."""
+    engine_pool = _server_state.engine_pool
+    if engine_pool is None:
+        return
+
+    scheduler_config = getattr(engine_pool, "_scheduler_config", None)
+    cache_dir = getattr(scheduler_config, "paged_ssd_cache_dir", None)
+    if not cache_dir:
+        return
+
+    # Older versions kept CED prefill blocks here under a separate size budget.
+    legacy_dir = Path(cache_dir) / "deepseek_v41_ced_v1"
+    if legacy_dir.is_symlink() or not legacy_dir.is_dir():
+        return
+    try:
+        shutil.rmtree(legacy_dir)
+    except OSError as exc:
+        logger.warning("Failed to remove legacy CED SSD cache %s: %s", legacy_dir, exc)
+        return
+    logger.info("Removed legacy CED SSD cache directory: %s", legacy_dir)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
@@ -682,6 +706,7 @@ async def lifespan(app: FastAPI):
             logger.warning("Server alias auto-detection failed: %s", exc)
 
     _reset_boundary_snapshots_for_server()
+    _remove_legacy_ced_ssd_cache_for_server()
 
     # Reap distributed ranks orphaned by a crashed previous coordinator
     # (G8): all teardown used to live in-process, so a SIGKILL/panic of
@@ -2690,7 +2715,8 @@ def init_server(
     if _server_state.distributed_inference_enabled:
         _register_cluster_routes()
     response_state_dir = None
-    if global_settings:
+    # Keep Responses state in memory while the SSD cache dir is unavailable.
+    if global_settings and not global_settings.cache.is_ssd_cache_dir_unavailable():
         response_state_dir = (
             global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
             / "response-state"
