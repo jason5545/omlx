@@ -76,7 +76,10 @@ class TestMacOS27Workarounds:
 
     def test_base_no_binary_list_unconditional(self, formula):
         """Older macOS keeps the existing source-build list unchanged."""
-        assert 'no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken"' in formula
+        assert (
+            'no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken,watchfiles"'
+            in formula
+        )
         assert '"--no-binary", no_binary' in formula
 
     def test_release_stripping_disabled_on_macos_27(self, formula):

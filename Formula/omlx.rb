@@ -62,7 +62,10 @@ class Omlx < Formula
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
     ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
 
-    no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken"
+    # watchfiles arrives through mlx-audio 0.6.3's uvicorn[standard]. Its
+    # prebuilt wheel has no header room, so Homebrew cannot rewrite the
+    # dylib ID during the linkage fix-up (MachO::HeaderPadError).
+    no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken,watchfiles"
     pip_flags = []
     if MacOS.version >= "27"
       # macOS 27's dyld requires the LC_SYMTAB string pool to start on an
