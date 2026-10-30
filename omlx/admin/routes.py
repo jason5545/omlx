@@ -133,7 +133,7 @@ from .benchmark import (
     _sanitize_upload_error,
     _upload_model_name,
 )
-from .hf_downloader import MODEL_FORMATS
+from .hf_downloader import MODEL_FORMATS, _is_repo_id
 from .recipe import (
     ALL_FIELDS,
     DEFAULTS,
@@ -238,20 +238,20 @@ print(deleted)
 
 
 def _oq_a8_model_supported(config_type: str | None) -> bool:
-    """True for the model families the oQ A8 prefill patch can route.
+    """True for the model families the A8 prefill paths can route.
 
-    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) matches
-    exactly: only that validated checkpoint family has routed-expert A8, so a
-    ``qwen4`` prefix would admit unvalidated models.
+    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) and
+    DeepSeek V4.1 match exactly: only those validated checkpoint families have
+    routed-expert A8, so a ``qwen4`` prefix would admit unvalidated models.
     """
     config_type = str(config_type or "").lower().replace("-", "_")
-    return config_type == "qwen4_exp" or config_type.startswith(
+    return config_type in ("qwen4_exp", "deepseek_v41") or config_type.startswith(
         ("qwen3_5", "qwen3_6", "qwen3_8")
     )
 
 
 def _oq_a8_kernels_available() -> bool:
-    """True when the oQ A8 prefill kernels can actually run on this host.
+    """True when the A8 prefill kernels can actually run on this host.
 
     Enabling the setting on a machine without tensor units would leave every
     projection falling back, so the save is refused rather than accepted into
@@ -415,9 +415,9 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
-    # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8 and Qwen3.8 Flash-Next)
-    qwen35_oq_a8_enabled: bool | None = None
-    qwen35_oq_a8_min_tokens: int | None = None
+    # INT8-activation (A8) prefill (Qwen3.5/3.6/3.8, Qwen3.8 Flash-Next, DeepSeek V4.1)
+    a8_prefill_enabled: bool | None = None
+    a8_prefill_min_tokens: int | None = None
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool | None = None
     moe_expert_offload_resident_fraction: float | None = None
@@ -835,6 +835,13 @@ class HFDownloadRequest(BaseModel):
     repo_id: str
     hf_token: str = ""
     files: list[str] | None = None
+
+
+class HFUpdateCheckRequest(BaseModel):
+    """Request model for checking downloaded models for Hub updates."""
+
+    repo_ids: list[str]
+    hf_token: str = ""
 
 
 class HFRetryRequest(BaseModel):
@@ -1482,7 +1489,11 @@ async def _apply_cache_settings_runtime(
     )
 
     # Update scheduler config based on cache settings
-    if enabled is False or (enabled is None and not global_settings.cache.enabled):
+    if (
+        enabled is False
+        or (enabled is None and not global_settings.cache.enabled)
+        or global_settings.cache.is_ssd_cache_dir_unavailable()
+    ):
         pool._scheduler_config.paged_ssd_cache_dir = None
         pool._scheduler_config.paged_ssd_cache_max_size = 0
     else:
@@ -1495,7 +1506,7 @@ async def _apply_cache_settings_runtime(
             cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
         )
         pool._scheduler_config.paged_ssd_cache_auto_size = (
-            cache_cfg.is_ssd_cache_auto_size()
+            cache_cfg.ssd_cache_max_size.lower() == "auto"
         )
 
     # Apply hot cache max size
@@ -2311,7 +2322,7 @@ def _model_options(model_info: dict, settings) -> dict:
         "ane_prefill_shared_fractions": [0, 1 / 3, 1] if ane_backend == "k2" else [],
         "embedding_audio_supported": model_type == "embedding_gemma2",
         # Lets the settings UIs hide the toggle the save would reject.
-        "qwen35_oq_a8_supported": (
+        "a8_prefill_supported": (
             _oq_a8_model_supported(model_type) and _oq_a8_kernels_available()
         ),
         "gpu_power_limit_supported": gpu_power.gpu_power_cap_supported(),
@@ -3145,18 +3156,18 @@ async def update_model_settings(
         current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
             request.qwen35_ane_prefill_cpu_shared_resource
         )
-    # oQ mixed-bit QxA8 prefill. Load-time like the ANE controls above: the
+    # INT8-activation (A8) prefill. Load-time like the ANE controls above: the
     # runtime signature re-creates a loaded model when this changes.
-    if "qwen35_oq_a8_enabled" in sent:
-        current_settings.qwen35_oq_a8_enabled = bool(request.qwen35_oq_a8_enabled)
-    if "qwen35_oq_a8_min_tokens" in sent:
-        value = request.qwen35_oq_a8_min_tokens
+    if "a8_prefill_enabled" in sent:
+        current_settings.a8_prefill_enabled = bool(request.a8_prefill_enabled)
+    if "a8_prefill_min_tokens" in sent:
+        value = request.a8_prefill_min_tokens
         if value is None or value < 1:
             raise HTTPException(
                 status_code=400,
-                detail="oQ A8 min tokens must be at least 1.",
+                detail="A8 prefill min tokens must be at least 1.",
             )
-        current_settings.qwen35_oq_a8_min_tokens = int(value)
+        current_settings.a8_prefill_min_tokens = int(value)
     budget_error = _ane_prefill_budget_error(
         current_settings.to_dict(), entry.config_model_type
     )
@@ -3611,34 +3622,34 @@ def _validate_model_settings(entry, settings):
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
-    if "qwen35_oq_a8_min_tokens" in settings:
-        value = settings["qwen35_oq_a8_min_tokens"]
+    if "a8_prefill_min_tokens" in settings:
+        value = settings["a8_prefill_min_tokens"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise HTTPException(
-                status_code=400, detail="oQ A8 min tokens must be at least 1."
+                status_code=400, detail="A8 prefill min tokens must be at least 1."
             )
-    if settings.get("qwen35_oq_a8_enabled"):
+    if settings.get("a8_prefill_enabled"):
         if not _oq_a8_model_supported(getattr(entry, "config_model_type", "")):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 and "
-                    "Qwen3.8-Flash-Next models."
+                    "A8 prefill is available only for Qwen3.5/3.6/3.8, "
+                    "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
                 ),
             )
         if not _oq_a8_kernels_available():
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "oQ A8 prefill needs the native Qwen3.5 prefill kernels and "
-                    "a Metal device with native INT8 tensor operations "
-                    "(M5-series or newer)."
+                    "A8 prefill needs the native prefill kernels and a Metal "
+                    "device with native INT8 tensor operations (M5-series or "
+                    "newer)."
                 ),
             )
         if settings.get("qwen35_ane_prefill_enabled"):
             raise HTTPException(
                 status_code=400,
-                detail="ANE prefill and oQ A8 prefill cannot both be enabled.",
+                detail="ANE prefill and A8 prefill cannot both be enabled.",
             )
     if any(key.startswith("qwen35_ane_prefill_") for key in settings):
         try:
@@ -3957,16 +3968,16 @@ def _feature_problem(
         except ValueError as error:
             return str(error)
         return _ane_prefill_budget_error(snapshot, entry.config_model_type)
-    if name == "oq_a8":
+    if name == "a8_prefill":
         if not _oq_a8_model_supported(entry.config_model_type):
             return (
-                "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 and "
-                "Qwen3.8-Flash-Next models."
+                "A8 prefill is available only for Qwen3.5/3.6/3.8, "
+                "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
             )
         if not _oq_a8_kernels_available():
             return (
-                "oQ A8 prefill needs the native Qwen3.5 prefill kernels and a "
-                "Metal device with native INT8 tensor operations."
+                "A8 prefill needs the native prefill kernels and a Metal "
+                "device with native INT8 tensor operations."
             )
         return None
     if name == "moe_expert_offload":
@@ -4030,7 +4041,7 @@ async def _apply_settings_snapshot(
     candidate, conflicts = resolve_vlm_mtp_conflicts(candidate)
     _note_conflict("vlm_mtp", conflicts, skipped)
     candidate, conflicts = resolve_qwen35_prefill_conflicts(candidate)
-    _note_conflict("oq_a8", conflicts, skipped)
+    _note_conflict("a8_prefill", conflicts, skipped)
     try:
         ModelSettings.from_dict(candidate)
         _validate_model_settings(entry, candidate)
@@ -4652,6 +4663,9 @@ def _global_settings_response(global_settings):
         "cache": {
             "enabled": global_settings.cache.enabled,
             "ssd_cache_dir": cache_dir,
+            "ssd_cache_unavailable": (
+                global_settings.cache.is_ssd_cache_dir_unavailable()
+            ),
             "ssd_cache_max_size": global_settings.cache.ssd_cache_max_size,
             "ssd_cache_auto_size_bytes": get_auto_ssd_cache_size(Path(cache_dir)),
             "hot_cache_only": global_settings.cache.hot_cache_only,
@@ -5303,14 +5317,14 @@ async def update_global_settings(
             global_settings.cache.enabled = request.cache_enabled
             cache_changed = True
     if request.ssd_cache_dir is not None:
-        # Compare against the configured dir, not the fallback dir in use.
-        requested_cache_dir, configured_cache_dir = (
-            Path(value).expanduser().resolve()
-            if value
+        requested_cache_dir = (
+            Path(request.ssd_cache_dir).expanduser().resolve()
+            if request.ssd_cache_dir
             else (global_settings.base_path / "cache").resolve()
-            for value in (request.ssd_cache_dir, global_settings.cache.ssd_cache_dir)
         )
-        if requested_cache_dir != configured_cache_dir:
+        if requested_cache_dir != global_settings.cache.get_ssd_cache_dir(
+            global_settings.base_path
+        ).resolve():
             global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
             cache_changed = True
     if request.ssd_cache_max_size is not None:
@@ -6464,10 +6478,11 @@ def _build_runtime_cache_observability(
     cache_cfg = global_settings.cache
     engine_pool = _get_engine_pool()
     auto_size = cache_cfg.ssd_cache_max_size.lower() == "auto"
+    ssd_cache_unavailable = cache_cfg.is_ssd_cache_dir_unavailable()
     try:
         cfg_disk_max = (
             0
-            if auto_size and engine_pool is not None
+            if ssd_cache_unavailable or (auto_size and engine_pool is not None)
             else cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
         )
     except (ValueError, OSError, TypeError) as exc:
@@ -6477,7 +6492,10 @@ def _build_runtime_cache_observability(
     payload = {
         "base_path": str(global_settings.base_path),
         "ssd_cache_dir": str(cache_dir),
-        "response_state_dir": str(cache_dir / "response-state"),
+        "ssd_cache_unavailable": ssd_cache_unavailable,
+        "response_state_dir": (
+            "" if ssd_cache_unavailable else str(cache_dir / "response-state")
+        ),
         "models": [],
         "total_num_files": 0,
         "total_size_bytes": 0,
@@ -6749,7 +6767,12 @@ def _build_runtime_cache_observability(
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total
     payload["hot_cache_entries"] = hot_cache_entries_total
-    if auto_size and not payload["models"] and engine_pool is not None:
+    if (
+        auto_size
+        and not payload["models"]
+        and engine_pool is not None
+        and not ssd_cache_unavailable
+    ):
         try:
             disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
         except (ValueError, OSError, TypeError) as exc:
@@ -6762,14 +6785,13 @@ def _build_runtime_cache_observability(
         try:
             num_files = 0
             total_bytes = 0
-            for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
-                for subdir in "0123456789abcdef":
-                    subdir_path = root / subdir
-                    if not subdir_path.exists():
-                        continue
-                    for f in subdir_path.glob("*.safetensors"):
-                        num_files += 1
-                        total_bytes += f.stat().st_size
+            for subdir in "0123456789abcdef":
+                subdir_path = cache_dir / subdir
+                if not subdir_path.exists():
+                    continue
+                for f in subdir_path.glob("*.safetensors"):
+                    num_files += 1
+                    total_bytes += f.stat().st_size
             sidecar_count, sidecar_bytes = _scan_offline_gdn_sidecars(cache_dir)
             payload["total_num_files"] = num_files + sidecar_count
             payload["total_size_bytes"] = total_bytes + sidecar_bytes
@@ -7361,17 +7383,16 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
         )
         if cache_dir.exists():
             try:
-                for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
-                    for subdir in "0123456789abcdef":
-                        subdir_path = root / subdir
-                        if not subdir_path.exists():
-                            continue
-                        for f in subdir_path.glob("*.safetensors"):
-                            try:
-                                f.unlink()
-                                total_deleted += 1
-                            except OSError:
-                                pass
+                for subdir in "0123456789abcdef":
+                    subdir_path = cache_dir / subdir
+                    if not subdir_path.exists():
+                        continue
+                    for f in subdir_path.glob("*.safetensors"):
+                        try:
+                            f.unlink()
+                            total_deleted += 1
+                        except OSError:
+                            pass
                 sidecar_count, _ = _scan_offline_gdn_sidecars(cache_dir, clear=True)
                 total_deleted += sidecar_count
             except Exception as exc:
@@ -8044,9 +8065,8 @@ async def get_hf_model_info(
     from .hf_downloader import HFDownloader
 
     repo_id = repo_id.strip()
-    parts = repo_id.split("/")
     local_dir = None
-    if _hf_downloader is not None and len(parts) == 2 and not {".", ".."} & set(parts):
+    if _hf_downloader is not None and _is_repo_id(repo_id):
         local_dir = _hf_downloader.model_dir / repo_id
     try:
         result = await HFDownloader.get_model_info(
@@ -8058,6 +8078,9 @@ async def get_hf_model_info(
             result["disk_free"] = await asyncio.to_thread(
                 _free_disk_bytes, _hf_downloader.model_dir
             )
+            # An unfinished download resumes with Retry, not as an update.
+            if _hf_downloader.has_unfinished_download(repo_id):
+                result["update_files"] = []
         return result
     except TimeoutError:
         raise HTTPException(
@@ -8068,6 +8091,18 @@ async def get_hf_model_info(
         raise HTTPException(status_code=404, detail=f"Model '{repo_id}' not found")
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/api/hf/updates")
+async def check_hf_updates(
+    request: HFUpdateCheckRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Report downloaded models whose files changed on HuggingFace."""
+    if _hf_downloader is None:
+        raise HTTPException(status_code=503, detail="Downloader not initialized")
+
+    return await _hf_downloader.check_updates(request.repo_ids, request.hf_token)
 
 
 @router.get("/api/hf/models")

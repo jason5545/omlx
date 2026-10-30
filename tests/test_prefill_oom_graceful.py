@@ -30,7 +30,7 @@ from omlx.memory_monitor import (
     make_prefill_memory_profile,
 )
 from omlx.prefill_transient_tracker import PrefillTransientTracker
-from omlx.request import Request, SamplingParams
+from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import (
     PrefillEvictionRequest,
     Scheduler,
@@ -1097,12 +1097,16 @@ def test_record_chunk_transient_skips_partial_speed_sample():
 
 
 def test_record_chunk_transient_keeps_full_speed_spike_as_last_sample():
-    """A same-size spike remains available to protect the next full step."""
+    """A same-size spike protects the next full step until its prefill ends."""
     tracker = PrefillTransientTracker()
+    owner = SimpleNamespace(status=RequestStatus.WAITING)
     ns = SimpleNamespace(
         _prefill_min_chunk_tokens=32,
         _prefill_speed_priority=True,
         _prefill_transient_tracker=tracker,
+        _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
+        memory_monitor=None,
+        requests={"req-spike": owner},
     )
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
@@ -1129,6 +1133,13 @@ def test_record_chunk_transient_keeps_full_speed_spike_as_last_sample():
     assert tracker.samples == 2
     assert tracker.last_n_tokens == 2048
     assert tracker.last_delta_bytes == spike
+    safety = Scheduler._PREFILL_TRANSIENT_SAFETY
+    predicted = Scheduler._predicted_chunk_transient(ns, 2048, 0)
+    assert predicted == pytest.approx(spike * safety)
+
+    owner.status = RequestStatus.RUNNING
+    predicted = Scheduler._predicted_chunk_transient(ns, 2048, 0)
+    assert predicted == pytest.approx(256 * 1024**2 * safety)
 
 
 def test_record_chunk_transient_keeps_partial_context_sample():
@@ -1245,6 +1256,8 @@ def test_small_retained_pool_still_records_the_sample():
 def test_speed_partial_recovers_a_poisoned_estimate():
     """A cheaper partial proves the full-step rate is too high."""
     ns, tracker = _speed_record_ctx()
+    # The outlier is charged only while its own prefill is still waiting.
+    ns.requests = {"r": SimpleNamespace(status=RequestStatus.WAITING)}
     ns._record_chunk_transient(
         2048, 0, 3 * _GB, request_id="r", loop_label="unit", requested_step=2048,
     )

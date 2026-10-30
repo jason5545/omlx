@@ -46,6 +46,7 @@ from ..api.utils import (
     detect_and_strip_partial,
     remove_special_tokens_preserve_whitespace,
 )
+from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
@@ -80,6 +81,7 @@ from .base import (
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
+from .lfm3_speech import SPEECH_MODEL_TYPES, LFM3Speech
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +109,8 @@ OCR_MODEL_PROMPTS: Dict[str, str] = {
     "dots_ocr": "Convert this page to clean Markdown while preserving reading order.",
     "glm_ocr": "Text Recognition:",
 }
+# Unlimited-OCR-2 (DASH decoder) defaults to this prompt for any page count.
+UNLIMITED_OCR_2_PROMPT = "Multi page parsing."
 
 # Extra stop sequences for OCR models to prevent degeneration.
 # Many OCR models lack proper EOS handling and generate chat-turn
@@ -1753,6 +1757,8 @@ class VLMBatchedEngine(BaseEngine):
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
         self._diffusion_cancel_events: set[threading.Event] = set()
+        # LFM3 speech requests run outside the scheduler's output collectors.
+        self._speech_active = 0
 
     async def _preflight_or_raise_with_eviction(
         self,
@@ -1808,6 +1814,13 @@ class VLMBatchedEngine(BaseEngine):
             if hasattr(config, "model_type"):
                 return config.model_type
         return None
+
+    @property
+    def speech(self) -> LFM3Speech | None:
+        """ASR, TTS and spoken replies of a loaded LFM3-Audio or LFM3-Omni model."""
+        if self.model_type not in SPEECH_MODEL_TYPES:
+            return None
+        return LFM3Speech(self)
 
     @property
     def message_extractor(self):
@@ -2057,6 +2070,12 @@ class VLMBatchedEngine(BaseEngine):
                                 False,
                             )
                         ),
+                        a8_prefill=bool(
+                            getattr(self._model_settings, "a8_prefill_enabled", False)
+                        ),
+                        a8_prefill_min_tokens=int(
+                            getattr(self._model_settings, "a8_prefill_min_tokens", 128)
+                        ),
                     )
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
@@ -2101,7 +2120,7 @@ class VLMBatchedEngine(BaseEngine):
 
         restored = restore_bonsai_quantized_modules(self._vlm_model)
         if restored:
-            logger.info("Restored oMLX Bonsai kernel paths for %d modules", restored)
+            logger.info("Rebound %d mlx-vlm 1-bit modules to stock MLX", restored)
 
         if self.model_type in NATIVE_VIDEO_MODEL_TYPES:
             self._native_video = attach_native_video_processor(
@@ -2417,6 +2436,7 @@ class VLMBatchedEngine(BaseEngine):
                 # Agent sessions resend 20-90 screenshots; bound by bytes.
                 max_memory_entries=4096,
                 max_memory_bytes=1024**3,
+                numerics=numerics_revision_for_model(self._vlm_model),
             )
             logger.info(
                 "Vision feature cache enabled (SSD: %s)",
@@ -2462,16 +2482,6 @@ class VLMBatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
-        if (
-            self._adapter.model_type == "deepseek_v41"
-            and self._adapter.config.ced_prefill
-            and scheduler_config.paged_ssd_cache_dir
-        ):
-            # Approximate decoder states must not become hits in full-prefill
-            # mode (or vice versa) after reloading the model with new settings.
-            scheduler_config.paged_ssd_cache_dir = str(
-                Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
-            )
         if (
             self._adapter.model_type == "qwen4_exp"
             and scheduler_config.paged_ssd_cache_dir
@@ -2670,7 +2680,11 @@ class VLMBatchedEngine(BaseEngine):
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
-        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+        # DeepSeek V4.1 applies the setting in its own loader.
+        if (
+            getattr(self._model_settings, "a8_prefill_enabled", False)
+            and self.model_type != "deepseek_v41"
+        ):
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -2680,7 +2694,7 @@ class VLMBatchedEngine(BaseEngine):
                 apply_qwen35_oq_a8_patch(
                     self._vlm_model,
                     min_tokens=int(
-                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                        getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                     ),
                 )
             except Exception:
@@ -2939,6 +2953,7 @@ class VLMBatchedEngine(BaseEngine):
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
+        self._speech_active = 0
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError
@@ -2960,6 +2975,7 @@ class VLMBatchedEngine(BaseEngine):
         # and examples, so upstream inference incorrectly selects json_tools.
         # Use the same oMLX protocol adapter as distributed ranks.
         from ..adapter.output_parser import (
+            correct_tool_parser_type,
             install_minimax_m3_tokenizer_protocol,
         )
 
@@ -2978,7 +2994,9 @@ class VLMBatchedEngine(BaseEngine):
                 load_tool_module,
             )
 
-            tool_parser_type = _infer_tool_parser(chat_template)
+            tool_parser_type = correct_tool_parser_type(
+                _infer_tool_parser(chat_template), chat_template
+            )
             if tool_parser_type is None:
                 return
             try:
@@ -4239,6 +4257,10 @@ class VLMBatchedEngine(BaseEngine):
                     "model repository.",
                     field="messages",
                 )
+            # The Unlimited-OCR processor reads a prompt list as a batch with
+            # one image per prompt. A single prompt string keeps every page.
+            if model_type == "unlimited-ocr" and isinstance(prompt, str):
+                prompts = prompt
             # Tokenize text and preprocess images and audio
             inputs = prepare_inputs(
                 self._processor,
@@ -5387,6 +5409,17 @@ class VLMBatchedEngine(BaseEngine):
         ):
             yield output
 
+    def _is_unlimited_ocr_2(self) -> bool:
+        """True for Unlimited-OCR-2, whose decoder uses DASH sparse attention."""
+        config = getattr(self._vlm_model, "config", None)
+        text_config = getattr(config, "text_config", None)
+        sparse = getattr(text_config, "sparse_attention_config", None)
+        return (
+            self.model_type == "unlimited-ocr"
+            and isinstance(sparse, dict)
+            and sparse.get("training_stage") == "dash"
+        )
+
     def _apply_ocr_prompt(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Apply a default OCR prompt only when the user sends no text.
 
@@ -5406,6 +5439,8 @@ class VLMBatchedEngine(BaseEngine):
             return messages
 
         ocr_prompt = OCR_MODEL_PROMPTS[model_type]
+        if self._is_unlimited_ocr_2():
+            ocr_prompt = UNLIMITED_OCR_2_PROMPT
         messages = copy.deepcopy(messages)
 
         # Find last user message
@@ -6035,6 +6070,8 @@ class VLMBatchedEngine(BaseEngine):
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
+        if getattr(self, "_speech_active", 0):
+            return True
         if self.is_diffusion_model:
             return getattr(self, "_diffusion_active_requests", 0) > 0
         engine_core = getattr(self, "_engine", None)
