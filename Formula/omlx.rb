@@ -121,8 +121,8 @@ class Omlx < Formula
       ENV.append "CMAKE_ARGS", "-DPython_EXECUTABLE=#{libexec}/bin/python"
     end
 
-    # Install omlx (with optional grammar extra for structured output)
-    install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
+    # Keep audio-model dependencies removed from mlx-audio's extras installed.
+    install_spec = build.with?("grammar") ? "#{buildpath}[grammar,audio]" : "#{buildpath}[audio]"
     system(*pip_install, install_spec)
 
     if build.with?("custom-kernel")
