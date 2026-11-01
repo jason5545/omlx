@@ -1,8 +1,8 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jason5545/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.3rc1.tar.gz"
-  sha256 "288b91b956a4d6bff3dffcaf1f6ba3fd84012fe2362f7d9d4777596b801a3d7c"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.3.tar.gz"
+  sha256 "ff0d649ba4e550c031a5d27bb7a4a89b30b35607483fd42010bda2164c0547ad"
   license "Apache-2.0"
 
   head "https://github.com/jason5545/omlx.git", branch: "main"
@@ -21,12 +21,6 @@ class Omlx < Formula
   # the venv so it never runs `strip` on the compiled dylibs.
   on_macos do
     skip_clean "libexec" if MacOS.version >= "27"
-  end
-
-  # Same mlx-audio commit as pyproject.toml, installed with its [all] extras.
-  resource "mlx-audio" do
-    url "https://github.com/Blaizzy/mlx-audio.git",
-      revision: "8c244a1faff44cfa69e3151c195f52a4c1c90be5"
   end
 
   # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
@@ -62,9 +56,8 @@ class Omlx < Formula
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
     ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
 
-    # watchfiles arrives through mlx-audio 0.6.3's uvicorn[standard]. Its
-    # prebuilt wheel has no header room, so Homebrew cannot rewrite the
-    # dylib ID during the linkage fix-up (MachO::HeaderPadError).
+    # Keep watchfiles source-built because its wheel lacks header room for
+    # Homebrew's linkage rewrite; the current [audio] extras do not install it.
     no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken,watchfiles"
     pip_flags = []
     if MacOS.version >= "27"
@@ -83,8 +76,8 @@ class Omlx < Formula
     end
 
     # Every pip step must share these flags; a later step without --no-binary
-    # (e.g. mlx-audio) can clobber a source-built package with a prebuilt
-    # wheel that fails dlopen on macOS 27 (#2110).
+    # can clobber a source-built package with a prebuilt wheel that fails
+    # dlopen on macOS 27 (#2110).
     pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
@@ -124,8 +117,9 @@ class Omlx < Formula
       ENV.append "CMAKE_ARGS", "-DPython_EXECUTABLE=#{libexec}/bin/python"
     end
 
-    # Keep audio-model dependencies removed from mlx-audio's extras installed.
-    install_spec = build.with?("grammar") ? "#{buildpath}[grammar,audio]" : "#{buildpath}[audio]"
+    # [audio] is the only source of mlx-audio and of the Kokoro G2P stack
+    # (misaki, spaCy) that the spaCy model check below needs.
+    install_spec = build.with?("grammar") ? "#{buildpath}[audio,grammar]" : "#{buildpath}[audio]"
     system(*pip_install, install_spec)
 
     if build.with?("custom-kernel")
@@ -136,16 +130,10 @@ class Omlx < Formula
       end
     end
 
-    resource("mlx-audio").stage do
-      system(*pip_install, ".[all]")
-    end
-
     # Install the spaCy English model required by misaki for Kokoro TTS.
     # Homebrew's cached resource path is hash-prefixed, which pip rejects
     # as an invalid wheel filename. Copy it back to the canonical basename.
-    # preshed 3.0.14 (2026-10-24) breaks spaCy 3.8.16's tokenizer load with
-    # "OverflowError: Python int too large to convert to C ssize_t" in
-    # _flush_specials. Hold it below 3.0.14 until a fixed release ships.
+    # preshed 3.0.14 breaks spaCy 3.8.16's tokenizer load in _flush_specials.
     system(*pip_install, "preshed<3.0.14")
     spacy_model_wheel = buildpath/"en_core_web_sm-3.8.0-py3-none-any.whl"
     cp resource("en-core-web-sm").cached_download, spacy_model_wheel
@@ -154,15 +142,9 @@ class Omlx < Formula
     system libexec/"bin/python", "-c",
            "import spacy; spacy.load('en_core_web_sm')"
 
-    # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
-    system(*pip_install, "python-multipart>=0.0.5")
-
     # jang-tools serves JANG mixed-precision bundles; omlx routes them via
-    # omlx.patches.jang_load. Installed here rather than through omlx's own
-    # dependency list because the release postdates the DMG layer's
-    # exclude-newer cutoff in packaging/venvstacks.toml. Every requirement
-    # (mlx, mlx-lm, safetensors, numpy, tqdm, huggingface_hub, jinja2) is
-    # already pinned above, so resolution only adds the pure-Python package.
+    # omlx.patches.jang_load. This release postdates the DMG layer's
+    # exclude-newer cutoff, so install it explicitly.
     system(*pip_install, "jang[mlx]>=2.5.47")
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
