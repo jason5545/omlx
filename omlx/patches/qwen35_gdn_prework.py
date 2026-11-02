@@ -25,7 +25,7 @@ This kernel also runs automatically for compatible FP16/BF16 B1/T1 decode
 through Qwen3_5GatedDeltaNet on Metal. Gates,
 recurrence, final norm and projections remain unchanged. Other Qwen3.5
 decode shapes and prefill keep the stock path. Qwen4 has its separate
-BF16 decode prework and norm-gate kernels below, and its planned decode runs
+FP16/BF16 decode prework and norm-gate kernels below, and its planned decode runs
 them with the recurrence as one launch between the two projections. Its B1
 speculative verify runs the same step for every row in one launch between
 multi-row projections with one-row arithmetic per row, and emits the conv
@@ -59,6 +59,8 @@ _QWEN4_DECODE_STEP_KERNEL = None
 _QWEN4_DECODE_ENGAGED_LOGGED = False
 _QWEN35_DECODE_ENGAGED_LOGGED = False
 _QWEN4_PREFILL_KERNELS = None
+# Qwen4 GDN layers run fused in the dtype of their float weights.
+_COMPUTE_DTYPES = (mx.bfloat16, mx.float16)
 _QWEN4_PREFILL_ENGAGED_LOGGED = False
 # Fixed on; tests clear these to reach the per-op reference paths.
 _QWEN4_PREFILL_ENABLED = True
@@ -162,6 +164,25 @@ def _gdn_weight_dtypes(layer):
         f"dt_bias={_dtype_name(layer.dt_bias)}"
     )
 
+# mx.sum reduces a row's lane partials with simd_sum, which MLX runs in FP32
+# for BF16 (rounded once by the caller) and natively in half for FP16.
+_L2_SUM_HEADER = """
+    template <typename T>
+    inline float omlx_l2_row_sum(T partial) {
+        if constexpr (metal::is_same_v<T, half>) {
+            return float(simd_sum(partial));
+        } else {
+            float tv = float(partial);
+            tv += simd_shuffle_xor(tv, short(16));
+            tv += simd_shuffle_xor(tv, short(8));
+            tv += simd_shuffle_xor(tv, short(4));
+            tv += simd_shuffle_xor(tv, short(2));
+            tv += simd_shuffle_xor(tv, short(1));
+            return tv;
+        }
+    }
+"""
+
 _SOURCE = """
     uint lane = thread_position_in_threadgroup.x;
     uint batch_idx = threadgroup_position_in_grid.y / uint(S);
@@ -208,14 +229,10 @@ _SOURCE = """
             // Stock Qwen4 L2 chain: x * rsqrt(sum(square(x), -1) + 1e-6),
             // with dk^-0.5 applied to q only.  mx.square rounds per
             // element; mx.sum accumulates each lane's four contiguous
-            // bf16 values sequentially, reduces with an fp32 xor tree and
-            // rounds once.  Mirror every rounding site exactly.
-            float tv = float(l2acc);
-            tv += simd_shuffle_xor(tv, short(16));
-            tv += simd_shuffle_xor(tv, short(8));
-            tv += simd_shuffle_xor(tv, short(4));
-            tv += simd_shuffle_xor(tv, short(2));
-            tv += simd_shuffle_xor(tv, short(1));
+            // values sequentially in T, reduces the lanes as
+            // omlx_l2_row_sum does and rounds once.  Mirror every rounding
+            // site exactly.
+            float tv = omlx_l2_row_sum(l2acc);
             const T eps = T(float(T(tv)) + float(T(1e-6f)));
             const T inv = T(metal::precise::rsqrt(float(eps)));
             for (uint i = 0; i < 4; ++i) {
@@ -312,7 +329,23 @@ _QWEN4_DECODE_HEADER = """
         }
         return x * (metal::log(xp1) / (xp1 - 1.0f));
     }
-"""
+
+    // nn.softplus(x) = logaddexp(x, 0) as MLX's LogAddExp runs it in T:
+    // BF16 rounds exp and log1p to T, while FP16 takes the native half exp
+    // and adds MLX's float log1p unrounded.
+    template <typename T>
+    inline T omlx_softplus(T x) {
+        const T neg_abs = -metal::abs(x);
+        const T positive = metal::max(x, T(0));
+        if constexpr (metal::is_same_v<T, half>) {
+            return T(float(positive) + omlx_log1p(float(metal::exp(neg_abs))));
+        } else {
+            const T exp_term = T(metal::precise::exp(float(neg_abs)));
+            const T log_term = T(omlx_log1p(float(exp_term)));
+            return T(float(positive) + float(log_term));
+        }
+    }
+""" + _L2_SUM_HEADER
 
 
 _QWEN4_DECODE_SOURCE = """
@@ -358,12 +391,7 @@ _QWEN4_DECODE_SOURCE = """
     if (is_q || is_k) {
         // Stock Qwen4 L2 chain, rounding for rounding as the verify kernel's
         // L2 arm: x * rsqrt(sum(square(x), -1) + 1e-6), dk^-0.5 on q only.
-        float tv = float(l2acc);
-        tv += simd_shuffle_xor(tv, short(16));
-        tv += simd_shuffle_xor(tv, short(8));
-        tv += simd_shuffle_xor(tv, short(4));
-        tv += simd_shuffle_xor(tv, short(2));
-        tv += simd_shuffle_xor(tv, short(1));
+        float tv = omlx_l2_row_sum(l2acc);
         const T eps = T(float(T(tv)) + float(T(1e-6f)));
         const T inv = T(metal::precise::rsqrt(float(eps)));
         uint out_base = head * uint(DK) + lane * 4;
@@ -387,13 +415,9 @@ _QWEN4_DECODE_SOURCE = """
             beta_out[head] = T((bv < T(0)) ? by : 1 - by);
 
             // compute_g casts A_log to FP32 but keeps softplus(a+dt_bias)
-            // in BF16 before the FP32 multiply and outer exp.
+            // in T before the FP32 multiply and outer exp.
             const T apd = T(float(a_in[head]) + float(dt_bias[head]));
-            const T neg_abs = -metal::abs(apd);
-            const T exp_term = T(metal::precise::exp(float(neg_abs)));
-            const T log_term = T(omlx_log1p(float(exp_term)));
-            const T positive = metal::max(apd, T(0));
-            const T sp = T(float(positive) + float(log_term));
+            const T sp = omlx_softplus(apd);
             float ea = metal::precise::exp(float(A_log[head]));
             g_out[head] = metal::precise::exp(-(ea * float(sp)));
         }
@@ -414,7 +438,7 @@ _QWEN4_NORM_GATE_SOURCE = """
     sumsq = simd_sum(sumsq);
     float inv = metal::precise::rsqrt(sumsq / float(DV) + float(eps));
     for (uint i = 0; i < 4; ++i) {
-        // mx.fast.rms_norm materializes BF16 before Qwen4 casts it back to
+        // mx.fast.rms_norm materializes T before Qwen4 casts it back to
         // FP32 for the sigmoid product.
         const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
         float zv = float(z[base + i]);
@@ -436,7 +460,7 @@ _QWEN4_NORM_GATE_SOURCE = """
 #   2. mlx-lm's ``gated_delta_step_packed_btree`` recurrence (T=1; four lanes
 #      and 32 FP32 state values per value row, the same partial sums and
 #      xor-1/xor-2 shuffles) reading q/k/v/g/beta from threadgroup memory;
-#      each row's BF16 output goes to threadgroup memory.
+#      each row's T output goes to threadgroup memory.
 #   3. simdgroup 0 runs the norm-gate above on the head's 128 outputs (same
 #      four values per lane and simd_sum).
 # Every value takes the three-launch path's arithmetic in the same order;
@@ -502,12 +526,7 @@ _QWEN4_DECODE_STEP_SOURCE = """
         }
 
         if (is_q || is_k) {
-            float tv_sum = float(l2acc);
-            tv_sum += simd_shuffle_xor(tv_sum, short(16));
-            tv_sum += simd_shuffle_xor(tv_sum, short(8));
-            tv_sum += simd_shuffle_xor(tv_sum, short(4));
-            tv_sum += simd_shuffle_xor(tv_sum, short(2));
-            tv_sum += simd_shuffle_xor(tv_sum, short(1));
+            float tv_sum = omlx_l2_row_sum(l2acc);
             const T eps_l2 = T(float(T(tv_sum)) + float(T(1e-6f)));
             const T inv = T(metal::precise::rsqrt(float(eps_l2)));
             for (uint i = 0; i < 4; ++i) {
@@ -531,11 +550,7 @@ _QWEN4_DECODE_STEP_SOURCE = """
         tg_beta[0] = T((bv < T(0)) ? by : 1 - by);
 
         const T apd = T(float(a_in[head]) + float(dt_bias[head]));
-        const T neg_abs = -metal::abs(apd);
-        const T exp_term = T(metal::precise::exp(float(neg_abs)));
-        const T log_term = T(omlx_log1p(float(exp_term)));
-        const T positive = metal::max(apd, T(0));
-        const T sp = T(float(positive) + float(log_term));
+        const T sp = omlx_softplus(apd);
         float ea = metal::precise::exp(float(A_log[head]));
         tg_g[0] = metal::precise::exp(-(ea * float(sp)));
     }
@@ -706,12 +721,7 @@ _QWEN4_VERIFY_STEP_SOURCE = """
         }
 
         if (is_q || is_k) {
-            float tv_sum = float(l2acc);
-            tv_sum += simd_shuffle_xor(tv_sum, short(16));
-            tv_sum += simd_shuffle_xor(tv_sum, short(8));
-            tv_sum += simd_shuffle_xor(tv_sum, short(4));
-            tv_sum += simd_shuffle_xor(tv_sum, short(2));
-            tv_sum += simd_shuffle_xor(tv_sum, short(1));
+            float tv_sum = omlx_l2_row_sum(l2acc);
             const T eps_l2 = T(float(T(tv_sum)) + float(T(1e-6f)));
             const T inv = T(metal::precise::rsqrt(float(eps_l2)));
             for (uint i = 0; i < 4; ++i) {
@@ -737,11 +747,7 @@ _QWEN4_VERIFY_STEP_SOURCE = """
         tg_beta[t] = T((bv < T(0)) ? by : 1 - by);
 
         const T apd = T(float(proj[t * P + a_off + head]) + float(dt_bias[head]));
-        const T neg_abs = -metal::abs(apd);
-        const T exp_term = T(metal::precise::exp(float(neg_abs)));
-        const T log_term = T(omlx_log1p(float(exp_term)));
-        const T positive = metal::max(apd, T(0));
-        const T sp = T(float(positive) + float(log_term));
+        const T sp = omlx_softplus(apd);
         float ea = metal::precise::exp(float(A_log[head]));
         tg_g[t] = metal::precise::exp(-(ea * float(sp)));
     }
@@ -836,6 +842,7 @@ def _kernel():
             name="omlx_qwen35_gdn_prework",
             input_names=["qkv", "conv_state", "conv_w", "q_scale", "k_scale"],
             output_names=["q_out", "k_out", "v_out", "conv_out"],
+            header=_L2_SUM_HEADER,
             source=_SOURCE,
         )
     return _KERNEL
@@ -1008,6 +1015,7 @@ def _qwen4_prefill_kernels():
                     "s_len",
                 ],
                 output_names=["q_out", "k_out", "v_out", "conv_out"],
+                header=_L2_SUM_HEADER,
                 source=_qwen4_prefill_prework_source(),
             ),
             mx.fast.metal_kernel(
@@ -1030,7 +1038,7 @@ def _qwen4_prefill_eligible(module, inputs, mask, cache) -> bool:
         or inputs.shape[0] != 1
         or inputs.shape[1] < _QWEN4_PREFILL_MIN_ROWS
         or inputs.shape[2] != _QWEN4_HIDDEN_SIZE
-        or inputs.dtype != mx.bfloat16
+        or inputs.dtype not in _COMPUTE_DTYPES
         or mx.default_device() != mx.gpu
         or len(getattr(cache, "cache", ())) != 2
         or getattr(cache, "is_speculating", True)
@@ -1043,7 +1051,7 @@ def _qwen4_prefill_eligible(module, inputs, mask, cache) -> bool:
     if conv_state is not None and not (
         isinstance(conv_state, mx.array)
         and conv_state.shape == (1, 3, 10240)
-        and conv_state.dtype == mx.bfloat16
+        and conv_state.dtype == inputs.dtype
     ):
         return False
     if recurrent_state is not None and not (
@@ -1052,7 +1060,7 @@ def _qwen4_prefill_eligible(module, inputs, mask, cache) -> bool:
         and recurrent_state.dtype == mx.float32
     ):
         return False
-    return _qwen4_gdn_geometry_ok(module)
+    return _qwen4_gdn_geometry_ok(module) and module.conv1d.weight.dtype == inputs.dtype
 
 
 def _qwen4_prefill(module, inputs, cache):
@@ -1074,8 +1082,8 @@ def _qwen4_prefill(module, inputs, cache):
             mixed_qkv,
             conv_state,
             module.conv1d.weight,
-            mx.array(dk**-0.5, dtype=mx.bfloat16),
-            mx.array(1.0, dtype=mx.bfloat16),
+            mx.array(dk**-0.5, dtype=inputs.dtype),
+            mx.array(1.0, dtype=inputs.dtype),
             mx.array(length, dtype=mx.int32),
         ],
         template=[
@@ -1138,7 +1146,7 @@ def _qwen4_norm_gate_kernel():
 
 
 def qwen4_decode_norm_gate_fused(y, z, norm_w, *, hv, dv, eps):
-    """Fuse Qwen4's BF16 RMSNorm + FP32 sigmoid-gate at B1/T1."""
+    """Fuse Qwen4's 16-bit RMSNorm + FP32 sigmoid-gate at B1/T1."""
 
     return _qwen4_norm_gate(y, z, norm_w, mx.array(eps, dtype=mx.float32), hv, dv)
 
@@ -1391,7 +1399,8 @@ _QWEN4_HIDDEN_SIZE = 2560
 
 
 def _qwen4_gdn_geometry_ok(module) -> bool:
-    """Require the supported Qwen4 GDN geometry, convolution and gate weights."""
+    """Require the supported Qwen4 GDN geometry, and convolution and gate weights
+    in one 16-bit dtype (the layer's compute dtype)."""
 
     conv_dim = 2 * 16 * 128 + 48 * 128
     if (
@@ -1412,19 +1421,19 @@ def _qwen4_gdn_geometry_ok(module) -> bool:
         conv is None
         or getattr(conv, "bias", None) is not None
         or conv.weight.shape != (conv_dim, 4, 1)
-        or conv.weight.dtype != mx.bfloat16
+        or conv.weight.dtype not in _COMPUTE_DTYPES
         or norm is None
         or getattr(norm, "activation", None) != "sigmoid"
         or norm.weight.shape != (128,)
-        or norm.weight.dtype != mx.bfloat16
+        or norm.weight.dtype != conv.weight.dtype
         or module.A_log.shape != (48,)
-        or module.A_log.dtype != mx.bfloat16
+        or module.A_log.dtype != conv.weight.dtype
         or module.dt_bias.shape != (48,)
-        or module.dt_bias.dtype != mx.bfloat16
+        or module.dt_bias.dtype != conv.weight.dtype
     )
 
 
-def _canonical_projection(linear, rows, signatures, in_dim=_QWEN4_HIDDEN_SIZE):
+def _canonical_projection(linear, rows, signatures, dtype, in_dim=_QWEN4_HIDDEN_SIZE):
     # The q4 prefill routing reclasses these projections to a QuantizedLinear
     # subclass; the fused decode reads their packed storage, not their forward.
     if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "affine":
@@ -1443,10 +1452,10 @@ def _canonical_projection(linear, rows, signatures, in_dim=_QWEN4_HIDDEN_SIZE):
         linear.weight.shape == (rows, packed_cols)
         and linear.weight.dtype == mx.uint32
         and linear.scales.shape == (rows, scale_cols)
-        and linear.scales.dtype == mx.bfloat16
+        and linear.scales.dtype == dtype
         and linear.biases is not None
         and linear.biases.shape == (rows, scale_cols)
-        and linear.biases.dtype == mx.bfloat16
+        and linear.biases.dtype == dtype
         and "bias" not in linear
     )
 
@@ -1456,6 +1465,7 @@ def _qwen4_decode_static_check(module) -> bool:
 
     if not _qwen4_gdn_geometry_ok(module):
         return False
+    dtype = module.conv1d.weight.dtype
     conv_dim = 2 * 16 * 128 + 48 * 128
 
     # The shipped oQe allocation is intentionally mixed per tensor.  This
@@ -1471,6 +1481,7 @@ def _qwen4_decode_static_check(module) -> bool:
         module.in_proj_qkv,
         conv_dim,
         qkv_signatures,
+        dtype,
     ):
         return False
     for linear, rows in (
@@ -1478,7 +1489,7 @@ def _qwen4_decode_static_check(module) -> bool:
         (module.in_proj_b, 48),
         (module.in_proj_a, 48),
     ):
-        if not _canonical_projection(linear, rows, aux_signatures):
+        if not _canonical_projection(linear, rows, aux_signatures, dtype):
             return False
 
     out = module.out_proj
@@ -1492,18 +1503,20 @@ def _qwen4_decode_static_check(module) -> bool:
         out,
         _QWEN4_HIDDEN_SIZE,
         out_signatures,
+        dtype,
         in_dim=module.num_v_heads * module.head_v_dim,
     )
 
 
-def _one_row_fused_projections(linears):
+def _one_row_fused_projections(linears, dtype):
     """Operands of mlx-vlm's one-row fused in-projection, or None when it keeps four.
 
-    ``_target_verify_linears`` runs one-row bf16 decode through
+    ``_target_verify_linears`` runs one-row decode through
     ``_decode_quantized_linears_fused``: one ``quantized_matmul`` over the
     row-concatenated projections, split back, when all four share bits, group
-    size and mode. This mirrors its gate (the input is always one bf16 row
-    here) and shares its concatenation cache on the first projection.
+    size and mode. This mirrors its gate (the input is always one row of the
+    layer's compute ``dtype`` here) and shares its concatenation cache on the
+    first projection.
     """
     first = linears[0]
     if not all(
@@ -1512,8 +1525,8 @@ def _one_row_fused_projections(linears):
         and linear.group_size == first.group_size
         and linear.mode == first.mode
         and linear.biases is not None
-        and linear.scales.dtype == mx.bfloat16
-        and linear.biases.dtype == mx.bfloat16
+        and linear.scales.dtype == dtype
+        and linear.biases.dtype == dtype
         and "bias" not in linear
         for linear in linears
     ):
@@ -1557,18 +1570,19 @@ def _build_qwen4_decode_plan(module):
     """Resolved operands of the fused B1/T1 decode, or None when ineligible."""
     if not _qwen4_decode_static_check(module):
         return None
+    dtype = module.conv1d.weight.dtype
     projections = (
         module.in_proj_qkv,
         module.in_proj_z,
         module.in_proj_b,
         module.in_proj_a,
     )
-    fused = _one_row_fused_projections(projections)
+    fused = _one_row_fused_projections(projections, dtype)
     in_qmv = None
     if fused is not None:
         weights, scales, biases, _, group_size, bits, mode = fused
         in_qmv = one_row_qmv(
-            weights, scales, biases, bits, group_size, mode, mx.bfloat16, _QWEN4_IN_QMV_RPS
+            weights, scales, biases, bits, group_size, mode, dtype, _QWEN4_IN_QMV_RPS
         )
     out = module.out_proj
     out_qmv = one_row_qmv(
@@ -1578,14 +1592,14 @@ def _build_qwen4_decode_plan(module):
         out.bits,
         out.group_size,
         out.mode,
-        mx.bfloat16,
+        dtype,
         _QWEN4_OUT_QMV_RPS,
     )
     return (
         projections,
         fused,
         module.conv1d.weight,
-        mx.array(module.head_k_dim**-0.5, dtype=mx.bfloat16),
+        mx.array(module.head_k_dim**-0.5, dtype=dtype),
         module.A_log,
         module.dt_bias,
         module.norm.weight,
@@ -1636,12 +1650,12 @@ def _qwen4_decode_static_eligible(module) -> bool:
     return _qwen4_decode_static_check(module)
 
 
-def _qwen4_decode_state_eligible(inputs, cache) -> bool:
-    """One bf16 row against a canonical, unpadded conv and recurrent state."""
+def _qwen4_decode_state_eligible(inputs, cache, dtype) -> bool:
+    """One ``dtype`` row against a canonical, unpadded conv and recurrent state."""
     if (
         not isinstance(inputs, mx.array)
         or inputs.shape != (1, 1, 2560)
-        or inputs.dtype != mx.bfloat16
+        or inputs.dtype != dtype
         or getattr(cache, "lengths", None) is not None
         or getattr(cache, "left_padding", None) is not None
     ):
@@ -1651,7 +1665,7 @@ def _qwen4_decode_state_eligible(inputs, cache) -> bool:
     return (
         isinstance(conv_state, mx.array)
         and conv_state.shape == (1, 3, 10240)
-        and conv_state.dtype == mx.bfloat16
+        and conv_state.dtype == dtype
         and isinstance(recurrent_state, mx.array)
         and recurrent_state.shape == (1, 48, 128, 128)
         and recurrent_state.dtype == mx.float32
@@ -1699,6 +1713,7 @@ def _build_qwen4_verify_plan(module):
     bits, whatever the decode allow-list admits)."""
     if not _qwen4_gdn_geometry_ok(module):
         return None
+    dtype = module.conv1d.weight.dtype
     projections = (
         module.in_proj_qkv,
         module.in_proj_z,
@@ -1708,11 +1723,14 @@ def _build_qwen4_verify_plan(module):
     rows = (2 * 16 * 128 + 48 * 128, 48 * 128, 48, 48)
     out = module.out_proj
     if not (
-        all(_canonical_projection(linear, n, None) for linear, n in zip(projections, rows))
-        and _canonical_projection(out, _QWEN4_HIDDEN_SIZE, None, in_dim=48 * 128)
+        all(
+            _canonical_projection(linear, n, None, dtype)
+            for linear, n in zip(projections, rows)
+        )
+        and _canonical_projection(out, _QWEN4_HIDDEN_SIZE, None, dtype, in_dim=48 * 128)
     ):
         return None
-    fused = _one_row_fused_projections(projections)
+    fused = _one_row_fused_projections(projections, dtype)
     if fused is None:
         return None
     weights, scales, biases, _, group_size, bits, mode = fused
@@ -1724,7 +1742,7 @@ def _build_qwen4_verify_plan(module):
         bits,
         group_size,
         mode,
-        mx.bfloat16,
+        dtype,
         _qwen4_verify_in_tile,
         unrolled=True,
     )
@@ -1735,7 +1753,7 @@ def _build_qwen4_verify_plan(module):
         out.bits,
         out.group_size,
         out.mode,
-        mx.bfloat16,
+        dtype,
         _qwen4_verify_out_tile,
         unrolled=True,
     )
@@ -1745,7 +1763,7 @@ def _build_qwen4_verify_plan(module):
         in_rows,
         out_rows,
         module.conv1d.weight,
-        mx.array(module.head_k_dim**-0.5, dtype=mx.bfloat16),
+        mx.array(module.head_k_dim**-0.5, dtype=dtype),
         module.A_log,
         module.dt_bias,
         module.norm.weight,
@@ -1764,14 +1782,14 @@ def _qwen4_verify_plan(module):
     return cached_per_module(module, "_omlx_qwen4_verify_plan", _build_qwen4_verify_plan)
 
 
-def _qwen4_verify_state_eligible(inputs, cache) -> bool:
-    """B1 bf16 rows against a canonical conv and recurrent state."""
+def _qwen4_verify_state_eligible(inputs, cache, dtype) -> bool:
+    """B1 ``dtype`` rows against a canonical conv and recurrent state."""
     if not (
         isinstance(inputs, mx.array)
         and inputs.ndim == 3
         and inputs.shape[0] == 1
         and inputs.shape[2] == _QWEN4_HIDDEN_SIZE
-        and inputs.dtype == mx.bfloat16
+        and inputs.dtype == dtype
     ):
         return False
     conv_state = cache[0]
@@ -1779,7 +1797,7 @@ def _qwen4_verify_state_eligible(inputs, cache) -> bool:
     return (
         isinstance(conv_state, mx.array)
         and conv_state.shape == (1, 3, 10240)
-        and conv_state.dtype == mx.bfloat16
+        and conv_state.dtype == dtype
         and isinstance(recurrent_state, mx.array)
         and recurrent_state.shape == (1, 48, 128, 128)
         and recurrent_state.dtype == mx.float32
@@ -1847,8 +1865,8 @@ def _qwen4_state_after(
     )[3]
 
 
-def _qwen4_batch_decode_state_eligible(inputs, cache) -> bool:
-    """2..16 bf16 one-token rows against canonical per-row conv and
+def _qwen4_batch_decode_state_eligible(inputs, cache, dtype) -> bool:
+    """2..16 one-token ``dtype`` rows against canonical per-row conv and
     recurrent states, outside a speculative transaction."""
     if not (
         isinstance(inputs, mx.array)
@@ -1856,7 +1874,7 @@ def _qwen4_batch_decode_state_eligible(inputs, cache) -> bool:
         and 2 <= inputs.shape[0] <= _QWEN4_BATCH_DECODE_MAX_ROWS
         and inputs.shape[1] == 1
         and inputs.shape[2] == _QWEN4_HIDDEN_SIZE
-        and inputs.dtype == mx.bfloat16
+        and inputs.dtype == dtype
         and getattr(cache, "lengths", None) is None
         and not getattr(cache, "is_speculating", False)
     ):
@@ -1867,7 +1885,7 @@ def _qwen4_batch_decode_state_eligible(inputs, cache) -> bool:
     return (
         isinstance(conv_state, mx.array)
         and conv_state.shape == (rows, 3, 10240)
-        and conv_state.dtype == mx.bfloat16
+        and conv_state.dtype == dtype
         and isinstance(recurrent_state, mx.array)
         and recurrent_state.shape == (rows, 48, 128, 128)
         and recurrent_state.dtype == mx.float32
@@ -1933,8 +1951,8 @@ def _qwen4_decode_dynamic_eligible(
         and gdn_sink is None
         and mask is None
         and cache is not None
-        and _qwen4_decode_state_eligible(inputs, cache)
         and _qwen4_decode_static_eligible(module)
+        and _qwen4_decode_state_eligible(inputs, cache, module.conv1d.weight.dtype)
     )
 
 
@@ -2191,10 +2209,12 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         # below could not claim it.
         if _QWEN4_DECODE_PLAN_ENABLED and mask is None and cache is not None:
             plan = _qwen4_decode_plan(self)
-            if plan is not None and _qwen4_decode_state_eligible(inputs, cache):
-                return qwen4_decode(self, plan, inputs, cache)
-            if plan is not None and _qwen4_batch_decode_state_eligible(inputs, cache):
-                return _qwen4_batch_decode(self, plan, inputs, cache)
+            if plan is not None:
+                dtype = plan[2].dtype  # conv_w: the layer's compute dtype
+                if _qwen4_decode_state_eligible(inputs, cache, dtype):
+                    return qwen4_decode(self, plan, inputs, cache)
+                if _qwen4_batch_decode_state_eligible(inputs, cache, dtype):
+                    return _qwen4_batch_decode(self, plan, inputs, cache)
         if _qwen4_prefill_eligible(self, inputs, mask, cache):
             return _qwen4_prefill(self, inputs, cache)
         if _qwen35_decode_eligible(self, inputs, mask, cache):
@@ -2254,7 +2274,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             mixed_qkv,
             cache[0],
             self.conv1d.weight,
-            mx.array(self.head_k_dim**-0.5, dtype=mx.bfloat16),
+            mx.array(self.head_k_dim**-0.5, dtype=inputs.dtype),
             b,
             a,
             self.A_log,
@@ -2339,10 +2359,12 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             and cache.lengths is None
             and 1 <= length <= _QWEN4_VERIFY_MAX_ROWS
             and (length == 1 or is_row_exact_armed())
-            and _qwen4_verify_state_eligible(inputs, cache)
         ):
             plan = _qwen4_verify_plan(layer)
-            if plan is not None:
+            # plan[2] is conv_w, which holds the layer's compute dtype.
+            if plan is not None and _qwen4_verify_state_eligible(
+                inputs, cache, plan[2].dtype
+            ):
                 result = _qwen4_verify(plan, inputs, cache)
                 if hasattr(cache, "advance"):
                     cache.advance(length)
