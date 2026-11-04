@@ -836,6 +836,7 @@ final class MenubarController: NSObject {
 
     @objc private func statsDidUpdate(_ note: Notification) {
         if let poller = note.object as? MenubarStatsPoller,
+           poller.lastTickWasSuccess,
            let lastStatusSuccessAt = poller.lastStatusSuccessAt {
             server?.recordAuxiliaryHealthSuccess(at: lastStatusSuccessAt)
         }
@@ -1424,7 +1425,9 @@ extension MenubarController {
     ///
     /// Internal (not private) so `MenubarControllerPortTests` can exercise
     /// it without a live `NSStatusBar`.
-    static func webAdminURL(host: String, port: Int, apiKey: String?) -> URL? {
+    static func webAdminURL(
+        host: String, port: Int, apiKey: String?, redirect: String = "/admin/dashboard"
+    ) -> URL? {
         guard let baseURL = AppConfig.httpURL(
             host: AppConfig.connectableHost(for: host),
             port: port
@@ -1434,7 +1437,7 @@ extension MenubarController {
             return nil
         }
         comps.path = "/admin/auto-login"
-        var items = [URLQueryItem(name: "redirect", value: "/admin/dashboard")]
+        var items = [URLQueryItem(name: "redirect", value: redirect)]
         if let key = apiKey, !key.isEmpty {
             items.append(URLQueryItem(name: "key", value: key))
         }

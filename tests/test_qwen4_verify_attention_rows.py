@@ -400,10 +400,9 @@ def test_float32_pooled_bank_follows_trim_and_regrowth():
     assert not _bit_equal(mirror[:, -2:], first[:, -2:])
 
 
-def test_gathered_verify_rows_keep_the_selection_kernel_past_the_decode_cap(monkeypatch):
-    """Past 65,536 tokens a decode row selects with the MLX ops while row-exact
-    verify rows keep the one-launch kernel (PER 32). Both arms pick the same
-    tokens, so every verify row still equals its serial decode step."""
+def test_gathered_verify_rows_use_per_32_selection_and_match_serial_decode(monkeypatch):
+    """At 65,601 tokens both decode and row-exact verify use the PER 32 kernel.
+    Every verify row must still equal its serial decode step."""
     qsa_fast = importlib.import_module("mlx_vlm.models.qwen4_exp.qsa_fast")
     attn = _attention(seed=7)
     cache = _prefill(attn, 65601, seed=8)
@@ -442,7 +441,7 @@ def test_gathered_verify_rows_keep_the_selection_kernel_past_the_decode_cap(monk
     ):
         pytest.skip("decode selection threadgroup exceeds this GPU's pipeline limit")
     assert verify_picks == [True, True, True]
-    assert picks == [False, False, False]
+    assert picks == [True, True, True]
     assert _bit_equal(verified, serial)
     for got, want in zip(verified_state, _state(cache)):
         assert _bit_equal(got, want)

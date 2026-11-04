@@ -366,20 +366,23 @@ final class ServerProcess: @unchecked Sendable {
     /// was delayed.
     @MainActor
     func recordAuxiliaryHealthSuccess(at date: Date = Date()) {
+        if attachedExternally {
+            lastAuxiliaryHealthyAt = date
+            autoRestartBudget.recordHealthy(at: date)
+            consecutiveFailures = 0
+            if case .unresponsive(let pid) = state {
+                update(.attached(pid: attachedOwnerPID ?? pid))
+            }
+            return
+        }
+        // A recent response from an exited child is not evidence of a live server.
+        guard let process, process.isRunning else { return }
         lastAuxiliaryHealthyAt = date
         autoRestartBudget.recordHealthy(at: date)
         consecutiveFailures = 0
         switch state {
-        case .starting:
-            if let pid = process?.processIdentifier {
-                update(.running(pid: pid))
-            }
-        case .unresponsive(let pid):
-            if attachedExternally {
-                update(.attached(pid: attachedOwnerPID ?? pid))
-            } else {
-                update(.running(pid: pid))
-            }
+        case .starting, .unresponsive:
+            update(.running(pid: process.processIdentifier))
         default:
             break
         }
@@ -447,6 +450,8 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     private func handleProcessExit(code: Int32, pid: Int32) {
+        cancelHealthLoop()
+        lastAuxiliaryHealthyAt = nil
         let wasExpectingExit = expectingExit
         expectingExit = false
         attachedExternally = false
@@ -587,13 +592,18 @@ final class ServerProcess: @unchecked Sendable {
         }
 
         presentStartupNotice()
+        // .starting also covers restart backoff, when no child exists yet.
+        guard let probedProcess = process, probedProcess.isRunning else { return }
         let probe = await resolver.probeHealth()
+        // The child may have exited or been replaced while the probe was pending.
+        guard !Task.isCancelled,
+              process === probedProcess,
+              probedProcess.isRunning else { return }
         let now = Date()
         switch state {
         case .starting:
             if probe.ok || hasRecentAuxiliaryHealth(now: now) {
-                let pid = process?.processIdentifier ?? 0
-                markHealthy(pid: pid, at: now)
+                markHealthy(pid: probedProcess.processIdentifier, at: now)
             } else {
                 logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: false)
             }

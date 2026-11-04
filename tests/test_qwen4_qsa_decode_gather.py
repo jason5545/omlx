@@ -1133,8 +1133,7 @@ def test_decode_steps_match_the_ops_path_bit_for_bit(monkeypatch, key_len):
         mx.eval(fast, ops)
         assert mx.array_equal(fast.view(mx.uint16), ops.view(mx.uint16)).item(), step
     assert ran["mask"] == 6
-    if qsa_fast._gpu_class() == "d":
-        assert ran["sdpa"] == 6
+    assert ran["sdpa"] == (6 if qsa_fast._two_pass_blocks(12, key_len + 1) else 0)
     for fast_state, ops_state in zip(fast_cache.state, ops_cache.state):
         assert mx.array_equal(fast_state, ops_state).item()
     pooled = fast_cache._pooled_index_offset
@@ -1144,21 +1143,27 @@ def test_decode_steps_match_the_ops_path_bit_for_bit(monkeypatch, key_len):
     ).item()
 
 
-@pytest.mark.skipif(
-    qsa_fast._gpu_class() != "d",
-    reason="MLX's two-pass partition count is transcribed for 'd'-class GPUs only",
-)
 @pytest.mark.parametrize(
     "key_len",
     [
         2052,
-        16383,  # last 128-partition length
-        16384,  # first 512-partition length
-        65536,  # first 1024-partition length
+        8192,  # 's': MLX's own kernel through 8192 keys
+        8193,  # 's': first 256-partition length
+        16383,  # 'd': last 128-partition length
+        16384,  # 'd': first 512-partition length
+        32768,  # 's': last 256-partition length
+        32769,  # 's': first 512-partition length
+        65536,  # 'd': first 1024-partition length; 's': last 512
+        65537,  # 's': first 1024-partition length
     ],
 )
 @pytest.mark.parametrize("kind", ["qsa", "sparse_head", "all"])
 def test_masked_decode_sdpa_matches_mlx_bit_for_bit(key_len, kind):
+    if qsa_fast._two_pass_blocks(12, key_len) is None:
+        assert qsa_fast._gpu_class() != "d" and not (
+            qsa_fast._gpu_class() == "s" and key_len > 8192
+        )
+        pytest.skip("MLX's own kernel runs this length on this GPU class")
     rng = np.random.default_rng(key_len)
     capacity = key_len + 777
     # Cache-shaped views: a prefix of a larger buffer, as update_and_fetch returns.
@@ -1223,10 +1228,21 @@ def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
     assert mx.array_equal(actual, expected).item()
 
 
-@pytest.mark.parametrize("key_len,kernel", [(32773, True), (65539, True), (65540, False), (89001, False), (160003, False)])
+@pytest.mark.parametrize(
+    "key_len,kernel",
+    [
+        (32773, True),
+        (65539, True),
+        (65540, True),
+        (89001, True),
+        (131075, True),
+        (131076, False),
+        (160003, False),
+    ],
+)
 def test_selection_kernel_stops_at_its_latency_crossover(key_len, kernel):
-    """Up to 16384 blocks (PER 16) the one-launch kernel selects; larger banks
-    keep the MLX ops, whose latency is lower there (89k: 0.077 vs 0.111 ms)."""
+    """Up to 32768 blocks (PER 32) the one-launch kernel selects; larger banks
+    keep the MLX ops, whose latency is lower there."""
     blocks = key_len // RATIO
     scores = mx.array(_head_scores(blocks, "normal", key_len).reshape(1, 1, 4, blocks))
     result = qsa_fast.decode_block_selection_tokens(

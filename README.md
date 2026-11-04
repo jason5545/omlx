@@ -171,6 +171,12 @@ and a capability-gated experimental token-only output path. See
 security boundaries, current limitations, and the physical-hardware validation
 checklist.
 
+A paired Mac can also speed up prefill without splitting the model: the
+[Prefill Accelerator](docs/experimental/prefill-accelerator.md) runs the first
+layers of long prompts on the other Mac while the model, its cache and
+decoding stay on this one (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next and
+MiniMax M3).
+
 ### Vision-Language Models
 
 Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. MiMo V2.6 checkpoints with bundled sidecars also accept sampled-frame video and 24 kHz audio. Qwen3.5, Qwen3.6 and Qwen3.8 checkpoints (dense and MoE) accept native video input as base64 `video_url` / `input_video` data URIs; video needs OpenCV (`opencv-python-headless`). oQ conversion of official MiMo V2.6 checkpoints preserves image and audio support. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
@@ -248,6 +254,8 @@ Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, Mistral Vibe, and D
 
 `omlx launch codex` and `omlx launch codex_app` give Codex a catalog of every chat model on the server, so you switch models with `/model` or the app's model picker. `--model`, the saved Codex model, or the server default picks the starting model. This needs Codex 0.148 or newer; relaunch after you add or remove models.
 
+`omlx launch copilot` gives Copilot CLI a catalog of every chat model on the server, so you switch models with `/model`. `--model`, the saved Copilot model, or the server default picks the starting model. The catalog goes into Copilot's `providers.json` next to your other providers, and the file is kept at `0600` because it holds the server's API key. This needs Copilot CLI 1.0.83 or newer; relaunch after you add or remove models.
+
 Install [Mistral Vibe](https://github.com/mistralai/mistral-vibe) 2.26.0 or newer with `uv tool install mistral-vibe`, then run `omlx launch vibe` to select a local model, or `omlx launch vibe --model <model-id>`. Vibe's provider, model, API-key reference and context window are configured for that process through its `VIBE_*` environment overrides. Existing `config.toml`, `VIBE_HOME`, tool permissions and cloud configuration are preserved. Pass Vibe arguments after `--`, for example `omlx launch vibe --model <model-id> -- --resume`.
 
 ### Performance Benchmark
@@ -321,7 +329,7 @@ Models are auto-detected by type. You can also download models directly from the
 | Type | Models |
 |------|--------|
 | LLM | Any model supported by [mlx-lm](https://github.com/ml-explore/mlx-lm) |
-| VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) models |
+| VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) models |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
@@ -465,7 +473,7 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 ## Acknowledgments
 
 - [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Vision-language model inference on Apple Silicon
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) - Vision-language model inference on Apple Silicon
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX started from vllm-mlx v0.1.0 and evolved significantly with multi-model serving, tiered KV caching, VLM with full paged cache support, an admin panel, and a macOS menu bar app
 - [venvstacks](https://venvstacks.lmstudio.ai) - Portable Python environment layering for the macOS app bundle
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
