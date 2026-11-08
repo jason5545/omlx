@@ -848,6 +848,48 @@ def test_fused_multirow_kernel_matches_dequantize_reference(
     assert routed_diff.max().item() == 0.0
 
 
+@pytest.mark.parametrize("q_len", [2, 4, 5, 8, 15])
+def test_fused_multirow_kernel_keeps_wide_3bit_windows_on_packed_state(
+    q_len, monkeypatch
+):
+    """Wide 3-bit MTP windows stay on the fused path with spare cache capacity."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    monkeypatch.setattr(tq_attention, "_mma_mse_attention", lambda *a, **k: None)
+    mx.random.seed(0)
+    B, n_q, n_kv, D = 1, 16, 2, 256
+    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 500
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T - q_len, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T - q_len, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=3.0)
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((B, n_kv, q_len, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, q_len, D)).astype(mx.float16),
+    )
+    assert tq.keys.norms.shape[2] > tq.offset == T
+    queries = mx.random.normal((B, n_q, q_len, D)).astype(mx.float16)
+    scale = D**-0.5
+
+    fused = tq_attention._fused_multirow_mse_attention(
+        tq, queries, tq._unwrap(ks), tq._unwrap(vs), scale, T
+    )
+    assert fused is not None
+
+    dk, dv = tq.dequantize()
+    causal = mx.arange(T)[None, :] <= mx.arange(T - q_len, T)[:, None]
+    ref = mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, mask=causal
+    )
+    assert mx.abs(fused.astype(mx.float32) - ref).max().item() < 5e-3
+
+    routed = tq_attention._decode_multirow_attention(tq, queries, ks, vs, scale)
+    routed_diff = mx.abs(routed.astype(mx.float32) - fused.astype(mx.float32))
+    assert routed_diff.max().item() == 0.0
+
+
 def test_fused_multirow_kernel_reads_sliced_cache_views(multirow_kernel):
     """Decode appends into a preallocated buffer, so attention gets states
     sliced to the written length out of a larger capacity (not row

@@ -58,6 +58,8 @@
 
 合併 upstream 後衝突落在下列檔案時逐項確認：
 
+- upstream #4866（2165e757）新增寬 MTP verify 視窗的 packed-state fused kernel。本地兩列分組、stride 讀取與 NAX 路徑保留；確認 `tests/test_turboquant.py::test_fused_multirow_kernel_keeps_wide_3bit_windows_on_packed_state` 覆蓋 3-bit、寬視窗與容量大於 offset 的情境。
+
 - `omlx/server.py`（sub-key policy hooks、`DEFAULT_SUB_KEY_POLICIES`；Anthropic endpoint 改用 `_prepare_anthropic_prompt` 後，仍要傳遞 `request_policy`）
 - `omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`
 - `omlx/engine_pool.py`（single-model residency；不要恢復成可同時 resident 多個 model 的 admission 行為）
