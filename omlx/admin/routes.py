@@ -418,7 +418,7 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
-    # INT8-activation (A8) prefill (Qwen3.5/3.6/3.8, Qwen3.8 Flash-Next, DeepSeek V4.1)
+    # A8 prefill (Qwen3.5/3.6/3.8, Qwen3.8 Flash-Next, DeepSeek V4.1, MiniMax M3)
     a8_prefill_enabled: bool | None = None
     a8_prefill_min_tokens: int | None = None
     # MoE expert offload (stream non-resident experts from the checkpoint)
@@ -2703,6 +2703,40 @@ async def unload_model(
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
 
+@router.post("/api/models/{model_id}/requests/{request_id}/abort")
+async def abort_model_request(
+    model_id: str,
+    request_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Stop one waiting, prefilling or generating request; the model stays loaded."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    if entry.engine is None:
+        raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+    abort = getattr(entry.engine, "abort_request", None)
+    if not callable(abort):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model cannot stop a single request: {model_id}",
+        )
+
+    found = await abort(
+        request_id,
+        reason="Request stopped by the server admin",
+        error_code="admin_abort",
+    )
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Request not found: {request_id}")
+    logger.info("Admin stopped request %s on %s", request_id, model_id)
+    return {"status": "ok", "model_id": model_id, "request_id": request_id}
+
+
 async def _require_admin_or_bearer(request: Request) -> bool:
     """Allow admin session OR a valid Bearer API key (for CLI use)."""
     gs = _get_global_settings() if _get_global_settings else None
@@ -3722,7 +3756,7 @@ def _validate_model_settings(entry, settings):
                 status_code=400,
                 detail=(
                     "A8 prefill is available only for Qwen3.5/3.6/3.8, "
-                    "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
+                    "Qwen3.8-Flash-Next, DeepSeek V4.1 and MiniMax M3 models."
                 ),
             )
         if settings.get("qwen35_ane_prefill_enabled"):
@@ -4059,7 +4093,7 @@ def _feature_problem(
         if not _oq_a8_model_supported(entry.config_model_type):
             return (
                 "A8 prefill is available only for Qwen3.5/3.6/3.8, "
-                "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
+                "Qwen3.8-Flash-Next, DeepSeek V4.1 and MiniMax M3 models."
             )
         if not _oq_a8_kernels_available() and not snapshot.get(
             "prefill_helper_node_id"
@@ -7262,6 +7296,13 @@ def _build_active_models_data() -> dict:
         if is_loaded and effective_ttl is not None and idle_seconds is not None:
             ttl_remaining_seconds = max(0.0, effective_ttl - idle_seconds)
 
+        # Cluster rows come from rank zero's sample and carry no engine id.
+        request_abort = (
+            entry is not None
+            and callable(getattr(entry.engine, "abort_request", None))
+            and not model_info.get("cluster")
+        )
+
         models.append(
             {
                 "id": model_id,
@@ -7286,6 +7327,7 @@ def _build_active_models_data() -> dict:
                 "activities": activities,
                 "prefilling": prefilling,
                 "generating": generating,
+                "request_abort": request_abort,
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "cluster": (
