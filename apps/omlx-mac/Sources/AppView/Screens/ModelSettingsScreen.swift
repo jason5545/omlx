@@ -129,7 +129,7 @@ private struct Header: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Squircle(systemSymbol: "cpu", size: 44, gradient: SquircleGradient.models)
+            ModelIconTile(modelType: model?.modelType, size: 44)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(model?.displayTitle ?? "—")
@@ -142,8 +142,10 @@ private struct Header: View {
                     }
                 }
                 if let m = model {
-                    Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
-                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
+                    Text([m.idNotInTitle, m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize)]
+                        .compactMap { $0 }
+                        .joined(separator: " · "))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -1563,8 +1565,8 @@ private struct PrefillAcceleratorGroup: View {
                                 comment: "Picker suffix for a paired Mac that does not answer"))
         } else if device.versionOk != true {
             parts.append(String(localized: "settings.acceleration.prefill_helper.update",
-                                defaultValue: "needs the same oMLX version",
-                                comment: "Picker suffix for a paired Mac on another oMLX version"))
+                                defaultValue: "needs an update",
+                                comment: "Picker suffix for a paired helper that needs an update"))
         } else if let fit = device.layersFit, fit > 0 {
             parts.append(String(localized: "settings.acceleration.prefill_helper.fits",
                                 defaultValue: "\(fit) layers fit",
