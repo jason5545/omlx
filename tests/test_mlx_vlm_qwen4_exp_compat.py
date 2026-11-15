@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import mmap
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1779,6 +1780,64 @@ def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
     assert embedding.rows_read == 2
     assert embedding._shard_specs[0][3:] == (bits, 32)
     embedding.close()
+
+
+def test_disk_backed_ple_advises_a_decode_tokens_pages_before_copying(tmp_path, monkeypatch):
+    """A token's per-shard gathers advise every page before the first copy; larger gathers keep the pool prefetch.
+
+    Upstream #5225 advises once per row and only up to 8 rows; this fork advises
+    each distinct page once and up to ``_PLE_ADVISE_MAX_ROWS`` rows (PATCHES.md,
+    SSD PLE entry), so the count and the threshold follow the local policy.
+    """
+    from mlx_vlm.models.qwen4_exp import language as ple
+
+    monkeypatch.setattr(ple, "_PLE_FAST_GATHER", False)
+    embedding, table = _disk_ple(tmp_path, shards=4, rows=2048, dims=160, bits=4)
+
+    events = []
+
+    class RecordingMap(mmap.mmap):
+        def madvise(self, option, start, length):
+            events.append(("advise", start, start + length))
+            return super().madvise(option, start, length)
+
+    reader = next(iter(embedding._readers.values()))
+    copy_rows = reader.rows_np
+
+    def rows_np(key, rows):
+        events.append(("copy", key, int(rows[0])))
+        return copy_rows(key, rows)
+
+    reader._mapping.close()
+    reader._mapping = RecordingMap(reader._file.fileno(), 0, access=mmap.ACCESS_READ)
+    reader.rows_np = rows_np
+
+    # One decode token: a row in each of the four shards.
+    indices = mx.array([[5, 2048 + 900, 2 * 2048 + 2047, 3 * 2048 + 1500]], dtype=mx.int32)
+    values = embedding(indices)
+    assert mx.array_equal(values, mx.take(table, indices.reshape(-1), axis=0)[None]).item()
+    advised = [event for event in events if event[0] == "advise"]
+    copies = events[len(advised) :]
+    assert advised and len(copies) == 4 * 3 and all(event[0] == "copy" for event in copies)
+    covered = {
+        page
+        for _, begin, stop in advised
+        for page in range(begin // ple._PLE_PAGE_SIZE, (stop - 1) // ple._PLE_PAGE_SIZE + 1)
+    }
+    for _, key, row in copies:
+        entry = reader._header[key]
+        start, end = entry["data_offsets"]
+        row_bytes = (end - start) // entry["shape"][0]
+        first = reader._data_start + start + row * row_bytes
+        pages = range(first // ple._PLE_PAGE_SIZE, (first + row_bytes - 1) // ple._PLE_PAGE_SIZE + 1)
+        assert covered.issuperset(pages), key
+
+    events.clear()
+    embedding(mx.array([list(range(ple._PLE_ADVISE_MAX_ROWS + 1))], dtype=mx.int32))
+    assert [event[0] for event in events if event[0] == "copy"] == ["copy"] * 3
+    assert not any(event[0] == "advise" and event[2] - event[1] <= ple._PLE_PAGE_SIZE for event in events)
+    embedding.close()
+
 
 # ---------------------------------------------------------------------------
 # Continuous-batching join regressions (issue #3245, PR #3246)

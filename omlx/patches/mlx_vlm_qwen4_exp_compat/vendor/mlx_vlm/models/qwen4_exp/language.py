@@ -3586,6 +3586,9 @@ _PLE_IO_POOL = ThreadPoolExecutor(
     max_workers=_PLE_IO_WORKERS, thread_name_prefix="ple-io"
 )
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+# Gathers of more rows read their missing pages on the I/O pool first; smaller
+# ones (a decode token's rows in each shard) are advised to the kernel instead.
+_PLE_POOL_PREFETCH_ROWS = 8
 # Slow gathers may indicate page eviction. Allow normal gather overhead and
 # rate-limit retries; elapsed time is a heuristic, not a residency check.
 _PLE_REARM_FLOOR_SECONDS = 0.0005
@@ -3689,7 +3692,7 @@ class _SafeTensorMMap:
         if row_indices.size == 0:
             return np.empty((0, shape[1]), dtype=np_dtype), dtype
         gather_start = None
-        if row_indices.size > 8:
+        if row_indices.size > _PLE_POOL_PREFETCH_ROWS:
             fully_seen = self._prefetch_missing_pages(
                 row_indices,
                 self._data_start + start,
