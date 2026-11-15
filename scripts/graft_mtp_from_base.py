@@ -28,7 +28,7 @@ sidecar is rewritten and the config value is reset to 1.
 Usage:
     python scripts/graft_mtp_from_base.py \
         --model-dir ~/.lmstudio/models/SolsticeAI/Arete-27B-Unlocked-Uncensored-Heretic-mlx-8Bit \
-        --base-repo Qwen/Qwen3.6-27B
+        [--base-repo Qwen/Qwen3.8-27B]   # default: follow the base_model chain
 """
 
 from __future__ import annotations
@@ -74,6 +74,47 @@ def _safetensors_header(url: str) -> tuple[int, dict]:
     return n, json.loads(_range(url, 8, 8 + n - 1))
 
 
+def _card_base_models(repo: str) -> list[str]:
+    with urllib.request.urlopen(f"{HF}/api/models/{repo}", timeout=60) as resp:
+        card = json.loads(resp.read()).get("cardData") or {}
+    base = card.get("base_model") or []
+    return [base] if isinstance(base, str) else list(base)
+
+
+def resolve_base_repo(model_dir: Path, vendor: str = "Qwen/") -> str:
+    """Walk the model cards' ``base_model`` chain up to the vendor release.
+
+    Fine-tunes name their parent, not the release they started from (Arete:
+    SolsticeAI heretic -> NousResearch/Arete-27B -> Qwen/Qwen3.8-27B), and a
+    guessed base silently grafts weights trained against another backbone.
+    """
+    readme = model_dir / "README.md"
+    start: list[str] = []
+    if readme.exists():
+        text = readme.read_text(errors="replace")
+        if text.startswith("---"):
+            front = text.split("---", 2)[1]
+            for line in front.splitlines():
+                if line.startswith("base_model:"):
+                    value = line.split(":", 1)[1].strip()
+                    if value:
+                        start.append(value)
+    if not start:
+        raise SystemExit(f"no base_model in {readme}; pass --base-repo")
+    seen: set[str] = set()
+    frontier = start
+    while frontier:
+        repo = frontier.pop(0)
+        if repo in seen:
+            continue
+        seen.add(repo)
+        if repo.startswith(vendor):
+            print(f"base repo: {' -> '.join(sorted(seen))} => {repo}")
+            return repo
+        frontier.extend(_card_base_models(repo))
+    raise SystemExit(f"no {vendor} release in the base_model chain {sorted(seen)}")
+
+
 def _bf16_array(buf: bytes, shape: tuple[int, ...]) -> mx.array:
     raw = np.frombuffer(buf, dtype=np.uint16).reshape(shape)
     return mx.array(raw).view(mx.bfloat16)
@@ -110,7 +151,11 @@ def _mean_bf16(raw: np.ndarray) -> float:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True, type=Path)
-    ap.add_argument("--base-repo", default="Qwen/Qwen3.6-27B")
+    ap.add_argument(
+        "--base-repo",
+        default="auto",
+        help="vendor release to graft from; auto follows the model cards' base_model chain",
+    )
     ap.add_argument("--base-revision", default="main")
     ap.add_argument("--bits", type=int, default=None)
     ap.add_argument("--group-size", type=int, default=None)
@@ -123,6 +168,9 @@ def main() -> int:
     if not config_path.exists() or not index_path.exists():
         print(f"not an MLX sharded checkpoint: {model_dir}", file=sys.stderr)
         return 2
+
+    if args.base_repo == "auto":
+        args.base_repo = resolve_base_repo(model_dir)
 
     config = json.loads(config_path.read_text())
     index = json.loads(index_path.read_text())
