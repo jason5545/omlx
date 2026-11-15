@@ -56,9 +56,7 @@ class Omlx < Formula
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
     ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
 
-    # Keep watchfiles source-built because its wheel lacks header room for
-    # Homebrew's linkage rewrite; the current [audio] extras do not install it.
-    no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken,watchfiles"
+    no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken"
     pip_flags = []
     if MacOS.version >= "27"
       # macOS 27's dyld requires the LC_SYMTAB string pool to start on an
@@ -135,8 +133,6 @@ class Omlx < Formula
     # Install the spaCy English model required by misaki for Kokoro TTS.
     # Homebrew's cached resource path is hash-prefixed, which pip rejects
     # as an invalid wheel filename. Copy it back to the canonical basename.
-    # preshed 3.0.14 breaks spaCy 3.8.16's tokenizer load in _flush_specials.
-    system(*pip_install, "preshed<3.0.14")
     spacy_model_wheel = buildpath/"en_core_web_sm-3.8.0-py3-none-any.whl"
     cp resource("en-core-web-sm").cached_download, spacy_model_wheel
     system libexec/"bin/pip", "install", "--no-deps",

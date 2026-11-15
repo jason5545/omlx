@@ -10,14 +10,13 @@
 
 ## 保留的本地改動
 
-自 0.6.3rc1 merge 起，這個 fork 盡量貼齊 upstream，只保留三十五個本地功能；其他一律 follow upstream（舊的 VLM/MTP、MTPLX、thinking-budget patch stack 已整批丟棄，存在 `backup/pre-upstream-merge` 分支僅供查閱，不要回移植）：
+自 0.6.3rc1 merge 起，這個 fork 盡量貼齊 upstream，只保留三十四個本地功能；其他一律 follow upstream（舊的 VLM/MTP、MTPLX、thinking-budget patch stack 已整批丟棄，存在 `backup/pre-upstream-merge` 分支僅供查閱，不要回移植）：
 
 - API sub-key 可以套 request policy（`identify_api_key` → `DEFAULT_SUB_KEY_POLICIES`）。`voco` 預設是 `max_context_window<=16384` 且 `enable_thinking=false`。有接的端點：`/v1/completions`、`/v1/chat/completions`、`/v1/messages`、`/v1/responses`、`/v1/decisions`（decisions 的讀出一律關 thinking，所以只有 `max_context_window` 有作用；decision model 走自己的 encoder，不套）。追 upstream 時新的推論端點要記得接。相關檔案：`omlx/server.py`、`omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`。測試：`tests/test_context_window.py` 的 `TestRequestPolicy`、`tests/integration/test_server_endpoints.py` 的 `test_decisions_sub_key_*`。
 - Mac app attach mode：`8000` 上已有健康 oMLX server 時 app 直接 attach，不顯示 port conflict；細節見下面 Mac app 章節。相關檔案：`apps/omlx-mac/Sources/Server/ServerProcess.swift` 等 6 個 Swift 檔。
-- `Formula/omlx.rb` 的 homepage/HEAD 指向 `https://github.com/jason5545/omlx.git`（xgrammar macOS arm64 post-install patch 已被 upstream 吸收，不需再維護本地版）。合併 0.7.3rc1 時保留 upstream 的 Ruby `post_install` 實作，同時保留本地 preshed 上限與 JANG 安裝。
-- `Formula/omlx.rb` 把 preshed 釘在 `<3.0.14`（2026-10-25，暫時）：preshed 3.0.14（2026-10-24 發布）讓 spaCy 3.8.16 載入 `en_core_web_sm` 時在 `Tokenizer._flush_specials` 丟 `OverflowError: Python int too large to convert to C ssize_t`，Formula 的 spaCy 驗證失敗、整套重裝中斷。乾淨 venv 逐一換版確認只有 preshed 會觸發（cymem 2.0.16、murmurhash 1.0.16、srsly 2.5.5 都正常）。preshed 出修正版、或 upstream 自己處理後拿掉。
-- `Formula/omlx.rb` 的 `no_binary` 保留 `watchfiles`（2026-10-30，防護）：mlx-audio 0.6.3 的 `[all]` 曾透過 `uvicorn[standard]` 帶入 watchfiles；它的預編 wheel 沒有足夠 header 空間，Homebrew 修 linkage 時會丟 `MachO::HeaderPadError`。upstream #4942 改由 oMLX `[audio]` extra 安裝 mlx-audio；2026-11-01 macOS 27.2 的乾淨 venv 沒有解析出 watchfiles，所以目前這項是預防性保留。10/30 預編 wheel 失敗、原始碼版成功；本次 557 個 `.so`／`.dylib` 測試中，tiktoken 成功，唯一失敗是 xgrammar wheel 內 `.dSYM` 的 DWARF debug-symbol 檔，runtime `libxgrammar_bindings.dylib` 成功。
+- `Formula/omlx.rb` 的 homepage/HEAD 指向 `https://github.com/jason5545/omlx.git`（xgrammar macOS arm64 post-install patch 已被 upstream 吸收，不需再維護本地版）。`post_install` 改成宣告式 `post_install_steps`（9796feef、37cb72d0，2026-09-22；upstream 仍是 Ruby `def post_install`），xgrammar rpath／RECORD 與 custom kernel rpath 兩段修補都在那段 shell 裡，合併時兩段都要留著；另外保留 JANG 安裝那一行。2026-11-15 拿掉 preshed `<3.0.14` 上限（preshed 3.0.15 已發布、3.0.14 已從 PyPI 撤下，乾淨 venv 實測 3.0.15＋spaCy 3.8.18 載入 `en_core_web_sm` 正常）與 `no_binary` 裡預防性的 `watchfiles`（目前的 venv 解析不到它；若又被帶進來，整套重裝前的 install_name_tool 模擬會抓到 HeaderPadError），`no_binary` 與 `tests/test_homebrew_formula.py` 回到 upstream 版本。
 - qwen3_5_moe VLM 強制 sanitize（`omlx/engine/vlm.py` 的 `_force_qwen35_moe_sanitize_on_load`）：mlx-vlm 用第一個 glob 到的 shard metadata 判斷 `is_mlx_format`，mixed-metadata checkpoint（如 Ornith-1.5 MXFP8）會跳過 sanitize，per-expert MTP MoE 權重沒堆疊成 switch_mlp，strict load 失敗 → 退回純 LLM、視覺被靜默丟掉。追 upstream 時守住這段。
+- OCR 模型的 PDF 並行上限跟著 EnginePool：`omlx/api/markitdown_pdf_fallback.py` 的 `_pool_concurrency_cap` 讀 `engine_pool.max_concurrent_requests_for(model_id)`（OCR 模型單獨常駐時可以開比較寬），沒有這個方法或回傳不是正整數時，退回 `scheduler.max_concurrent_requests`。`omlx/admin/routes.py` 改設定後自動重載 pinned model 用 `engine_pool.get_engine`，不直接呼叫 `_load_engine`（要走單一常駐的 admission）。Xiaomi-OCR weld 在用。2026-11-15 盤點時補記，原本沒寫進這份清單。
 - EnginePool 只允許一個 resident model：harness 或 API request 從 model A 切到 model B 時，先 unload 其他閒置 engine，再載入 B；如果 A 有 active request 或 lease，回 `ModelBusyError`，不要硬拆進行中的 request。相關檔案：`omlx/engine_pool.py`、`omlx/admin/routes.py`、`tests/test_engine_pool.py`。
 - `packaging/build.py` 下載一律走 `_urlopen`／`_ssl_context`，不直接用 `urllib.request.urlretrieve`：python.org 的 macOS 直譯器（build driver 預設用 PATH 上的 `python3`）附的 OpenSSL 沒有預設信任庫，spacy 模型下載會以 `CERTIFICATE_VERIFY_FAILED` 失敗，donor 重建中斷在 `_install_spacy_model`。helper 依序找 `SSL_CERT_FILE`、certifi、`/etc/ssl/cert.pem` 等系統 bundle。相關檔案：`packaging/build.py`。
 - JANGQ affine-ternary prism 轉接：dealignai 的 Bonsai-2-27B-*-Ternary-JANG 沿用 PrismML 的 ternary 權重，但把 `model_type` 改成 `qwen3_5`、又加 `storage_bits`，所以走不到 upstream #3782 已支援的 `prism_hadamard_qwen35`；載入時把 config 正規化成 schema-2、重建 modules manifest、拿掉 `storage_bits`、放寬 prism 的量化檢查、補 161 個 zero-centered norm 的 +1.0，全部在一次載入內 patch 並還原。相關檔案：`omlx/patches/prism_jangq_compat.py`、`omlx/utils/model_loading.py` 的 `maybe_load_jangq_prism`、`omlx/engine/vlm.py` 與 `omlx/engine/batched.py` 的呼叫點（batched 端只負責擋純文字載入）、`tests/test_prism_jangq_compat.py`。
@@ -62,9 +61,9 @@
 
 - `omlx/server.py`（sub-key policy hooks、`DEFAULT_SUB_KEY_POLICIES`；Anthropic endpoint 改用 `_prepare_anthropic_prompt` 後，仍要傳遞 `request_policy`）
 - `omlx/admin/auth.py`、`omlx/api/openai_models.py`、`omlx/settings.py`
-- `omlx/engine_pool.py`（single-model residency；不要恢復成可同時 resident 多個 model 的 admission 行為）
+- `omlx/engine_pool.py`（single-model residency；不要恢復成可同時 resident 多個 model 的 admission 行為；`max_concurrent_requests_for` 給 `omlx/api/markitdown_pdf_fallback.py` 的 `_pool_concurrency_cap` 用）
 - `apps/omlx-mac/Sources/Server/ServerProcess.swift`（attach mode；外部 server 沒有 child `Process`，成功的 `/api/status` 要能把 `.unresponsive` 還原成 `.attached`；managed child 保留 upstream 的 live-process guard，避免已退出程序的舊回應干擾自動重啟）
-- `Formula/omlx.rb`（homepage/head 要維持 jason5545）
+- `Formula/omlx.rb`（homepage/head 要維持 jason5545；`post_install_steps` 的 xgrammar 與 custom kernel 兩段修補不要被 upstream 的 Ruby `def post_install` 蓋掉）
 - `packaging/build.py`（`_ssl_context`／`_urlopen`；不要退回裸 `urllib.request.urlretrieve`）
 - `omlx/patches/prism_jangq_compat.py`、`omlx/utils/model_loading.py`（`maybe_load_jangq_prism`、`maybe_load_jang`）、`omlx/engine/vlm.py` 與 `omlx/engine/batched.py` 的載入插入點（兩個 JANG 轉接；插入點在 custom quantization 之前，prism 要先於 JANG，順序不要顛倒）
 - `omlx/model_discovery.py`（`JANG_CONFIG_FILES`／`_jang_has_vision`；JANG 包的 modality 判定）
