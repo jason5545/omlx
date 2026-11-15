@@ -674,3 +674,38 @@ def test_request_schemas_match_mlx_vlm():
         ours = set(getattr(image_routes, name).model_fields) - {"stream"}
         theirs = set(getattr(schemas, name).model_fields)
         assert ours == theirs, name
+
+
+def test_engine_pool_loads_an_image_pipeline_without_root_config(
+    tmp_path, mlx_vlm_h3, monkeypatch
+):
+    """The pool's stale-path guard must not drop a pipeline for lacking config.json."""
+    from omlx import engine_pool as engine_pool_module
+    from omlx.engine_pool import EnginePool
+
+    started = []
+
+    class _Stub(ImageGenerationEngine):
+        async def start(self):
+            started.append(self.model_name)
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setattr(engine_pool_module, "ImageGenerationEngine", _Stub)
+    _h3_checkpoint(tmp_path / "models" / "org" / "MiniMax-H3-Image-8bit")
+    pool = EnginePool()
+    pool._get_final_ceiling = lambda: 0
+    pool.discover_models(str(tmp_path / "models"))
+    entry = pool.get_entry("MiniMax-H3-Image-8bit")
+    assert (entry.model_type, entry.engine_type) == ("image_generation", "image_generation")
+
+    async def main():
+        engine = await pool.get_engine("MiniMax-H3-Image-8bit", _lease=True)
+        await pool.release_engine("MiniMax-H3-Image-8bit")
+        await asyncio.sleep(0)
+        return engine
+
+    engine = asyncio.run(main())
+    assert isinstance(engine, _Stub) and started == [entry.model_path]
+    assert pool.get_entry("MiniMax-H3-Image-8bit") is entry

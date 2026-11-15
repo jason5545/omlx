@@ -54,6 +54,7 @@ from .engine.splash import (
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.image_generation import ImageGenerationEngine
+from .image_generation import has_pipeline_metadata
 from .engine.tts import TTSEngine
 from .engine.vlm import OCR_MODEL_GENERATION_DEFAULTS, VLMBatchedEngine
 from .engine_core import get_mlx_executor, shutdown_mlx_executor
@@ -1998,9 +1999,14 @@ class EnginePool:
         """Drop stale unloaded entries whose backing model directory vanished."""
         model_path = Path(entry.model_path)
         source = entry.source_path
+        # Image pipelines keep config.json in their component folders only.
+        metadata_present = (model_path / "config.json").exists() or (
+            entry.engine_type == "image_generation"
+            and has_pipeline_metadata(model_path)
+        )
         if (
             model_path.exists()
-            and (model_path / "config.json").exists()
+            and metadata_present
             and (source is None or Path(source).exists())
         ):
             return
