@@ -8,8 +8,10 @@ oMLX does not import ``mlx_vlm.server`` (that builds mlx-vlm's own app), so the
 fields are mirrored here and ``tests/test_image_generation.py`` compares them
 with mlx-vlm's schemas. oMLX extensions:
 
-- ``stream: true`` answers with Server-Sent Events (``started``, ``result``,
-  ``error``, then ``[DONE]``; SSE comment lines keep the connection alive).
+- ``stream: true`` answers with Server-Sent Events (``started``, ``progress``,
+  ``result``, ``error``, then ``[DONE]``; SSE comment lines keep the
+  connection alive). ``progress`` needs a pipeline that reports it (see
+  :class:`_ProgressEvents`).
 - ``/v1/images/edits`` also accepts ``data:image/...;base64,`` URLs. They are
   written to a temporary folder for the request and removed afterwards.
 - Images are returned as ``b64_json`` only. ``response_format: "path"``,
@@ -57,6 +59,10 @@ router = APIRouter()
 
 DEFAULT_IMAGE_SIZE = "512x512"
 KEEPALIVE_SECONDS = 15.0
+# Stages other than denoising can report many small units (H3-Image's AdaLN
+# cache counts every block); between their start and end send at most this
+# often.
+PROGRESS_STAGE_INTERVAL_SECONDS = 1.0
 _DATA_URL_RE = re.compile(r"^data:(image/[\w.+-]+)?(;[\w=.+-]+)*;base64,", re.I)
 
 
@@ -418,6 +424,56 @@ def _http_error(exc: BaseException) -> HTTPException:
     return HTTPException(status_code=500, detail=f"Image generation failed: {exc}")
 
 
+class _ProgressEvents:
+    """Turn pipeline progress reports into SSE ``progress`` payloads.
+
+    Denoising steps become ``{"type": "progress", "image_index", "stage":
+    "denoise", "step", "total_steps", "elapsed_s"}``, one per finished step
+    (``step`` 1..``total_steps``; the "about to start" report is dropped).
+    Other stages (H3-Image: ``cache_adaln``, ``decode``) carry ``stage``,
+    ``completed`` and ``total`` instead of ``step``: their start, their end,
+    and in between at most one per ``PROGRESS_STAGE_INTERVAL_SECONDS``. A
+    stage whose first report is already complete (H3-Image reusing its AdaLN
+    cache) did no work and is not sent. ``elapsed_s`` counts from the start of
+    the generation, after the model was loaded.
+    """
+
+    def __init__(self, started: float):
+        self._started = started
+        self._stages: dict[tuple[int, str], float] = {}
+
+    def __call__(self, index: int, stage: str, completed: int, total: int):
+        now = time.monotonic()
+        elapsed = round(now - self._started, 1)
+        if stage == "denoise":
+            if completed <= 0:
+                return None
+            return {
+                "type": "progress",
+                "image_index": index,
+                "stage": stage,
+                "step": completed,
+                "total_steps": total,
+                "elapsed_s": elapsed,
+            }
+        key = (index, stage)
+        last = self._stages.get(key)
+        if last is None:
+            if total > 0 and completed >= total:
+                return None
+        elif completed < total and now - last < PROGRESS_STAGE_INTERVAL_SECONDS:
+            return None
+        self._stages[key] = now
+        return {
+            "type": "progress",
+            "image_index": index,
+            "stage": stage,
+            "completed": completed,
+            "total": total,
+            "elapsed_s": elapsed,
+        }
+
+
 def _release_when_done(pool, model_id: str, task: asyncio.Task, cleanup) -> None:
     """Release the lease once the MLX work is over, even after a disconnect.
 
@@ -472,9 +528,25 @@ async def _serve(
     cancelled = threading.Event()
     created = int(time.time())
     started = time.monotonic()
+    # Streaming only: progress payloads, then None once the work is over.
+    # The engine schedules on_progress on this loop before the work finishes,
+    # so the None always comes after the last report.
+    updates: asyncio.Queue | None = asyncio.Queue() if body.stream else None
+    on_progress = None
+    if updates is not None:
+        progress_events = _ProgressEvents(started)
+
+        def on_progress(index: int, stage: str, completed: int, total: int) -> None:
+            payload = progress_events(index, stage, completed, total)
+            if payload is not None:
+                updates.put_nowait(payload)
+
     work = asyncio.get_running_loop().create_task(
-        engine.run(task, jobs, cancelled=cancelled), name=f"image-{task}:{model_id}"
+        engine.run(task, jobs, cancelled=cancelled, on_progress=on_progress),
+        name=f"image-{task}:{model_id}",
     )
+    if updates is not None:
+        work.add_done_callback(lambda _work: updates.put_nowait(None))
     _release_when_done(pool, model_id, work, cleanup)
     folder_holder["handed_off"] = True
 
@@ -508,10 +580,16 @@ async def _serve(
         try:
             yield event({"type": "started", "model": model_id, "n": len(jobs)})
             while True:
-                done, _ = await asyncio.wait({work}, timeout=KEEPALIVE_SECONDS)
-                if done:
+                try:
+                    update = await asyncio.wait_for(
+                        updates.get(), timeout=KEEPALIVE_SECONDS
+                    )
+                except TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if update is None:
                     break
-                yield ": keepalive\n\n"
+                yield event(update)
             try:
                 images = work.result()
             except BaseException as exc:
@@ -654,6 +732,9 @@ async def images_defaults(
     _, model_id, entry = _image_entry(model)
 
     def _resolve():
+        from ..image_generation import ensure_image_patches
+
+        ensure_image_patches()
         from mlx_vlm.generate.image_defaults import resolve_image_defaults
 
         return resolve_image_defaults(entry.model_path, task=task)

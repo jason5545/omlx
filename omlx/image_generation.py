@@ -94,7 +94,20 @@ def _mlx_vlm_models_dirs() -> list[Path]:
     return [Path(p) / "models" for p in (locations or [])]
 
 
+def ensure_image_patches() -> None:
+    """Install oMLX's mlx-vlm image patches before any image module loads.
+
+    The H3-Image progress patch replaces ``minimax_h3_image.model`` and
+    ``.pipeline`` and only works before they are first imported, so every
+    path into mlx-vlm's image code calls this first.
+    """
+    from .patches.mlx_vlm_image_progress import apply_mlx_vlm_image_progress_patch
+
+    apply_mlx_vlm_image_progress_patch()
+
+
 def _candidate_types(path: Path) -> tuple[str, ...]:
+    ensure_image_patches()
     from mlx_vlm.generate.image import _local_image_model_types, _model_type_from_id
 
     return (*_local_image_model_types(str(path)), _model_type_from_id(str(path)))
@@ -225,6 +238,7 @@ def default_expander(family: str | None) -> str | None:
     if module_name is None:
         return None
     try:
+        ensure_image_patches()
         return str(importlib.import_module(module_name).DEFAULT_UPSAMPLER)
     except Exception as exc:  # pragma: no cover - mlx-vlm layout changed
         logger.warning("Cannot read the default prompt expander of %s: %s", family, exc)

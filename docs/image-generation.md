@@ -53,15 +53,35 @@ oMLX 在請求處理中不下載任何東西，所以先在本機找 PE 模型�
 ```
 data: {"type": "started", "model": "MiniMax-H3-Image-8bit", "n": 1}
 
-: keepalive
+data: {"type": "progress", "image_index": 0, "stage": "cache_adaln", "completed": 0, "total": 306, "elapsed_s": 31.2}
+
+data: {"type": "progress", "image_index": 0, "stage": "cache_adaln", "completed": 306, "total": 306, "elapsed_s": 36.0}
+
+data: {"type": "progress", "image_index": 0, "stage": "denoise", "step": 1, "total_steps": 6, "elapsed_s": 52.8}
+
+（step 2～5 省略）
+
+data: {"type": "progress", "image_index": 0, "stage": "denoise", "step": 6, "total_steps": 6, "elapsed_s": 137.0}
+
+data: {"type": "progress", "image_index": 0, "stage": "decode", "completed": 0, "total": 1, "elapsed_s": 137.0}
+
+data: {"type": "progress", "image_index": 0, "stage": "decode", "completed": 1, "total": 1, "elapsed_s": 149.5}
 
 data: {"type": "result", "created": 1794700000, "output_format": "png", "size": "2048x2048", "data": [{"b64_json": "...", ...}]}
 
 data: [DONE]
 ```
 
-- **不送 `progress`**：mlx-vlm 的生圖 pipeline 在內部跑完整個去噪迴圈，沒有每一步的回呼。H3-Image 走的是 `mlx_vlm/models/minimax_h3_image/`：`generate_array` 固定跑 6 步、沒有 callback 參數，`model._run` 也會拒絕不認得的 `extra`。有 `progress_callback` 的是影音版 `mlx_vlm/models/minimax_h3/`，生圖用不到。所以只有 `started` 和 `result`；要送 `progress` 得先改 mlx-vlm。
-- 生圖期間每 15 秒送一行 SSE 註解 `: keepalive`，讓連線不會因為閒置被斷。SSE 規範要求 client 忽略 `:` 開頭的行。
+（`elapsed_s` 是格式示意，不是實測。H3-Image 的 `cache_adaln` 總數是 6 個時間步 ×（50 個 transformer block + 輸出層）= 306。）
+
+- **`progress`**：pipeline 有回報進度才送，目前只有 H3-Image。mlx-vlm 的 pin 本身沒有回呼，oMLX 先用上游 PR [Neywa-Labs/mlx-vlm#2742](https://github.com/Neywa-Labs/mlx-vlm/pull/2742) 的版本（`omlx/patches/mlx_vlm_image_progress/`，見 `PATCHES.md`）。每個回報都在那段工作 `mx.eval` 完之後，所以代表真的做完，不是排進佇列。
+  - 去噪：每完成一步一個，`stage: "denoise"`，`step` 是 1～`total_steps`（H3 固定 6）。只想顯示「第幾步」的 client 看有沒有 `step` 就好。
+  - 其他階段帶 `stage`、`completed`、`total`，**沒有** `step`、`total_steps`。H3 有兩個：`cache_adaln`（AdaLN 投影快取，引擎載入後第一次生圖才建，之後的請求不送）、`decode`（VAE 解碼，`0/1` 開始、`1/1` 結束）。只送開始、結束，中間每秒最多一個。
+  - `image_index` 從 0 起，`n` 張圖依序送。
+  - `elapsed_s` 從生圖開始算（模型已載入），整個請求共用一個起點，到小數一位。
+  - prompt 擴寫（PE）和 text encoder 這段沒有進度回報：`started` 之後到第一個 `progress` 之間就是在做這些。
+  - 其他家族的 pipeline 不回報，只會有 `started` 和 `result`。
+- 15 秒沒有任何事件時送一行 SSE 註解 `: keepalive`，讓連線不會因為閒置被斷。SSE 規範要求 client 忽略 `:` 開頭的行。
 - 失敗時送 `data: {"type": "error", "message": "..."}` 再送 `[DONE]`。
 - 請求本身不合法（模型不存在、PE 缺檔、模型忙）時不開串流，直接回一般的 HTTP 錯誤。
 

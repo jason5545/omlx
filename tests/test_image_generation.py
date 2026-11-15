@@ -84,6 +84,8 @@ def _llm_checkpoint(root: Path) -> Path:
 
 @pytest.fixture
 def mlx_vlm_h3():
+    # Production applies the progress patch before any image module loads.
+    ig.ensure_image_patches()
     pytest.importorskip("mlx_vlm.models.minimax_h3_image.model")
     ig._capabilities_cached.cache_clear()
     yield
@@ -270,7 +272,7 @@ class _FakeEngine(ImageGenerationEngine):
         self.fail = fail
         self.calls: list[tuple[str, ImageJob]] = []
 
-    def _run_one_sync(self, task, job):
+    def _run_one_sync(self, task, job, progress=None):
         self.calls.append((task, job))
         if self.delay:
             time.sleep(self.delay)
@@ -585,10 +587,10 @@ def test_edit_accepts_paths_and_data_urls(server, tmp_path):
 
     original = server.engine._run_one_sync
 
-    def capture(task, job):
+    def capture(task, job, progress=None):
         seen["paths"] = job.image_paths
         seen["exist"] = [Path(p).is_file() for p in job.image_paths]
-        return original(task, job)
+        return original(task, job, progress)
 
     server.engine._run_one_sync = capture
     response = server.client.post(
@@ -846,7 +848,7 @@ class _LazyH3Engine(ImageGenerationEngine):
         self.fail = fail
         self.loaded = False
 
-    def _generate_sync(self, task, job):
+    def _generate_sync(self, task, job, progress=None):
         fake = self.fake
         fake.alloc(27 * GB)  # text encoder, loaded for every request
         fake.free(27 * GB)
@@ -1013,3 +1015,334 @@ def test_unload_settles_against_the_measured_resident_bytes(
         asyncio.run(pool._stop_and_unload_engine(model_id))
     assert "(settled)" in caplog.text
     assert "stalled" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Progress: pipeline callback -> engine relay -> SSE
+# ---------------------------------------------------------------------------
+
+
+DENOISE = [("denoise", step, 6) for step in range(7)]
+H3_STAGES = (
+    [("cache_adaln", unit, 30) for unit in range(31)]
+    + DENOISE
+    + [("decode", 0, 1), ("decode", 1, 1)]
+)
+H3_CACHED_STAGES = [("cache_adaln", 30, 30)] + DENOISE + [
+    ("decode", 0, 1), ("decode", 1, 1)]
+
+
+class _ReportingModel:
+    """An mlx-vlm image model whose pipeline reports progress.
+
+    It calls ``request.progress_callback`` the way H3-Image's
+    ``generate_array`` does: on the thread that runs the model, once per
+    report, before returning.
+    """
+
+    is_image_generation_model = True
+    is_image_edit_model = True
+
+    def __init__(self, reports_per_image):
+        self.reports_per_image = list(reports_per_image)
+        self.requests = []
+        self.threads = []
+
+    def _run(self, request):
+        self.requests.append(request)
+        self.threads.append(threading.get_ident())
+        reports = self.reports_per_image[
+            min(len(self.requests), len(self.reports_per_image)) - 1
+        ]
+        for stage, completed, total in reports:
+            if request.progress_callback is not None:
+                request.progress_callback(stage, completed, total)
+        width = request.width or 8
+        height = request.height or 6
+        return SimpleNamespace(
+            array=np.zeros((height, width, 3), np.uint8),
+            seed=request.seed,
+            peak_memory=0.0,
+            metadata={},
+        )
+
+    def generate(self, request):
+        return self._run(request)
+
+    def edit(self, request):
+        return self._run(request)
+
+
+class _ReportingEngine(ImageGenerationEngine):
+    """The real engine around a reporting model (no weights)."""
+
+    def __init__(self, reports_per_image):
+        super().__init__("/models/fake-h3")
+        self._capabilities = H3
+        self._model = _ReportingModel(reports_per_image)
+
+
+def test_engine_relays_progress_from_the_mlx_thread_to_the_loop(caplog):
+    engine = _ReportingEngine([DENOISE])
+    seen = []
+
+    async def main():
+        loop_thread = threading.get_ident()
+
+        def on_progress(index, stage, completed, total):
+            seen.append((index, stage, completed, total, threading.get_ident()))
+
+        await engine.run("generate", [_job(1), _job(2)], on_progress=on_progress)
+        return loop_thread
+
+    with caplog.at_level("INFO", logger="omlx.engine.image_generation"):
+        loop_thread = asyncio.run(main())
+    assert [entry[:4] for entry in seen] == [
+        (index, *report) for index in (0, 1) for report in DENOISE
+    ]
+    assert {entry[4] for entry in seen} == {loop_thread}
+    assert loop_thread not in engine._model.threads  # pipeline ran elsewhere
+    steps = [r.getMessage() for r in caplog.records if "progress:" in r.getMessage()]
+    assert len(steps) == 12 and "image=1 step 6/6" in steps[-1]
+    # The callback is carried by mlx-vlm's own request classes (a subclass
+    # until the pin has the field), so the pipeline's checks still pass.
+    from mlx_vlm.generate.image import ImageGenerationRequest
+
+    assert all(isinstance(r, ImageGenerationRequest) for r in engine._model.requests)
+
+
+def test_progress_handler_failures_never_fail_the_image():
+    engine = _ReportingEngine([DENOISE])
+
+    def broken(*_args):
+        raise RuntimeError("client handler bug")
+
+    images = asyncio.run(engine.run("generate", [_job(3)], on_progress=broken))
+    assert [image.seed for image in images] == [3]
+
+
+def test_requests_without_a_handler_still_get_a_logging_callback():
+    engine = _ReportingEngine([DENOISE])
+    asyncio.run(engine.run("generate", [_job(1)]))
+    assert callable(engine._model.requests[0].progress_callback)
+
+
+def _progress_server(server, reports_per_image):
+    engine = _ReportingEngine(reports_per_image)
+    server.pool.engine = engine
+    return engine
+
+
+def _types(events):
+    return [e if e == "[DONE]" else e["type"] for e in events]
+
+
+def test_streaming_sends_one_progress_event_per_denoising_step(server):
+    _progress_server(server, [DENOISE])
+    response = server.client.post(
+        "/v1/images/generations",
+        json={"model": "MiniMax-H3-Image-8bit", "prompt": "a cat", "size": "8x6",
+              "seed": 7, "stream": True},
+    )
+    assert response.status_code == 200
+    events = _events(response)
+    assert _types(events) == ["started"] + ["progress"] * 6 + ["result", "[DONE]"]
+    progress = events[1:7]
+    assert [(e["image_index"], e["stage"], e["step"], e["total_steps"])
+            for e in progress] == [(0, "denoise", step, 6) for step in range(1, 7)]
+    elapsed = [e["elapsed_s"] for e in progress]
+    assert elapsed == sorted(elapsed) and all(isinstance(v, float) for v in elapsed)
+    assert set(progress[0]) == {
+        "type", "image_index", "stage", "step", "total_steps", "elapsed_s"}
+    assert events[7]["data"][0]["seed"] == 7
+    assert _wait_released(server.pool) == 1
+
+
+def test_streaming_progress_numbers_each_image(server):
+    _progress_server(server, [DENOISE])
+    response = server.client.post(
+        "/v1/images/generations",
+        json={"model": "MiniMax-H3-Image-8bit", "prompt": "a cat", "size": "8x6",
+              "seed": 7, "n": 2, "stream": True},
+    )
+    events = _events(response)
+    assert _types(events) == ["started"] + ["progress"] * 12 + ["result", "[DONE]"]
+    assert [(e["image_index"], e["step"]) for e in events[1:13]] == [
+        (index, step) for index in (0, 1) for step in range(1, 7)]
+    assert [item["seed"] for item in events[13]["data"]] == [7, 8]
+
+
+def test_streaming_other_stages_carry_stage_not_step(server):
+    _progress_server(server, [H3_STAGES, H3_CACHED_STAGES])
+    response = server.client.post(
+        "/v1/images/generations",
+        json={"model": "MiniMax-H3-Image-8bit", "prompt": "a cat", "size": "8x6",
+              "n": 2, "stream": True},
+    )
+    events = _events(response)
+    progress = [e for e in events if e != "[DONE]" and e["type"] == "progress"]
+    summary = [
+        (e["image_index"], e["stage"], e.get("step", e.get("completed")))
+        for e in progress
+    ]
+    # First image: the AdaLN cache is built (start and end; the 29 reports in
+    # between arrive within the throttle interval), then six steps, then the
+    # VAE decode. Second image: the cache is reused, so it is not reported.
+    assert summary == (
+        [(0, "cache_adaln", 0), (0, "cache_adaln", 30)]
+        + [(0, "denoise", step) for step in range(1, 7)]
+        + [(0, "decode", 0), (0, "decode", 1)]
+        + [(1, "denoise", step) for step in range(1, 7)]
+        + [(1, "decode", 0), (1, "decode", 1)]
+    )
+    for event in progress:
+        if event["stage"] == "denoise":
+            assert "completed" not in event and event["total_steps"] == 6
+        else:
+            assert "step" not in event and "total_steps" not in event
+            assert event["total"] == (30 if event["stage"] == "cache_adaln" else 1)
+    assert _types(events)[-2:] == ["result", "[DONE]"]
+
+
+def test_streaming_edit_reports_progress(server, tmp_path):
+    _progress_server(server, [DENOISE])
+    reference = tmp_path / "ref.png"
+    Image.new("RGB", (4, 4), "red").save(reference)
+    response = server.client.post(
+        "/v1/images/edits",
+        json={"model": "MiniMax-H3-Image-8bit", "prompt": "blue",
+              "image": str(reference), "stream": True},
+    )
+    events = _events(response)
+    assert _types(events) == ["started"] + ["progress"] * 6 + ["result", "[DONE]"]
+
+
+def test_non_streaming_requests_ignore_progress(server):
+    _progress_server(server, [H3_STAGES])
+    response = server.client.post(
+        "/v1/images/generations",
+        json={"model": "MiniMax-H3-Image-8bit", "prompt": "a cat", "size": "8x6"},
+    )
+    assert response.status_code == 200
+    assert len(response.json()["data"]) == 1
+
+
+def test_progress_request_classes_keep_mlx_vlm_semantics():
+    import dataclasses
+
+    from mlx_vlm.generate.edit_image import ImageEditRequest
+    from mlx_vlm.generate.image import ImageGenerationRequest
+
+    from omlx.patches.mlx_vlm_image_progress import (
+        _with_progress_field,
+        request_classes,
+    )
+
+    generation, edit = request_classes()
+    request = generation("a cat", progress_callback=print)
+    copy = dataclasses.replace(request, seed=4)
+    assert isinstance(copy, ImageGenerationRequest)
+    assert copy.progress_callback is print and copy.seed == 4
+    assert edit("blue", "one.png").image_paths == ("one.png",)  # __post_init__
+    assert isinstance(edit("blue", ("a.png",)), ImageEditRequest)
+
+    @dataclasses.dataclass
+    class Upstream:  # a pin that already has the field
+        prompt: str
+        progress_callback: object = None
+
+    assert _with_progress_field(Upstream) is Upstream
+
+
+_VENDOR_CHECK = r"""
+import importlib, inspect, json, logging
+from types import SimpleNamespace
+import mlx.core as mx
+from omlx.image_generation import ensure_image_patches
+ensure_image_patches()
+from omlx.patches.mlx_vlm_image_progress import request_classes
+import mlx_vlm.models.minimax_h3_image as package
+pipeline_module = importlib.import_module("mlx_vlm.models.minimax_h3_image.pipeline")
+model_module = importlib.import_module("mlx_vlm.models.minimax_h3_image.model")
+from mlx_vlm.generate.image import generate_image
+from mlx_vlm.models.minimax_h3_image import (
+    MiniMaxH3ImageTransformer, MiniMaxH3ImageTransformerConfig,
+    MiniMaxH3ImageVAE, MiniMaxH3ImageVAEConfig,
+)
+
+class Tokenizer:
+    def encode(self, text, **kwargs):
+        return [12]
+
+pipeline = pipeline_module.MiniMaxH3ImagePipeline(
+    "/synthetic", evict_text_encoder=False, upsample_prompt=False)
+pipeline._conditioner = SimpleNamespace(
+    tokenizer=Tokenizer(),
+    _encode=lambda ids, tags, **kw: SimpleNamespace(
+        hidden_states=mx.ones((1, len(ids), 32)) * 0.01))
+pipeline._transformer = MiniMaxH3ImageTransformer(MiniMaxH3ImageTransformerConfig(
+    hidden_size=32, num_layers=2, num_refiner_layers=1, num_attention_heads=4,
+    attention_head_dim=8, ffn_dim=64, in_channels=2, text_dim=32, freq_dim=8,
+    time_embed_hidden_dim=32, time_embed_dim=16, rope_freq_dim=1))
+pipeline._vae = MiniMaxH3ImageVAE(MiniMaxH3ImageVAEConfig(
+    block_out_channels=(4, 4, 4, 4, 4, 4), layers_per_block=1, norm_num_groups=2,
+    latent_channels=2, latents_mean=(0.2, -0.3), latents_std=(0.8, 1.2),
+    decoder_num_layers=1, decoder_num_attention_heads=2,
+    decoder_attention_head_dim=8))
+model = model_module.MiniMaxH3ImageGenerationModel(pipeline, "synthetic")
+events = []
+generation, _ = request_classes()
+request = generation("a teapot", seed=1, width=64, height=64,
+                     extra={"min_generation_area": 1024},
+                     progress_callback=lambda *report: events.append(report))
+first = generate_image(model, request)
+second = generate_image(model, request)
+print(json.dumps({
+    "package": package.__file__,
+    "pipeline": pipeline_module.__file__,
+    "model": model_module.__file__,
+    "transformer": importlib.import_module(
+        "mlx_vlm.models.minimax_h3_image.transformer").__file__,
+    "events": events,
+    "shape": list(first.array.shape),
+    "same": bool(mx.array_equal(first.array, second.array).item()),
+}))
+"""
+
+
+def test_vendored_h3_pipeline_reports_progress_on_the_pinned_mlx_vlm():
+    """Fresh interpreter: the patch has to run before H3 modules are imported."""
+    import subprocess
+    import sys
+
+    pytest.importorskip("mlx_vlm.models.minimax_h3_image")
+    root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [sys.executable, "-c", _VENDOR_CHECK],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**__import__("os").environ, "PYTHONPATH": str(root)},
+    )
+    assert completed.returncode == 0, completed.stderr[-4000:]
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    vendor = root / "omlx/patches/mlx_vlm_image_progress/vendor"
+    assert Path(result["pipeline"]).is_relative_to(vendor)
+    assert Path(result["model"]).is_relative_to(vendor)
+    assert not Path(result["package"]).is_relative_to(vendor)
+    assert not Path(result["transformer"]).is_relative_to(vendor)
+    events = [tuple(event) for event in result["events"]]
+    cache_work = 6 * (2 + 1)  # six tables x (two transformer blocks + output)
+    first = (
+        [("cache_adaln", unit, cache_work) for unit in range(cache_work + 1)]
+        + [("denoise", step, 6) for step in range(7)]
+        + [("decode", 0, 1), ("decode", 1, 1)]
+    )
+    second = (
+        [("cache_adaln", cache_work, cache_work)]
+        + [("denoise", step, 6) for step in range(7)]
+        + [("decode", 0, 1), ("decode", 1, 1)]
+    )
+    assert events == first + second
+    assert result["shape"] == [64, 64, 3] and result["same"]

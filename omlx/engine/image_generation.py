@@ -7,9 +7,13 @@ every other engine, so a generation never blocks the event loop and never
 races another model's Metal work. Generations on one engine therefore run one
 after another; the EnginePool lease keeps the model resident meanwhile.
 
-mlx-vlm's image pipelines run their denoising loop internally and expose no
-per-step callback, so the engine reports when an image starts and finishes,
-not each step.
+Progress. Pipelines that take a ``progress_callback(stage, completed, total)``
+(MiniMax-H3-Image, through ``omlx.patches.mlx_vlm_image_progress`` until the
+mlx-vlm pin has Neywa-Labs/mlx-vlm#2742) call it on the MLX executor thread
+after each stage's work is evaluated. The engine logs denoising steps there
+and hands every report to ``run(on_progress=...)`` on the event loop with
+``call_soon_threadsafe``, which never blocks the generation. Other pipelines
+ignore the callback, so only the start and end of each image are known.
 
 Memory. ``mx.get_peak_memory()`` and ``mx.get_active_memory()`` count every
 model in the process. Because all MLX work is serialized on the one MLX
@@ -43,6 +47,8 @@ from .base import BaseNonStreamingEngine
 logger = logging.getLogger(__name__)
 
 ImageTask = Literal["generate", "edit"]
+# (image_index, stage, completed, total); runs on the event loop.
+ImageProgressHandler = Callable[[int, str, int, int], Any]
 
 
 class ImageGenerationCancelled(Exception):
@@ -147,6 +153,9 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
     # -- lifecycle -----------------------------------------------------------
 
     def _load_sync(self, task: ImageTask) -> Any:
+        from ..image_generation import ensure_image_patches
+
+        ensure_image_patches()
         if task == "generate":
             from mlx_vlm.generate.image import load_image_generation_model
 
@@ -203,13 +212,18 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
 
     # -- generation ----------------------------------------------------------
 
-    def _run_one_sync(self, task: ImageTask, job: ImageJob) -> GeneratedImage:
+    def _run_one_sync(
+        self,
+        task: ImageTask,
+        job: ImageJob,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> GeneratedImage:
         # Measure from before a possible generate/edit reload so its load
         # counts toward this request.
         active_before = mx.get_active_memory()
         mx.reset_peak_memory()
         try:
-            image = self._generate_sync(task, job)
+            image = self._generate_sync(task, job, progress)
         except BaseException:
             # A failed request still left what it loaded and still peaked;
             # run() reports the peak so a near-OOM raises the pool's charge.
@@ -226,15 +240,23 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
             self._resident_bytes + max(0, mx.get_peak_memory() - active_before)
         )
 
-    def _generate_sync(self, task: ImageTask, job: ImageJob) -> GeneratedImage:
+    def _generate_sync(
+        self,
+        task: ImageTask,
+        job: ImageJob,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> GeneratedImage:
+        from ..patches.mlx_vlm_image_progress import request_classes
+
         model = self._ensure_model_sync(task)
         started = time.monotonic()
+        generation_request, edit_request = request_classes()
         if task == "generate":
-            from mlx_vlm.generate.image import ImageGenerationRequest, generate_image
+            from mlx_vlm.generate.image import generate_image
 
             result = generate_image(
                 model,
-                ImageGenerationRequest(
+                generation_request(
                     prompt=job.prompt,
                     seed=job.seed,
                     steps=job.steps,
@@ -242,14 +264,15 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
                     height=int(job.height),
                     guidance=job.guidance,
                     extra=dict(job.extra),
+                    progress_callback=progress,
                 ),
             )
         else:
-            from mlx_vlm.generate.edit_image import ImageEditRequest, edit_image
+            from mlx_vlm.generate.edit_image import edit_image
 
             result = edit_image(
                 model,
-                ImageEditRequest(
+                edit_request(
                     prompt=job.prompt,
                     image_paths=job.image_paths,
                     seed=job.seed,
@@ -258,6 +281,7 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
                     height=job.height,
                     guidance=job.guidance,
                     extra=dict(job.extra),
+                    progress_callback=progress,
                 ),
             )
         pixels = np.array(result.array)
@@ -287,11 +311,13 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
         *,
         cancelled: threading.Event | None = None,
         on_image: Callable[[int, GeneratedImage], Any] | None = None,
+        on_progress: ImageProgressHandler | None = None,
     ) -> list[GeneratedImage]:
         """Generate ``jobs`` in order on the MLX executor.
 
         ``cancelled`` is checked between images: an image already running
-        finishes, the rest are skipped.
+        finishes, the rest are skipped. ``on_progress(index, stage, completed,
+        total)`` receives the pipeline's progress reports on the event loop.
         """
         if not self.supports(task):
             raise ValueError(f"{self._model_name} does not support image {task}")
@@ -310,9 +336,10 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
                         f"cancelled after {index} of {len(jobs)} images"
                     )
                 self._failed_peak_bytes = 0
+                progress = self._progress_relay(loop, task, index, on_progress)
                 try:
                     image = await loop.run_in_executor(
-                        get_mlx_executor(), self._run_one_sync, task, job
+                        get_mlx_executor(), self._run_one_sync, task, job, progress
                     )
                 except BaseException:
                     self._observe_memory(self._failed_peak_bytes)
@@ -342,6 +369,53 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
             return results
         finally:
             await self._finish_activity(activity_id)
+
+    def _progress_relay(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        task: ImageTask,
+        index: int,
+        handler: ImageProgressHandler | None,
+    ) -> Callable[[str, int, int], None]:
+        """The callback the pipeline calls on the MLX executor thread.
+
+        It only logs and schedules ``handler`` on ``loop``; it never waits for
+        the loop, so a slow or vanished client cannot stall the generation,
+        and its own failures never fail the image.
+        """
+        started = time.monotonic()
+        model_name = self._model_name
+
+        def deliver(stage: str, completed: int, total: int) -> None:
+            try:
+                outcome = handler(index, stage, completed, total)
+                if asyncio.iscoroutine(outcome):
+                    loop.create_task(outcome)
+            except Exception:
+                logger.exception("Image progress handler failed for %s", model_name)
+
+        def relay(stage: str, completed: int, total: int) -> None:
+            try:
+                stage, completed, total = str(stage), int(completed), int(total)
+                elapsed = time.monotonic() - started
+                if stage == "denoise" and completed > 0:
+                    logger.info(
+                        "Image %s progress: model=%s image=%d step %d/%d %.1fs",
+                        task, model_name, index, completed, total, elapsed,
+                    )
+                elif completed in (0, total):
+                    logger.debug(
+                        "Image %s progress: model=%s image=%d %s %d/%d %.1fs",
+                        task, model_name, index, stage, completed, total, elapsed,
+                    )
+                if handler is not None:
+                    loop.call_soon_threadsafe(deliver, stage, completed, total)
+            except RuntimeError:
+                pass  # the event loop is closed: nobody is listening anymore
+            except Exception:
+                logger.exception("Image progress relay failed for %s", model_name)
+
+        return relay
 
     def _observe_memory(self, footprint_peak_bytes: int) -> None:
         if footprint_peak_bytes <= 0:
