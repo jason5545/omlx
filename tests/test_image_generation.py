@@ -709,3 +709,307 @@ def test_engine_pool_loads_an_image_pipeline_without_root_config(
     engine = asyncio.run(main())
     assert isinstance(engine, _Stub) and started == [entry.model_path]
     assert pool.get_entry("MiniMax-H3-Image-8bit") is entry
+
+
+# ---------------------------------------------------------------------------
+# Memory: component estimate, own peak, pool charge, unload settle
+# ---------------------------------------------------------------------------
+
+GB = 10**9
+
+
+def _write_safetensors(path: Path, tensors: dict[str, int]) -> None:
+    """Write a real safetensors header with zero-filled data of the given sizes."""
+    header, offset = {}, 0
+    for name, size in tensors.items():
+        header[name] = {"dtype": "U8", "shape": [size], "data_offsets": [offset, offset + size]}
+        offset += size
+    raw = json.dumps(header).encode()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(len(raw).to_bytes(8, "little") + raw + b"\0" * offset)
+
+
+def _sized_h3_checkpoint(root: Path) -> Path:
+    """H3 layout with headers: transformer 4748 B (2608 B AdaLN), te 2749, vae 234."""
+    _h3_checkpoint(root)
+    for folder in ("transformer", "text_encoder", "vae"):
+        for shard in (root / folder).glob("*.safetensors"):
+            shard.unlink()
+        (root / folder / "model.safetensors.index.json").unlink()
+    _write_safetensors(
+        root / "transformer" / "model.safetensors",
+        {
+            "transformer_blocks.0.adaln_proj.linear.weight": 2600,
+            "norm_out.linear.weight": 8,
+            "transformer_blocks.0.ff.weight": 1228,
+            "transformer_blocks.0.attn.to_q.weight": 912,
+        },
+    )
+    _write_safetensors(
+        root / "text_encoder" / "model.safetensors",
+        {"language_model.model.layers.0.weight": 2749},
+    )
+    _write_safetensors(root / "vae" / "model.safetensors", {"decoder.weight": 234})
+    return root
+
+
+def _file_bytes(folder: Path) -> int:
+    return sum(p.stat().st_size for p in folder.glob("*.safetensors"))
+
+
+def test_h3_estimate_is_the_steady_state_request_peak(tmp_path, mlx_vlm_h3):
+    from omlx.model_discovery import discover_models, estimate_model_size
+
+    root = _sized_h3_checkpoint(tmp_path / "models" / "org" / "MiniMax-H3-Image-8bit")
+    expected = int(
+        (
+            _file_bytes(root / "transformer")
+            - 2608
+            + _file_bytes(root / "vae")
+            + _file_bytes(root / "text_encoder")
+        )
+        * 1.05
+    )
+    assert ig.estimate_image_memory(root, "minimax_h3_image") == expected
+    info = discover_models(tmp_path / "models")["MiniMax-H3-Image-8bit"]
+    assert info.estimated_size == expected
+    assert info.estimated_size < estimate_model_size(root)
+
+
+def test_h3_8bit_component_sizes_give_an_estimate_between_51_4_and_60_gb(
+    tmp_path, monkeypatch
+):
+    """The MiniMax-H3-Image-8bit sizes read on 11/16 (bytes from the headers)."""
+    files = {"transformer": 47.48 * GB, "text_encoder": 27.49 * GB, "vae": 2.34 * GB}
+    monkeypatch.setattr(ig, "_files_bytes", lambda folder: int(files[folder.name]))
+    monkeypatch.setattr(ig, "_tensor_bytes", lambda folder, predicate: int(26.08 * GB))
+    estimate = ig.estimate_image_memory(tmp_path, "minimax_h3_image")
+    # 51.4 GB is the largest peak measured on 11/15 (a 4096x4096 edit).
+    assert 51.4 * GB <= estimate <= 60 * GB
+    assert estimate == int((47.48 - 26.08 + 2.34 + 27.49) * GB * 1.05)
+
+
+def test_unknown_families_and_unreadable_h3_shards_keep_the_file_size(
+    tmp_path, mlx_vlm_h3
+):
+    from omlx.model_discovery import discover_models, estimate_model_size
+
+    assert ig.estimate_image_memory(tmp_path, "flux3") is None
+    assert ig.estimate_image_memory(tmp_path, None) is None
+    # The fixture's shards are 64 zero bytes: no valid header, so no rule.
+    root = _h3_checkpoint(tmp_path / "models" / "org" / "MiniMax-H3-Image-8bit")
+    assert ig.estimate_image_memory(root, "minimax_h3_image") is None
+    info = discover_models(tmp_path / "models")["MiniMax-H3-Image-8bit"]
+    assert info.estimated_size == estimate_model_size(root)
+
+
+def test_h3_without_adaln_weights_keeps_the_file_size(tmp_path, mlx_vlm_h3):
+    root = _sized_h3_checkpoint(tmp_path / "MiniMax-H3-Image-8bit")
+    _write_safetensors(root / "transformer" / "model.safetensors", {"proj_in.weight": 64})
+    assert ig.estimate_image_memory(root, "minimax_h3_image") is None
+
+
+class _FakeMX:
+    """Process-wide MLX gauges as one counter, like mx.get_active_memory()."""
+
+    def __init__(self, active: int):
+        self.active = active
+        self.peak = 0
+
+    def get_active_memory(self):
+        return self.active
+
+    def get_peak_memory(self):
+        return self.peak
+
+    def reset_peak_memory(self):
+        self.peak = 0
+
+    def clear_cache(self):
+        pass
+
+    def alloc(self, size: int):
+        self.active += size
+        self.peak = max(self.peak, self.active)
+
+    def free(self, size: int):
+        self.active -= size
+
+
+class _LazyH3Engine(ImageGenerationEngine):
+    """Replays the H3 pipeline's allocations on a fake MLX gauge."""
+
+    def __init__(self, fake: _FakeMX, observer=None, fail: bool = False):
+        super().__init__("/models/fake-h3", memory_observer=observer)
+        self._capabilities = H3
+        self.fake = fake
+        self.fail = fail
+        self.loaded = False
+
+    def _generate_sync(self, task, job):
+        fake = self.fake
+        fake.alloc(27 * GB)  # text encoder, loaded for every request
+        fake.free(27 * GB)
+        if not self.loaded:
+            fake.alloc(26 * GB)  # AdaLN weights, dropped after the cache
+            fake.free(26 * GB)
+            fake.alloc(23 * GB)  # transformer remainder + VAE, kept
+            self.loaded = True
+        fake.alloc(2 * GB)  # activations
+        if self.fail:
+            raise RuntimeError("metal out of memory")
+        fake.free(2 * GB)
+        return GeneratedImage(
+            pixels=np.zeros((6, 8, 3), np.uint8),
+            width=8,
+            height=6,
+            seed=job.seed,
+            revised_prompt=None,
+            metadata={},
+            peak_memory_gb=fake.peak / GB,
+            elapsed_s=0.0,
+        )
+
+
+def test_engine_measures_its_own_peak_without_other_models(monkeypatch):
+    from omlx.engine import image_generation as engine_module
+
+    fake = _FakeMX(active=30 * GB)  # an LLM already loaded in the process
+    monkeypatch.setattr(engine_module, "mx", fake)
+    seen = []
+    engine = _LazyH3Engine(fake, observer=seen.append)
+
+    first = asyncio.run(engine.run("generate", [_job(1)]))[0]
+    assert first.footprint_peak_bytes == 27 * GB  # nothing resident yet
+    assert first.peak_memory_gb == 57  # the process-wide number, unchanged
+    assert engine.resident_bytes == 23 * GB
+
+    second = asyncio.run(engine.run("generate", [_job(2)]))[0]
+    assert second.footprint_peak_bytes == (23 + 27) * GB  # resident + encoder
+    assert engine.resident_bytes == 23 * GB
+    assert seen == [27 * GB, 50 * GB]
+    assert engine.observed_peak_bytes == 50 * GB
+
+
+def test_a_failed_request_still_reports_its_peak(monkeypatch):
+    from omlx.engine import image_generation as engine_module
+
+    fake = _FakeMX(active=0)
+    monkeypatch.setattr(engine_module, "mx", fake)
+    seen = []
+    engine = _LazyH3Engine(fake, observer=seen.append, fail=True)
+    with pytest.raises(RuntimeError):
+        asyncio.run(engine.run("generate", [_job(1)]))
+    assert seen == [27 * GB]
+    assert engine.resident_bytes == 25 * GB  # what it loaded before failing
+
+
+def _image_pool(tmp_path, monkeypatch, *, sized: bool):
+    from omlx import engine_pool as engine_pool_module
+    from omlx.engine_pool import EnginePool
+
+    class _Stub(ImageGenerationEngine):
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setattr(engine_pool_module, "ImageGenerationEngine", _Stub)
+    root = tmp_path / "models" / "org" / "MiniMax-H3-Image-8bit"
+    (_sized_h3_checkpoint if sized else _h3_checkpoint)(root)
+    pool = EnginePool()
+    pool._get_final_ceiling = lambda: 0
+    pool.discover_models(str(tmp_path / "models"))
+    return pool, "MiniMax-H3-Image-8bit"
+
+
+def _load(pool, model_id):
+    async def main():
+        engine = await pool.get_engine(model_id, _lease=True)
+        await pool.release_engine(model_id)
+        return engine
+
+    return asyncio.run(main())
+
+
+@pytest.mark.parametrize("sized", [True, False])
+def test_pool_raises_the_charge_only_above_the_estimate(
+    tmp_path, mlx_vlm_h3, monkeypatch, sized
+):
+    pool, model_id = _image_pool(tmp_path, monkeypatch, sized=sized)
+    entry = pool.get_entry(model_id)
+    estimate = entry.estimated_size
+    engine = _load(pool, model_id)
+    assert pool._entry_resident_size(entry) == estimate
+    assert pool._current_model_memory == estimate
+    assert entry.actual_size == estimate  # lazy start: no longer the file size
+
+    # A peak that fits (with 5% headroom) changes nothing.
+    engine._observe_memory(int(estimate / 1.06))
+    assert pool._entry_resident_size(entry) == estimate
+    assert entry.actual_size == int(estimate / 1.06)  # measured, not the charge
+    assert pool._current_model_memory == estimate
+
+    # A larger peak raises the charge and the pool total together.
+    bigger = estimate * 2
+    engine._observe_memory(bigger)
+    assert pool._entry_resident_size(entry) == int(bigger * 1.05)
+    assert pool._current_model_memory == int(bigger * 1.05)
+    assert entry.actual_size == bigger
+
+    # A later smaller peak never lowers it.
+    engine._observe_memory(estimate // 2)
+    assert pool._entry_resident_size(entry) == int(bigger * 1.05)
+
+
+def test_pool_reload_keeps_the_learned_charge(tmp_path, mlx_vlm_h3, monkeypatch):
+    pool, model_id = _image_pool(tmp_path, monkeypatch, sized=True)
+    entry = pool.get_entry(model_id)
+    engine = _load(pool, model_id)
+    learned = int(entry.estimated_size * 3 * 1.05)
+    engine._observe_memory(entry.estimated_size * 3)
+
+    async def unload():
+        async def no_clear(_model_id):
+            pass
+
+        pool._metal_sync_clear_cache = no_clear
+        await pool._stop_and_unload_engine(model_id)
+
+    asyncio.run(unload())
+    assert entry.engine is None and pool._current_model_memory == 0
+    # Admission for the next load already uses the learned charge.
+    assert pool._entry_resident_size(entry) == learned
+    _load(pool, model_id)
+    assert pool._current_model_memory == learned
+
+
+def test_unload_settles_against_the_measured_resident_bytes(
+    tmp_path, mlx_vlm_h3, monkeypatch, caplog
+):
+    """11/15: 21.55 GiB freed against need>=71.82 GiB stalled the barrier."""
+    from omlx import engine_pool as engine_pool_module
+
+    pool, model_id = _image_pool(tmp_path, monkeypatch, sized=True)
+    engine = _load(pool, model_id)
+    entry = pool.get_entry(model_id)
+    # Charge the real H3-8bit estimate, as a load of that checkpoint would.
+    entry.runtime_estimated_size = entry.runtime_settle_size = 53_788_367_769
+    gauge = {"active": 40 * GB}
+    engine._resident_bytes = 23 * GB
+
+    async def stop():
+        gauge["active"] -= int(21.55 * 1024**3)
+
+    async def no_clear(_model_id):
+        pass
+
+    engine.stop = stop
+    pool._metal_sync_clear_cache = no_clear
+    monkeypatch.setattr(engine_pool_module.mx, "get_active_memory", lambda: gauge["active"])
+    monkeypatch.setattr(engine_pool_module, "get_phys_footprint", lambda: 0)
+    with caplog.at_level("INFO", logger="omlx.engine_pool"):
+        asyncio.run(pool._stop_and_unload_engine(model_id))
+    assert "(settled)" in caplog.text
+    assert "stalled" not in caplog.text

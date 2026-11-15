@@ -306,6 +306,8 @@ def _qwen35_cpu_share_estimated_bytes(
 
 
 # Re-reads of a dynamic-bound ceiling before a load is refused (1s in total).
+# An image model's charge stays this far above the largest request peak seen.
+_IMAGE_PEAK_HEADROOM = 1.05
 _ADMISSION_CEILING_RECHECKS = 4
 _ADMISSION_CEILING_RECHECK_S = 0.25
 
@@ -468,6 +470,10 @@ class EnginePool:
         """
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
+        # Image pipelines: the largest charge a request has needed, by model
+        # id. Kept across unload/reload and rescans so a reload never goes
+        # back below what was measured.
+        self._image_peak_charge: dict[str, int] = {}
         self._current_model_memory = 0
         # Splash engines between launch and load completion, which the memory
         # guard must count before entry.engine is set.
@@ -605,6 +611,12 @@ class EnginePool:
         if entry.runtime_estimated_size is not None:
             return entry.runtime_estimated_size
 
+        if entry.engine_type == "image_generation":
+            return max(
+                entry.estimated_size,
+                self._image_peak_charge.get(entry.model_id, 0),
+            )
+
         deployment = self._distributed_deployment_for_entry(entry)
         if deployment is None:
             return entry.estimated_size
@@ -617,6 +629,39 @@ class EnginePool:
             if assignment is not None
             else entry.estimated_size
         )
+
+    def _observe_image_memory(self, model_id: str, peak_bytes: int) -> None:
+        """Raise an image model's charge when a request needed more.
+
+        ``peak_bytes`` is the engine's own peak for one request (other models
+        excluded, see ``ImageGenerationEngine``). The charge keeps 5% above
+        the largest peak seen and never goes down, so a family without a
+        component rule stays at its file size and a measured peak can only
+        make the pool more careful. Runs on the event loop.
+        """
+        wanted = int(peak_bytes * _IMAGE_PEAK_HEADROOM)
+        if wanted > self._image_peak_charge.get(model_id, 0):
+            self._image_peak_charge[model_id] = wanted
+        entry = self._entries.get(model_id)
+        if entry is None or entry.engine_type != "image_generation":
+            return
+        if entry.engine is None:
+            return  # the next load picks up the learned charge
+        # Once a request ran, "actual" is the largest peak of this load.
+        entry.actual_size = int(
+            getattr(entry.engine, "observed_peak_bytes", 0) or peak_bytes
+        )
+        charge = self._entry_resident_size(entry)
+        if wanted <= charge:
+            return
+        entry.runtime_estimated_size = wanted
+        self._current_model_memory += wanted - charge
+        logger.info(
+            f"Image model {model_id} peaked at {format_size(int(peak_bytes))}; "
+            f"charge raised {format_size(charge)} -> {format_size(wanted)} "
+            f"(total: {format_size(self._current_model_memory)})"
+        )
+        self._wake_process_memory_enforcer()
 
     def _entry_runtime_resident_size(
         self,
@@ -3928,6 +3973,13 @@ class EnginePool:
             if entry.runtime_settle_size is not None
             else resident_size
         )
+        if entry.engine_type == "image_generation":
+            # Image pipelines load components lazily and drop some after each
+            # request, so they hold far less than their (peak) charge. Settle
+            # against what the engine measured it keeps resident.
+            measured = getattr(entry.engine, "resident_bytes", None)
+            if isinstance(measured, int):
+                settle_size = measured
         pre_unload_active = 0 if external else mx.get_active_memory()
         pre_unload_footprint = 0 if external else get_phys_footprint()
 
@@ -4453,7 +4505,14 @@ class EnginePool:
                 elif entry.engine_type == "audio_tts":
                     engine = TTSEngine(model_name=entry.model_path)
                 elif entry.engine_type == "image_generation":
-                    engine = ImageGenerationEngine(model_name=entry.model_path)
+                    engine = ImageGenerationEngine(
+                        model_name=entry.model_path,
+                        memory_observer=(
+                            lambda peak, _id=model_id: self._observe_image_memory(
+                                _id, peak
+                            )
+                        ),
+                    )
                 elif entry.engine_type == "audio_sts":
                     engine = STSEngine(
                         model_name=entry.model_path,

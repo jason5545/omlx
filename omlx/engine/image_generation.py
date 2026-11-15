@@ -10,6 +10,17 @@ after another; the EnginePool lease keeps the model resident meanwhile.
 mlx-vlm's image pipelines run their denoising loop internally and expose no
 per-step callback, so the engine reports when an image starts and finishes,
 not each step.
+
+Memory. ``mx.get_peak_memory()`` and ``mx.get_active_memory()`` count every
+model in the process. Because all MLX work is serialized on the one MLX
+executor thread, nothing else allocates while ``_run_one_sync`` runs, so the
+engine can separate its own share: it tracks the bytes it keeps resident
+(``resident_bytes``) and, per image, the peak it reached on top of the other
+models (``GeneratedImage.footprint_peak_bytes``). Pipelines such as
+MiniMax-H3-Image load components lazily and drop some after each request, so
+neither number is the checkpoint's file size. The pool charges the larger of
+its estimate and the peaks reported through ``memory_observer``, and settles
+an unload against ``resident_bytes``.
 """
 
 from __future__ import annotations
@@ -50,6 +61,9 @@ class GeneratedImage:
     metadata: Dict[str, Any]
     peak_memory_gb: float
     elapsed_s: float
+    # This engine's own peak: what it held before the request plus the most
+    # the request allocated on top. Excludes other models in the process.
+    footprint_peak_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -82,13 +96,23 @@ def _supports(model: Any, task: ImageTask) -> bool:
 class ImageGenerationEngine(BaseNonStreamingEngine):
     """Serve ``/v1/images/generations`` and ``/v1/images/edits`` for one model."""
 
-    def __init__(self, model_name: str, **kwargs: Any):
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        memory_observer: Callable[[int], Any] | None = None,
+        **kwargs: Any,
+    ):
         super().__init__()
         self._model_name = model_name
         self._model: Any = None
         self._capabilities: ImageCapabilities = image_capabilities(model_name)
         self._kwargs = kwargs
         self._generated = 0
+        self._memory_observer = memory_observer
+        self._resident_bytes = 0
+        self._observed_peak_bytes = 0
+        self._failed_peak_bytes = 0
 
     @property
     def model_name(self) -> str:
@@ -104,6 +128,21 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
 
     def supports(self, task: ImageTask) -> bool:
         return self._capabilities.generate if task == "generate" else self._capabilities.edit
+
+    @property
+    def resident_bytes(self) -> int:
+        """Bytes this engine keeps allocated between requests (measured)."""
+        return self._resident_bytes
+
+    @property
+    def observed_peak_bytes(self) -> int:
+        """Largest own peak any request on this engine has reached."""
+        return self._observed_peak_bytes
+
+    def _track_resident(self, active_before: int) -> None:
+        """Fold the allocation change of one executor call into the tally."""
+        delta = mx.get_active_memory() - active_before
+        self._resident_bytes = max(0, self._resident_bytes + delta)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -141,8 +180,13 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
         task: ImageTask = "generate" if self._capabilities.generate else "edit"
         logger.info("Starting image engine: %s (%s)", self._model_name, task)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), self._ensure_model_sync, task)
+        await loop.run_in_executor(get_mlx_executor(), self._start_sync, task)
         logger.info("Image engine started: %s", self._model_name)
+
+    def _start_sync(self, task: ImageTask) -> None:
+        active_before = mx.get_active_memory()
+        self._ensure_model_sync(task)
+        self._track_resident(active_before)
 
     async def stop(self) -> None:
         if self._model is None:
@@ -154,13 +198,36 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
         await loop.run_in_executor(
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
+        self._resident_bytes = 0
         logger.info("Image engine stopped: %s", self._model_name)
 
     # -- generation ----------------------------------------------------------
 
     def _run_one_sync(self, task: ImageTask, job: ImageJob) -> GeneratedImage:
-        model = self._ensure_model_sync(task)
+        # Measure from before a possible generate/edit reload so its load
+        # counts toward this request.
+        active_before = mx.get_active_memory()
         mx.reset_peak_memory()
+        try:
+            image = self._generate_sync(task, job)
+        except BaseException:
+            # A failed request still left what it loaded and still peaked;
+            # run() reports the peak so a near-OOM raises the pool's charge.
+            mx.clear_cache()
+            self._failed_peak_bytes = self._footprint_peak(active_before)
+            self._track_resident(active_before)
+            raise
+        image.footprint_peak_bytes = self._footprint_peak(active_before)
+        self._track_resident(active_before)
+        return image
+
+    def _footprint_peak(self, active_before: int) -> int:
+        return int(
+            self._resident_bytes + max(0, mx.get_peak_memory() - active_before)
+        )
+
+    def _generate_sync(self, task: ImageTask, job: ImageJob) -> GeneratedImage:
+        model = self._ensure_model_sync(task)
         started = time.monotonic()
         if task == "generate":
             from mlx_vlm.generate.image import ImageGenerationRequest, generate_image
@@ -242,14 +309,21 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
                     raise ImageGenerationCancelled(
                         f"cancelled after {index} of {len(jobs)} images"
                     )
-                image = await loop.run_in_executor(
-                    get_mlx_executor(), self._run_one_sync, task, job
-                )
+                self._failed_peak_bytes = 0
+                try:
+                    image = await loop.run_in_executor(
+                        get_mlx_executor(), self._run_one_sync, task, job
+                    )
+                except BaseException:
+                    self._observe_memory(self._failed_peak_bytes)
+                    raise
                 results.append(image)
                 self._generated += 1
+                self._observe_memory(image.footprint_peak_bytes)
                 self._update_activity(activity_id, completed_items=index + 1)
                 logger.info(
-                    "Image %s done: model=%s %dx%d seed=%d %.1fs peak=%.1fGB%s",
+                    "Image %s done: model=%s %dx%d seed=%d %.1fs peak=%.1fGB "
+                    "(own %.1fGB, resident %.1fGB)%s",
                     task,
                     self._model_name,
                     image.width,
@@ -257,6 +331,8 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
                     image.seed,
                     image.elapsed_s,
                     image.peak_memory_gb,
+                    image.footprint_peak_bytes / 1e9,
+                    self._resident_bytes / 1e9,
                     " (prompt expanded)" if image.revised_prompt else "",
                 )
                 if on_image is not None:
@@ -267,6 +343,19 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
         finally:
             await self._finish_activity(activity_id)
 
+    def _observe_memory(self, footprint_peak_bytes: int) -> None:
+        if footprint_peak_bytes <= 0:
+            return
+        self._observed_peak_bytes = max(
+            self._observed_peak_bytes, footprint_peak_bytes
+        )
+        if self._memory_observer is None:
+            return
+        try:
+            self._memory_observer(footprint_peak_bytes)
+        except Exception:  # accounting must never fail a finished image
+            logger.exception("Image memory observer failed for %s", self._model_name)
+
     def get_stats(self) -> Dict[str, Any]:
         return {
             "model_name": self._model_name,
@@ -275,6 +364,8 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
             "generate": self._capabilities.generate,
             "edit": self._capabilities.edit,
             "images_generated": self._generated,
+            "resident_bytes": self._resident_bytes,
+            "observed_peak_bytes": self._observed_peak_bytes,
         }
 
     def __repr__(self) -> str:

@@ -334,3 +334,111 @@ def resolve_prompt_expansion(
         default,
     )
     return PromptExpansion(False, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Memory estimate
+# ---------------------------------------------------------------------------
+
+# Same allowance for runtime buffers as model_discovery.estimate_model_size.
+_RUNTIME_OVERHEAD = 1.05
+# A safetensors header is a few KB to a few MB; anything larger is not one.
+_MAX_SAFETENSORS_HEADER = 256 * 1024 * 1024
+
+
+def _safetensors_files(folder: Path) -> list[Path]:
+    return sorted(folder.glob("*.safetensors")) if folder.is_dir() else []
+
+
+def _files_bytes(folder: Path) -> int:
+    return sum(path.stat().st_size for path in _safetensors_files(folder))
+
+
+def _tensor_bytes(folder: Path, predicate) -> int:
+    """Sum the stored bytes of the tensors in ``folder`` whose name matches.
+
+    Reads only the JSON header at the front of each shard, never tensor data.
+    """
+    total = 0
+    for path in _safetensors_files(folder):
+        with path.open("rb") as handle:
+            raw = handle.read(8)
+            if len(raw) != 8:
+                raise ValueError(f"{path} is not a safetensors file")
+            length = int.from_bytes(raw, "little")
+            if not 0 < length <= _MAX_SAFETENSORS_HEADER:
+                raise ValueError(f"{path} has an implausible header length")
+            header = json.loads(handle.read(length))
+        for name, info in header.items():
+            if name == "__metadata__" or not predicate(name):
+                continue
+            start, end = info["data_offsets"]
+            total += int(end) - int(start)
+    return total
+
+
+def _h3_component(root: Path, name: str) -> Path:
+    # Mirrors mlx_vlm.models.minimax_h3_image.weights.component_path.
+    diffusers = root / f"{name}_diffusers"
+    if name != "text_encoder" and (diffusers / "config.json").is_file():
+        return diffusers
+    return root / name
+
+
+def _is_h3_adaln_weight(name: str) -> bool:
+    # The projections MiniMaxH3Transformer.drop_adaln_weights() deletes.
+    return ".adaln_proj." in name or name.startswith("norm_out.linear.")
+
+
+def _h3_image_memory(root: Path) -> int | None:
+    """Peak memory of one MiniMax-H3-Image request, from component sizes.
+
+    mlx-vlm's H3-Image pipeline loads nothing up front. Per request it loads
+    the text encoder, encodes the prompt and drops the encoder again
+    (``evict_text_encoder`` defaults to True). The transformer and the VAE
+    load on first use and stay. The first request materializes the AdaLN
+    tables and then drops the AdaLN projection weights (about 26 GB of the
+    8-bit transformer). From the second request on, the text encoder is
+    loaded next to the resident transformer and VAE, which is the peak:
+
+        transformer - AdaLN weights + VAE + text encoder
+
+    The first request peaks lower, at the larger of the text encoder and the
+    AdaLN weights alone.
+    """
+    transformer = _h3_component(root, "transformer")
+    text_encoder = _h3_component(root, "text_encoder")
+    vae = _h3_component(root, "vae")
+    transformer_bytes = _files_bytes(transformer)
+    text_encoder_bytes = _files_bytes(text_encoder)
+    vae_bytes = _files_bytes(vae)
+    if not (transformer_bytes and text_encoder_bytes and vae_bytes):
+        return None  # e.g. a text encoder kept in another repo
+    adaln_bytes = _tensor_bytes(transformer, _is_h3_adaln_weight)
+    if not 0 < adaln_bytes < transformer_bytes:
+        return None
+    steady = transformer_bytes - adaln_bytes + vae_bytes + text_encoder_bytes
+    first = max(text_encoder_bytes, adaln_bytes)
+    return int(max(steady, first) * _RUNTIME_OVERHEAD)
+
+
+# Families whose pipelines never hold every component at once. Any other
+# family is charged its full file size.
+_MEMORY_ESTIMATORS = {
+    "minimax_h3_image": _h3_image_memory,
+}
+
+
+def estimate_image_memory(path: Path | str, family: str | None) -> int | None:
+    """Return the peak bytes one request of this pipeline needs, if known.
+
+    ``None`` means "no family rule": the caller charges the file size.
+    """
+    estimator = _MEMORY_ESTIMATORS.get(family or "")
+    if estimator is None:
+        return None
+    try:
+        return estimator(Path(path))
+    except Exception as exc:  # unreadable header, odd layout: fall back
+        logger.warning("Could not size %s from its components: %s", path, exc)
+        return None

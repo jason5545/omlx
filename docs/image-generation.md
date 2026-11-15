@@ -18,7 +18,12 @@ oMLX 只做一道前置過濾：資料夾裡沒有 `model_index.json`、`manifes
 
 生圖模型是 EnginePool 的一種引擎（`engine_type: image_generation`，`omlx/engine/image_generation.py`），跟其他模型一樣受 single-model residency 管：
 
-- 記憶體估算是整個 checkpoint 的 safetensors 加 5%（MiniMax-H3-Image-8bit 約 81 GB）。載入前照既有規則先卸載其他閒置模型。
+- 記憶體估算（`omlx/image_generation.py` 的 `estimate_image_memory`）：認得的家族用元件大小推「一次請求的峰值」，其他家族照舊是整個 checkpoint 的 safetensors 加 5%。載入前照既有規則先卸載其他閒置模型。
+- MiniMax-H3-Image 的規則：mlx-vlm 的 pipeline 啟動時什麼都不載（lazy）。每次請求先載 text encoder、編碼完就丟掉（`evict_text_encoder` 預設 true，所以每次都重載）；transformer 和 VAE 第一次用到才載，之後常駐；第一次請求建完 AdaLN cache 後會丟掉 AdaLN 投影權重（8-bit 約 26 GB）。所以第二次請求起的峰值是「transformer − AdaLN 權重 + VAE + text encoder」，再加 5%。AdaLN 權重的大小從 transformer shard 的 safetensors header 讀（只讀 header，不讀權重）。MiniMax-H3-Image-8bit：(47.48 − 26.08 + 2.34 + 27.49) GB × 1.05 = **53.79 GB**（pool log 用 GiB，印成 `50.09GB`）。讀不到 header、找不到 AdaLN 權重或元件不在本機時，退回檔案大小。
+- 11/15 的實測對得上這個規則：第一次 2048² 的 peak 26.9 GB（只有 text encoder 約 26.7 GB），第二次 49.9 GB（常駐 transformer 21.4 + VAE decoder 1.6 + text encoder 26.7），4096² edit 51.4 GB（多了 VAE encoder 和視覺塔）。舊估算 75.60 GiB 是三個元件同時常駐的量，實際上不會發生。
+- 每張圖之後，引擎量自己的峰值：請求開始前的常駐量，加上這次請求在其他模型之上多用的最大量（`mx.get_peak_memory()` 減請求開始時的 `mx.get_active_memory()`；所有 MLX 工作都在同一條 MLX 執行緒上，請求期間其他模型不會配置記憶體）。log 是 `Image generate done: ... peak=49.9GB (own 49.9GB, resident 23.0GB)`，`peak` 是整個行程的數字，`own` 是這個模型自己的。失敗的請求也回報峰值。
+- pool 的 charge 是「估算」和「量過的最大峰值 × 1.05」取大，只升不降：量到更大的峰值時當場調高 charge 和 pool 總量（log：`Image model ... peaked at ...; charge raised ... -> ...`），卸載重載、重新掃描模型後也保留。不認得的家族從檔案大小起跳，所以不會低估。
+- 卸載時的 settle 期望值改用引擎實測的常駐量（H3-8bit 生過圖後約 23 GB），不再用 charge，所以不會每次 `stalled`。沒生過圖就卸載時常駐量是 0，直接 settled。
 - 每個請求對引擎取 lease，生圖期間不會被淘汰。這時別的模型的請求會拿到 **409**（`ModelBusyError`：`Model '...' is busy; cannot ...`），不排隊等。生圖結束、lease 放掉後才能切換。
 - 同一個生圖模型的多個請求依序執行：所有 MLX 運算都在全域 MLX 執行緒上（避免 Metal command buffer 競爭，見 `engine_core.get_mlx_executor`），後到的請求排在前一個後面。
 - event loop 不會被卡住：生圖在 MLX 執行緒上跑，`/health`、`/v1/models`、admin 照常回應。
@@ -55,7 +60,7 @@ data: {"type": "result", "created": 1794700000, "output_format": "png", "size": 
 data: [DONE]
 ```
 
-- **不送 `progress`**：mlx-vlm 的生圖 pipeline 在內部跑完整個去噪迴圈，沒有每一步的回呼（H3 的 `generate_array` 固定跑 6 步，沒有 callback 參數）。所以只有 `started` 和 `result`。
+- **不送 `progress`**：mlx-vlm 的生圖 pipeline 在內部跑完整個去噪迴圈，沒有每一步的回呼。H3-Image 走的是 `mlx_vlm/models/minimax_h3_image/`：`generate_array` 固定跑 6 步、沒有 callback 參數，`model._run` 也會拒絕不認得的 `extra`。有 `progress_callback` 的是影音版 `mlx_vlm/models/minimax_h3/`，生圖用不到。所以只有 `started` 和 `result`；要送 `progress` 得先改 mlx-vlm。
 - 生圖期間每 15 秒送一行 SSE 註解 `: keepalive`，讓連線不會因為閒置被斷。SSE 規範要求 client 忽略 `:` 開頭的行。
 - 失敗時送 `data: {"type": "error", "message": "..."}` 再送 `[DONE]`。
 - 請求本身不合法（模型不存在、PE 缺檔、模型忙）時不開串流，直接回一般的 HTTP 錯誤。

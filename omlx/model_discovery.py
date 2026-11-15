@@ -28,6 +28,7 @@ from typing import Literal
 
 from . import gguf
 from .image_generation import (
+    estimate_image_memory,
     image_capabilities,
     incomplete_download,
     is_image_generation_dir,
@@ -1958,7 +1959,11 @@ def _register_image_model(
             )
             return
         capabilities = image_capabilities(model_dir)
-        estimated_size = estimate_model_size(model_dir)
+        # Pipelines that load and drop components per request are charged
+        # their request peak; every other family its full file size.
+        estimated_size = estimate_image_memory(
+            model_dir, capabilities.family
+        ) or estimate_model_size(model_dir)
         models[model_id] = DiscoveredModel(
             model_id=model_id,
             model_path=str(model_dir),
