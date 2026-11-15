@@ -367,6 +367,17 @@ _NUMERICS_REVISIONS = {
     "mlx_vlm.models.deepseekocr.vision": "mlx-vlm-138d761",
     "mlx_vlm.models.minicpmv4_6.vision": "mlx-vlm-138d761",
     "mlx_vlm.quantization.nvfp4": "mlx-vlm-138d761",
+    # mlx-vlm 14bab76 resizes Siglip2 position embeddings with the ATen
+    # bilinear kernel (Aya Vision, Phi-4-MM), runs Molmo's position upsample
+    # channels-last with antialiased cubic, and fixes base.interpolate's axis
+    # order (InternVL, InternVL-Chat, Molmo2, MolmoPoint vision towers).
+    "mlx_vlm.models.aya_vision.vision": "mlx-vlm-14bab76",
+    "mlx_vlm.models.phi4mm.vision": "mlx-vlm-14bab76",
+    "mlx_vlm.models.molmo.vision": "mlx-vlm-14bab76",
+    "mlx_vlm.models.internvl.vision": "mlx-vlm-14bab76",
+    "mlx_vlm.models.internvl_chat.vision": "mlx-vlm-14bab76",
+    "mlx_vlm.models.molmo2.vision": "mlx-vlm-14bab76",
+    "mlx_vlm.models.molmo_point.vision": "mlx-vlm-14bab76",
 }
 
 

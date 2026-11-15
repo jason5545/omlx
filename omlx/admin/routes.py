@@ -3088,6 +3088,9 @@ async def update_model_settings(
             "audio_tts": "audio_tts",
             "audio_sts": "audio_sts",
             "decision": "decision",
+            # Reached only through auto-detection: an override cannot turn a
+            # checkpoint into an image pipeline.
+            "image_generation": "image_generation",
         }
         if override_value:
             entry.model_type = override_value

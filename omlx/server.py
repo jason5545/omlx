@@ -991,6 +991,11 @@ from .api.websearch_routes import set_global_settings_getter as _set_websearch_s
 _set_websearch_settings(lambda: _server_state.global_settings)
 app.include_router(websearch_router, dependencies=[Depends(verify_inference_api_key)])
 
+# Image generation and editing (mlx-vlm image pipelines; see docs/image-generation.md)
+from .api.image_routes import router as image_router
+
+app.include_router(image_router, dependencies=[Depends(verify_inference_api_key)])
+
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
 # would always import successfully — we need an explicit mlx-audio check.
@@ -4069,7 +4074,10 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                     id=display_id,
                     owned_by="omlx",
                     model_type=m.get("model_type"),
-                    max_model_len=get_max_context_window(model_id),
+                    # An image pipeline has no context window to advertise.
+                    max_model_len=None
+                    if m.get("model_type") == "image_generation"
+                    else get_max_context_window(model_id),
                 )
             )
         # Both sets are needed by the exposed-profile and Claude tier-alias

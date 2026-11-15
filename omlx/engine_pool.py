@@ -53,6 +53,7 @@ from .engine.splash import (
 )
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
+from .engine.image_generation import ImageGenerationEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import OCR_MODEL_GENERATION_DEFAULTS, VLMBatchedEngine
 from .engine_core import get_mlx_executor, shutdown_mlx_executor
@@ -363,6 +364,7 @@ class EngineEntry:
         "audio_tts",
         "audio_sts",
         "decision",
+        "image_generation",
     ]  # Model type
     engine_type: Literal[
         "batched",
@@ -374,6 +376,7 @@ class EngineEntry:
         "audio_tts",
         "audio_sts",
         "decision",
+        "image_generation",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
@@ -409,6 +412,7 @@ class EngineEntry:
         | STTEngine
         | STSEngine
         | TTSEngine
+        | ImageGenerationEngine
         | None
     ) = None  # Loaded engine instance
     last_access: float = 0.0  # Latest load/acquire/release for LRU and TTL
@@ -1694,6 +1698,7 @@ class EnginePool:
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
         "decision": "decision",
+        "image_generation": "image_generation",
     }
 
     @staticmethod
@@ -4441,6 +4446,8 @@ class EnginePool:
                     engine = STTEngine(model_name=entry.model_path)
                 elif entry.engine_type == "audio_tts":
                     engine = TTSEngine(model_name=entry.model_path)
+                elif entry.engine_type == "image_generation":
+                    engine = ImageGenerationEngine(model_name=entry.model_path)
                 elif entry.engine_type == "audio_sts":
                     engine = STSEngine(
                         model_name=entry.model_path,

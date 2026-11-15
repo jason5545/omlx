@@ -13,6 +13,8 @@ Supports:
 - Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
 - Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, d3, d1)
+- Image generation models: Use ImageGenerationEngine for /v1/images/* (any
+  pipeline mlx-vlm classifies as image generation or editing)
 """
 
 import contextlib
@@ -25,14 +27,35 @@ from pathlib import Path
 from typing import Literal
 
 from . import gguf
+from .image_generation import (
+    image_capabilities,
+    incomplete_download,
+    is_image_generation_dir,
+)
 
 logger = logging.getLogger(__name__)
 
 ModelType = Literal[
-    "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+    "llm",
+    "vlm",
+    "embedding",
+    "reranker",
+    "audio_stt",
+    "audio_tts",
+    "audio_sts",
+    "decision",
+    "image_generation",
 ]
 EngineType = Literal[
-    "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+    "batched",
+    "vlm",
+    "embedding",
+    "reranker",
+    "audio_stt",
+    "audio_tts",
+    "audio_sts",
+    "decision",
+    "image_generation",
 ]
 DecisionKind = Literal["clef", "openjev", "d3", "d1"]
 
@@ -765,8 +788,11 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     Returns:
         Model type: "llm", "vlm", "embedding", "reranker", "audio_stt",
-        "audio_tts", "audio_sts", or "decision"
+        "audio_tts", "audio_sts", "decision", or "image_generation"
     """
+    if is_image_generation_dir(model_path):
+        return "image_generation"
+
     config_path = model_path / "config.json"
     if not config_path.exists():
         return "llm"
@@ -1907,6 +1933,59 @@ def _register_model(
         logger.error(f"Failed to discover model {model_id}: {e}")
 
 
+def _register_image_model(
+    models: dict[str, DiscoveredModel],
+    model_dir: Path,
+    model_id: str,
+    *,
+    source_type: str = "local",
+    source_repo_id: str | None = None,
+) -> None:
+    """Register an image generation pipeline mlx-vlm recognizes."""
+    if model_id in models:
+        logger.warning(
+            f"Duplicate model_id '{model_id}' found in {model_dir}, "
+            f"keeping version from {models[model_id].model_path}"
+        )
+        return
+    try:
+        incomplete = incomplete_download(model_dir)
+        if incomplete:
+            logger.warning(
+                f"Skipping incomplete image model '{model_id}': {incomplete} "
+                f"in {model_dir} — likely an interrupted or still-running "
+                f"download."
+            )
+            return
+        capabilities = image_capabilities(model_dir)
+        estimated_size = estimate_model_size(model_dir)
+        models[model_id] = DiscoveredModel(
+            model_id=model_id,
+            model_path=str(model_dir),
+            model_type="image_generation",
+            engine_type="image_generation",
+            estimated_size=estimated_size,
+            config_model_type=capabilities.family or "",
+            source_type=source_type,
+            source_repo_id=source_repo_id,
+        )
+        tasks = [
+            task
+            for task, enabled in (
+                ("generate", capabilities.generate),
+                ("edit", capabilities.edit),
+            )
+            if enabled
+        ]
+        logger.info(
+            f"Discovered model: {model_id} (type: image_generation, "
+            f"family: {capabilities.family}, tasks: {'/'.join(tasks)}, "
+            f"size: {estimated_size / (1024**3):.2f}GB)"
+        )
+    except Exception as e:
+        logger.error(f"Failed to discover image model {model_id}: {e}")
+
+
 # Prebuilt Splash packages, by their manifest's format, and the MLX model
 # that holds the same weights. Splash stopped loading packages in 1.3.1.
 _SPLASH_PACKAGE_REPLACEMENTS = {
@@ -2114,6 +2193,12 @@ def discover_models(
 
     models: dict[str, DiscoveredModel] = {}
 
+    if is_image_generation_dir(model_dir):
+        # The directory is one image pipeline; its component folders
+        # (transformer/, text_encoder/, ...) are not models of their own.
+        _register_image_model(models, model_dir, model_dir.name)
+        return models
+
     for subdir in _iter_readable_entries(model_dir, "model directory"):
         if not _is_readable_dir(subdir, "model entry") or subdir.name.startswith("."):
             continue
@@ -2127,6 +2212,9 @@ def discover_models(
             )
         elif _register_gguf_folder(models, subdir, gguf_root):
             pass
+        elif is_image_generation_dir(subdir):
+            # Level 1: image pipeline folder (its components carry config.json)
+            _register_image_model(models, subdir, subdir.name)
         elif _is_model_dir(subdir):
             # Level 1: direct model folder
             _register_model(models, subdir, subdir.name)
@@ -2142,6 +2230,14 @@ def discover_models(
                     source_repo_id=hf_resolved.source_repo_id,
                 ) or _skip_splash_package(hf_resolved.snapshot_path):
                     pass
+                elif is_image_generation_dir(hf_resolved.snapshot_path):
+                    _register_image_model(
+                        models,
+                        hf_resolved.snapshot_path,
+                        hf_resolved.model_id,
+                        source_type="hf_cache",
+                        source_repo_id=hf_resolved.source_repo_id,
+                    )
                 elif _is_hf_cache_mlx_compatible(
                     hf_resolved.snapshot_path,
                     hf_resolved.source_repo_id,
@@ -2175,6 +2271,9 @@ def discover_models(
                     has_children = True
                 elif _skip_splash_package(child):
                     has_children = True
+                elif is_image_generation_dir(child):
+                    has_children = True
+                    _register_image_model(models, child, child.name)
                 elif _is_model_dir(child):
                     has_children = True
                     _register_model(models, child, child.name)
