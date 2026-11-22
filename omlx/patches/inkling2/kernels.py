@@ -6,6 +6,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
+from ..qwen35_verify_qmm import is_row_exact_armed
 
 # Upper bound on one additive mask block (elements) in the general attention
 # path; queries are split into sub-blocks so the mask stays below it.
@@ -141,7 +142,8 @@ def _decode_attention(q, k, v, rel, sink, scale, window):
 
 
 # Flash attention with the relative-bias band and per-query sinks, for
-# prefill-sized BF16 query blocks. One threadgroup runs 32 queries of one head
+# prefill-sized BF16 or FP16 query blocks (FP16 after the M1/M2 activation
+# recast). One threadgroup runs 32 queries of one head
 # in four simdgroups (8 rows each) over 16-key tiles staged in half. Scores
 # live in the log2 domain; each row's online softmax starts from its sink
 # logit, so the zero-value sink is exact without an extra key.
@@ -169,9 +171,9 @@ _FLASH_SOURCE = """
     const int a_row = S - L + row;
     const float qscale = scale[0] * LOG2E;
 
-    // Q, K and V are BF16 values within half's range (L2-clipped q/k,
-    // unit-RMS v), so staging them in half is exact; scores accumulate in
-    // FP32 and the softmax scale is applied there. K is stored transposed
+    // Q, K and V are FP16, or BF16 values within half's range (L2-clipped
+    // q/k, unit-RMS v), so staging them in half is exact; scores accumulate
+    // in FP32 and the softmax scale is applied there. K is stored transposed
     // and both tiles are padded by 16 bytes per row against bank conflicts.
     constexpr int LDK = BK + 8;
     constexpr int LDV = D + 8;
@@ -209,7 +211,7 @@ _FLASH_SOURCE = """
     for (int k0 = k_begin; k0 <= a_last; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (vec_kv) {
-            // 8 BF16 values (16 bytes) per load.
+            // 8 BF16 or FP16 values (16 bytes) per load.
             for (int c = tid; c < BK * D / 8; c += NT) {
                 const int r = c / (D / 8);
                 const int col = (c % (D / 8)) * 8;
@@ -222,11 +224,23 @@ _FLASH_SOURCE = """
                 }
                 threadgroup half* kd = Ks + col * LDK + r;
                 threadgroup half* vd = Vs + r * LDV + col;
-                for (int j = 0; j < 4; ++j) {
-                    kd[(2 * j) * LDK] = half(as_type<float>(kw[j] << 16));
-                    kd[(2 * j + 1) * LDK] = half(as_type<float>(kw[j] & 0xFFFF0000u));
-                    vd[2 * j] = half(as_type<float>(vw[j] << 16));
-                    vd[2 * j + 1] = half(as_type<float>(vw[j] & 0xFFFF0000u));
+                if (IS_BF16) {
+                    for (int j = 0; j < 4; ++j) {
+                        kd[(2 * j) * LDK] = half(as_type<float>(kw[j] << 16));
+                        kd[(2 * j + 1) * LDK] = half(as_type<float>(kw[j] & 0xFFFF0000u));
+                        vd[2 * j] = half(as_type<float>(vw[j] << 16));
+                        vd[2 * j + 1] = half(as_type<float>(vw[j] & 0xFFFF0000u));
+                    }
+                } else {
+                    // FP16 activations (M1/M2 recast): the words already hold halves.
+                    for (int j = 0; j < 4; ++j) {
+                        const half2 k2 = as_type<half2>(kw[j]);
+                        const half2 v2 = as_type<half2>(vw[j]);
+                        kd[(2 * j) * LDK] = k2.x;
+                        kd[(2 * j + 1) * LDK] = k2.y;
+                        vd[2 * j] = v2.x;
+                        vd[2 * j + 1] = v2.y;
+                    }
                 }
             }
         } else {
@@ -333,7 +347,7 @@ def _use_flash(length: int, window: int) -> bool:
 
 
 def flash_banded_attention(q, k, v, rel, sink, *, scale, window, left_padding=None):
-    """``banded_sink_attention`` for BF16 prefill blocks; same arguments and result."""
+    """``banded_sink_attention`` for BF16/FP16 prefill blocks; same arguments and result."""
     global _flash_kernel
     b, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
@@ -363,6 +377,7 @@ def flash_banded_attention(q, k, v, rel, sink, *, scale, window, left_padding=No
         ],
         template=[
             ("T", q.dtype),
+            ("IS_BF16", q.dtype == mx.bfloat16),
             ("D", d),
             ("HQ", hq),
             ("HKV", hkv),
@@ -398,7 +413,26 @@ def banded_sink_attention(
     b, length = q.shape[0], q.shape[2]
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
-    if q.dtype == mx.bfloat16 and _use_flash(length, window):
+    if b == 1 and left_padding is None and is_row_exact_armed():
+        # Row-exact verify: each row is the decode step of its token, over the
+        # keys up to its own position.
+        s = k.shape[2]
+        return mx.concatenate(
+            [
+                _decode_attention(
+                    q[:, :, r : r + 1],
+                    k[:, :, : s - length + 1 + r],
+                    v[:, :, : s - length + 1 + r],
+                    rel[:, r : r + 1],
+                    sink[:, r : r + 1],
+                    scale,
+                    window,
+                )
+                for r in range(length)
+            ],
+            axis=2,
+        )
+    if q.dtype in (mx.bfloat16, mx.float16) and _use_flash(length, window):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )

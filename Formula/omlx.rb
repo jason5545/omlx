@@ -1,14 +1,14 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jason5545/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.8.0rc1.tar.gz"
-  sha256 "1e319d5c2cc2d0cfc309a256413087d3687cb291b1feaa1c8d249c28c0cdc6f2"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.8.2.tar.gz"
+  sha256 "286a4106aa39815a1dd2b3b0935e736c363e461b071573581f7c4da2dfee2cdc"
   license "Apache-2.0"
 
   head "https://github.com/jason5545/omlx.git", branch: "main"
 
   option "with-custom-kernel",
-         "Build native custom kernels for Bonsai, GLM-5.2, MiniMax M3 and Qwen3.5/3.6/4 acceleration"
+         "Build native custom kernels for oQH, Bonsai, GLM-5.2, MiniMax M3 and Qwen3.5/3.6/4 acceleration"
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
