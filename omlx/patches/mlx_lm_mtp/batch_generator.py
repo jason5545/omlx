@@ -1764,6 +1764,40 @@ def _host_token_procs(procs) -> bool:
     )
 
 
+def _live_processors(procs, positions: int):
+    """Processors that can change logits within the next ``positions`` calls."""
+    if not procs:
+        return procs
+    live = [
+        p for p in procs if not (hasattr(p, "inert_for") and p.inert_for(positions))
+    ]
+    return live or None
+
+
+class _DeferredHostTokens:
+    """Token history with host ints past ``base``, where processors read new tokens."""
+
+    def __init__(self, base: int, tail: List[int]):
+        self._base = base
+        self._tail = tail
+
+    def __len__(self) -> int:
+        return self._base + len(self._tail)
+
+    def __getitem__(self, i: int) -> int:
+        if i < self._base:
+            raise IndexError(f"position {i} precedes the host tail at {self._base}")
+        return self._tail[i - self._base]
+
+
+def _advance_processors(procs, base: int, emitted: List[int]) -> None:
+    """Advance inert processors one call per emitted token, as the verify rows would."""
+    for j in range(len(emitted)):
+        history = _DeferredHostTokens(base, emitted[: j + 1])
+        for proc in procs:
+            proc(history, None)
+
+
 def _snap_snapshotable(procs):
     """Checkpoint state of processors exposing ``snapshot_state`` (budget).
 
@@ -3260,17 +3294,25 @@ def _dspark_next_drafts(
     # distribution but must not advance the thinking budget (they would
     # count tokens that are only emitted if verified later). Checkpoint
     # before the loop and rewind after.
-    snap = _snap_snapshotable(procs)
+    draft_procs = _live_processors(procs, depth)
+    snap = _snap_snapshotable(draft_procs)
 
+    # Hosts whose next slot depends on the previous draft beyond an additive
+    # bias (DFly2 re-projects a corrected hidden) supply dspark_step_logits;
+    # dspark_forward's first result is then their opaque block state.
+    step_logits = getattr(host, "dspark_step_logits", None)
     for idx in range(depth):
-        bias, _ = host.dspark_markov(previous)
-        logits_2d = logits[:, idx, :] + bias
-        if procs is not None and prev_buf is not None:
+        if step_logits is not None:
+            logits_2d = step_logits(logits, idx, previous)
+        else:
+            bias, _ = host.dspark_markov(previous)
+            logits_2d = logits[:, idx, :] + bias
+        if draft_procs is not None and prev_buf is not None:
             prefix = mx.concatenate(
                 [prev_buf.astype(mx.int32), anchor.reshape(1).astype(mx.int32)]
                 + [token.reshape(1).astype(mx.int32) for token in draft_toks]
             )
-            logits_2d = _apply_processors(procs, prefix, logits_2d)
+            logits_2d = _apply_processors(draft_procs, prefix, logits_2d)
         lp_2d = _logprobs(logits_2d)
         token = _ensure_uint32(sampler(lp_2d))
         draft_toks.append(token)
@@ -3278,7 +3320,7 @@ def _dspark_next_drafts(
         draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
         previous = token.reshape(1)
 
-    _restore_snapshotable(procs, snap)
+    _restore_snapshotable(draft_procs, snap)
 
     state.drafts = mx.concatenate(draft_toks)
     state.draft_lps = draft_lps
@@ -3421,7 +3463,8 @@ def _chain_next_drafts(
     if begin is not None:
         begin(state.mtp_cache, depth)
 
-    sparse_k = _sparse_top_k(sampler) if procs is None else 0
+    draft_procs = _live_processors(procs, depth)
+    sparse_k = _sparse_top_k(sampler) if draft_procs is None else 0
     coarse = _coarse_draft_head(model) if 0 < sparse_k <= 32 else None
     n = committed.shape[0]
     if coarse is None:
@@ -3452,9 +3495,10 @@ def _chain_next_drafts(
         chain_cache = _chain_tail_caches(model, state.mtp_cache) or chain_cache
 
     # Speculative draft shaping — see _dspark_next_drafts.
-    snap = _snap_snapshotable(procs)
-    host_procs = committed_ids is not None and _host_token_procs(procs)
-    shaping = procs is not None and prev_buf is not None
+    draft_procs = _live_processors(procs, depth)
+    snap = _snap_snapshotable(draft_procs)
+    host_procs = committed_ids is not None and _host_token_procs(draft_procs)
+    shaping = draft_procs is not None and prev_buf is not None
 
     sparse_ids: List[Any] = []
     for j in range(depth):
@@ -3476,7 +3520,7 @@ def _chain_next_drafts(
                     prev = _HostTokens(
                         prev, int(prev_buf.shape[0]), [int(committed_ids[-1])]
                     )
-                logits_2d = _apply_processors(procs, prev, logits_2d)
+                logits_2d = _apply_processors(draft_procs, prev, logits_2d)
                 if (
                     host_procs
                     and j == 0
@@ -3512,7 +3556,7 @@ def _chain_next_drafts(
             source, head_hidden = coarse.hidden(h, tok.reshape(1, 1), chain_cache)
         h = head_hidden[:, -1:]
 
-    _restore_snapshotable(procs, snap)
+    _restore_snapshotable(draft_procs, snap)
 
     if draft_toks:
         state.drafts = mx.concatenate(draft_toks)
@@ -3704,13 +3748,16 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
     mtp_logits = gen_batch.model.mtp_forward(hidden_at_main, next_ids, mtp_cache)
     mtp_logits_2d = mtp_logits[:, -1, :]
     # The seed draft is speculative — shape but do not count.
-    snap = _snap_snapshotable(procs)
-    if procs is not None:
+    draft_procs = _live_processors(procs, 1)
+    snap = _snap_snapshotable(draft_procs)
+    if draft_procs is not None:
         prev_with_main_and_next = mx.concatenate(
             [prev_buf, _ensure_uint32(next_main_tok)]
         )
-        mtp_logits_2d = _apply_processors(procs, prev_with_main_and_next, mtp_logits_2d)
-    _restore_snapshotable(procs, snap)
+        mtp_logits_2d = _apply_processors(
+            draft_procs, prev_with_main_and_next, mtp_logits_2d
+        )
+    _restore_snapshotable(draft_procs, snap)
     draft_lp_2d = _logprobs(mtp_logits_2d)
     draft_tok = sampler(draft_lp_2d)
     # Filtered draft lp — what the sampler actually drew from. The next
@@ -4345,7 +4392,6 @@ def _stochastic_verify_tokens_sparse(
 
     from omlx.utils.sampling import top_k_indices
 
-    k = int(drafts.shape[0])
     top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
     temp = float(sampler.temp)
     ids = top_k_indices(combined_lp, top_k)
@@ -4358,7 +4404,14 @@ def _stochastic_verify_tokens_sparse(
         vals = mx.where(mx.cumsum(probs, axis=-1) - probs < top_p, vals, -float("inf"))
     scaled = vals * (1.0 / temp)
     logp = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)  # (k+1, top_k)
+    return _verify_on_support(ids, logp, drafts, draft_accept_lps)
 
+
+def _verify_on_support(ids, logp, drafts, draft_accept_lps):
+    """Verify drafts against a target density that is zero outside ``ids``."""
+    import mlx.core as mx
+
+    k = int(drafts.shape[0])
     d = drafts.astype(mx.int32)
     hit = ids[:k] == d[:, None]
     p_at = mx.where(
@@ -4405,6 +4458,84 @@ def _stochastic_verify_tokens_sparse(
             bonus_tok.astype(mx.int32),
         ]
     )
+
+
+_NUCLEUS_CANDIDATES = 512
+
+
+def _nucleus_verify_eligible(sampler, vocab: int) -> bool:
+    """Target filter is exactly top-p (no top-k, min-p or XTC) on a wide vocab."""
+    top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
+    return (
+        vocab > 2 * _NUCLEUS_CANDIDATES
+        and float(getattr(sampler, "temp", 0.0) or 0.0) > 0.0
+        and 0.0 < top_p < 1.0
+        and int(getattr(sampler, "top_k", 0) or 0) == 0
+        and float(getattr(sampler, "min_p", 0.0) or 0.0) == 0.0
+        and float(getattr(sampler, "xtc_probability", 0.0) or 0.0) <= 0.0
+        and getattr(sampler, "_mtp_sampling_logits", None) is not None
+    )
+
+
+def _nucleus_support(sampler, combined_lp):
+    """Top-p density on the ``_NUCLEUS_CANDIDATES`` likeliest tokens of each row.
+
+    ``exact`` is 1 only when every row's nucleus fits inside its candidates.
+    """
+    import mlx.core as mx
+
+    from omlx.utils.sampling import top_k_indices_wide
+
+    top_p = float(sampler.top_p)
+    temp = float(sampler.temp)
+    ids = top_k_indices_wide(combined_lp, _NUCLEUS_CANDIDATES)
+    vals = mx.take_along_axis(combined_lp, ids, axis=-1)
+    order = mx.argsort(-vals.astype(mx.float32), axis=-1)
+    vals = mx.take_along_axis(vals, order, axis=-1)
+    ids = mx.take_along_axis(ids, order, axis=-1)
+    # Same rule as apply_top_p: drop a token once the mass above it reaches top_p.
+    probs = mx.exp(vals.astype(mx.float32))
+    total = mx.exp(combined_lp.astype(mx.float32)).sum(axis=-1, keepdims=True)
+    mass_above = mx.cumsum(probs, axis=-1, inclusive=False)
+    num_kept = (mass_above < top_p * total).sum(axis=-1, keepdims=True).astype(
+        mx.int32
+    )
+    cutoff = mx.take_along_axis(vals, num_kept - 1, axis=-1)
+    exact = mx.all(vals[:, -1:] < cutoff)
+    scaled = (mx.where(vals < cutoff, -float("inf"), vals) * (1.0 / temp)).astype(
+        mx.float32
+    )
+    logp = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+    return ids, logp, exact
+
+
+def _verify_stochastic(
+    sampler, combined_lp, drafts, draft_accept_lps, *, allow_nucleus=True
+):
+    """``_stochastic_verify_tokens`` packet plus a trailing 1 when it is valid."""
+    import mlx.core as mx
+
+    if allow_nucleus and int(drafts.shape[0]) > 0 and _nucleus_verify_eligible(
+        sampler, combined_lp.shape[-1]
+    ):
+        ids, logp, exact = _nucleus_support(sampler, combined_lp)
+        packet = _verify_on_support(ids, logp, drafts, draft_accept_lps)
+        return mx.concatenate([packet, exact.astype(mx.int32).reshape(1)])
+    packet = _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps)
+    return mx.concatenate([packet, mx.ones((1,), dtype=mx.int32)])
+
+
+def _settled_verify(host, sampler, combined_lp, drafts, draft_accept_lps):
+    """Host packet of ``_verify_stochastic``, redrawn densely when not valid.
+
+    Validity depends only on the logits, so the redraw keeps the distribution.
+    """
+    *packet, exact = host
+    if exact:
+        return packet
+    return _stochastic_verify_tokens(
+        sampler, combined_lp, drafts, draft_accept_lps
+    ).tolist()
 
 
 def _stochastic_verify_tokens(sampler, combined_lp, drafts, draft_accept_lps):
@@ -4496,15 +4627,20 @@ def _context_copy_drafts(
     so the Leviathan/Chen rule keeps the sampled distribution exact. Either
     way any draft source leaves the output distribution unchanged. Returns
     ``[]`` when the MTP head should draft instead. With ``block``, only a copy
-    of exactly that many tokens replaces the drafter's block.
+    of exactly that many tokens replaces the drafter's block, except a
+    verbatim copy on a target with 16-row windows, which may run past it.
     """
     if state.context_copy is None:
-        # A wide copy verifies MAX_COPY + 1 rows, so it must fit the target's
-        # verify cap (GLM-5.3's indexer pool rolls back at most 8 rows).
+        # A wide copy verifies MAX_COPY + 1 rows. A declared verify cap decides
+        # (GLM-5.3's indexer pool rolls back at most 8 rows, Inkling 2 verifies
+        # 16); without one only row-exact targets cover 16-row windows.
         cap = _max_verify_rows(gen_batch.model)
         state.context_copy = _context_copy.ContextCopy(
-            wide_window=_row_exact_verify(gen_batch.model)
-            and (cap is None or cap > _context_copy.MAX_COPY)
+            wide_window=(
+                cap > _context_copy.MAX_COPY
+                if cap is not None
+                else _row_exact_verify(gen_batch.model)
+            )
         )
     copier = state.context_copy
     state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)
@@ -4518,7 +4654,12 @@ def _context_copy_drafts(
         block = state.depth
     if block is None:
         return copier.propose(room)
-    copied = copier.propose(min(room, block))
+    if copier.wide_window:
+        copied = copier.propose(min(room, block), wide_limit=room)
+        if len(copied) > block:
+            return copied
+    else:
+        copied = copier.propose(min(room, block))
     return copied if len(copied) == block else []
 
 
@@ -4590,8 +4731,13 @@ def _run_verify_cycle_chain(
     procs = _proc_list(gen_batch)
     is_greedy = _is_greedy(gen_batch)
     drafter = _drafter_for(gen_batch.model)
-    if drafter is not None and verify_result is None:
-        # A shared verify was already built from the drafts it was given.
+    if (
+        drafter is not None
+        and verify_result is None
+        and not (state.copy_drafts and int(state.drafts.shape[0]) > drafter.depth)
+    ):
+        # A shared verify was already built from the drafts it was given. A
+        # copy longer than the block is not the drafter's block to clip.
         _clip_block_drafts(
             state,
             state.controller.cur if state.controller is not None else state.depth,
@@ -4607,11 +4753,16 @@ def _run_verify_cycle_chain(
     # Token buffer per input position (mirrors PR 990 _step_backbone). Row j's
     # processor prefix is everything before that input position.
     prev_rows: List[Optional[Any]] = [None] * (k + 1)
+    rows_from = 0
     if procs is not None:
         buf = gen_batch._token_context[0]
+        rows_from = buf._size
         prev_rows[0] = buf.update_and_fetch(state.next_main)
         for j in range(k):
             prev_rows[j + 1] = buf.update_and_fetch(state.drafts[j : j + 1])
+    # Inert processors skip the rows and advance over the emitted tokens below.
+    verify_procs = _live_processors(procs, k + 1)
+    deferred_procs = [p for p in procs or [] if p not in (verify_procs or [])]
 
     # --- backbone verify forward + single host sync ---
     t0 = time.perf_counter()
@@ -4630,9 +4781,9 @@ def _run_verify_cycle_chain(
     state.stats.backbone_ms += verify_ms
     rows = logits[0]  # (k+1, vocab)
     row_snaps: List[Optional[Any]] = [None] * (k + 1)
-    if procs is not None:
+    if verify_procs is not None:
         row_tokens = prev_rows
-        if _host_token_procs(procs):
+        if _host_token_procs(verify_procs):
             # The verify forward already evaluated [next_main, d1..dk], so
             # their ids cost no GPU wait; each row's new token is then a host
             # int. The buffer's pending appends, no longer read here, are
@@ -4646,13 +4797,15 @@ def _run_verify_cycle_chain(
         applied = []
         for j in range(k + 1):
             applied.append(
-                _apply_processors(procs, row_tokens[j], rows[j : j + 1]).squeeze(0)
+                _apply_processors(verify_procs, row_tokens[j], rows[j : j + 1]).squeeze(
+                    0
+                )
             )
             # Checkpoint after each row: rows 0..m correspond to the m+1
             # tokens actually emitted this cycle (m accepted drafts + the
             # bonus/verify correction). Rows m+1..k are speculative — they
             # predict rejected drafts and are re-verified next cycle.
-            row_snaps[j] = _snap_snapshotable(procs)
+            row_snaps[j] = _snap_snapshotable(verify_procs)
         rows = mx.stack(applied)
     combined_lp = rows - mx.logsumexp(rows, axis=-1, keepdims=True)  # (k+1, V)
     # A block drafter can start the next block on the GPU while the host
@@ -4715,8 +4868,15 @@ def _run_verify_cycle_chain(
         # ONE host sync (mirrors the greedy path's sync structure).
         host = stochastic_result
         if host is None:
-            result = _stochastic_verify_tokens(
-                sampler, combined_lp, state.drafts, state.draft_accept_lps
+            result = _verify_stochastic(
+                sampler,
+                combined_lp,
+                state.drafts,
+                state.draft_accept_lps,
+                # A fast-path miss would also discard the queued pre-draft.
+                allow_nucleus=not (
+                    can_predraft and callable(getattr(drafter, "predraft", None))
+                ),
             )
             if can_predraft:
                 m_arr = result[:1]
@@ -4728,7 +4888,13 @@ def _run_verify_cycle_chain(
                 predrafted = _predraft(
                     gen_batch, state, drafter, captured, result, m_arr, anchor
                 )
-            host = result.tolist()
+            host = _settled_verify(
+                result.tolist(),
+                sampler,
+                combined_lp,
+                state.drafts,
+                state.draft_accept_lps,
+            )
         m = int(host[0])
         draft_ids = host[1 : k + 1]
         res_ids = host[k + 1 : 2 * k + 1]
@@ -4799,7 +4965,12 @@ def _run_verify_cycle_chain(
     # MTPProcessingSampler's position-keyed snapshot/restore on vlm_mtp.
     # Uses the FINAL m (after the model clamp and boundary alignment above).
     if m < k and row_snaps[m] is not None:
-        _restore_snapshotable(procs, row_snaps[m])
+        _restore_snapshotable(verify_procs, row_snaps[m])
+    if deferred_procs:
+        # Rows 0..m consumed next_main and the m accepted drafts.
+        emitted_ids = [int(state.next_main.reshape(-1)[0].item())]
+        emitted_ids += [int(d) for d in draft_ids[:m]]
+        _advance_processors(deferred_procs, rows_from, emitted_ids)
 
     # A clamp can put the final verify token on the boundary, while a full
     # accept can put its bonus token there. Neither token is present in the
@@ -5291,11 +5462,12 @@ def _step_mtp(
     )
     mtp_logits_2d = mtp_logits[:, -1, :]
     # The draft is speculative — shape it but do not advance the budget.
-    snap = _snap_snapshotable(procs)
-    if procs is not None and prev_buf is not None:
+    draft_procs = _live_processors(procs, 1)
+    snap = _snap_snapshotable(draft_procs)
+    if draft_procs is not None and prev_buf is not None:
         prev_with_next = mx.concatenate([prev_buf, _ensure_uint32(next_main_tok)])
-        mtp_logits_2d = _apply_processors(procs, prev_with_next, mtp_logits_2d)
-    _restore_snapshotable(procs, snap)
+        mtp_logits_2d = _apply_processors(draft_procs, prev_with_next, mtp_logits_2d)
+    _restore_snapshotable(draft_procs, snap)
     new_lp = _logprobs(mtp_logits_2d)
     new_tok = sampler(new_lp)
     # Filtered draft lp — what the sampler actually drew from. The next

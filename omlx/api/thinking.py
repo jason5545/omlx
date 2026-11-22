@@ -975,3 +975,12 @@ class ThinkingBudgetProcessor:
                 delattr(self, name)
         if self._loop_detector is not None and "_loop_detector" in state:
             self._loop_detector.restore(state["_loop_detector"])
+
+    def inert_for(self, positions: int) -> bool:
+        """Whether the next ``positions`` calls leave every logit unchanged."""
+        if self._forcing or self._waiting_utf8:
+            return False
+        if self._done:
+            # A re-entry into thinking restarts the count at zero.
+            return positions < self._budget
+        return self._thinking_tokens + positions < self._budget
