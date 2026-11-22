@@ -977,10 +977,24 @@ class ThinkingBudgetProcessor:
             self._loop_detector.restore(state["_loop_detector"])
 
     def inert_for(self, positions: int) -> bool:
-        """Whether the next ``positions`` calls leave every logit unchanged."""
-        if self._forcing or self._waiting_utf8:
+        """Whether the next ``positions`` calls leave every logit unchanged.
+
+        Same bound as :meth:`idle_for`, which also covers the loop guard,
+        the reminder and a processor without a budget (loop guard only,
+        ``budget=None``). After the reasoning closed, only a re-entry can
+        force again, and it restarts the count (and the reminder) at zero.
+        """
+        if positions <= 0:
+            return True
+        if self._loop_stop or self._forcing or self._waiting_utf8 or self._close_requested:
             return False
-        if self._done:
-            # A re-entry into thinking restarts the count at zero.
-            return positions < self._budget
-        return self._thinking_tokens + positions < self._budget
+        det = self._loop_detector
+        if det is not None and not det.looping and det.may_trigger_within(positions):
+            return False
+        if not self._done:
+            return self.idle_for(positions)
+        if self._budget is not None and positions >= self._budget:
+            return False
+        if self._nudge_after is not None and positions >= self._nudge_after:
+            return False
+        return True

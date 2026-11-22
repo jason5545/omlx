@@ -212,8 +212,10 @@ def test_host_ids_change_no_decision(seed, monkeypatch):
     for i, (a, b) in enumerate(zip(off, on)):
         assert a == b, f"cycle {i} differs"
     # The runs cross the processor's decisions (otherwise this proves little)
-    # and the host path skips idle draft calls.
-    assert on_calls < off_calls
+    # and the host path never calls the processor more. Since upstream #4926
+    # both paths already drop a processor that is inert for the whole chain
+    # (_live_processors), so the host path's idle_for skip seldom saves more.
+    assert on_calls <= off_calls
 
 
 def test_runs_cross_reminders_closes_and_loops(monkeypatch):

@@ -478,11 +478,14 @@ def _idle_proc(rng):
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
-def test_idle_for_holds_for_every_continuation():
+@pytest.mark.parametrize("bound", ["idle_for", "inert_for"])
+def test_idle_for_holds_for_every_continuation(bound):
     """Whenever the processor says it is idle for ``h`` calls, the next
     ``h`` calls, each adding one token of any value, return the logits
     untouched (the MTP drafter then skips them; it rewinds the processor
-    after its chain either way)."""
+    after its chain either way). ``inert_for`` (the verify and draft rows
+    of the MTP chain skip the processor) must hold the same way, also
+    without a budget (loop guard only)."""
     rng = random.Random(11)
     vocab = [1, 3, 5, NL, 50, 51, 52, 53, END, START, 9, 9, 9, 1, 1]
     logits = mx.zeros((1, 128))
@@ -496,7 +499,7 @@ def test_idle_for_holds_for_every_continuation():
             hist.append(forced if forced is not None else rng.choice(vocab))
             out = proc(list(hist), logits)
             for h in (1, 2, 3):
-                if not proc.idle_for(h):
+                if not getattr(proc, bound)(h):
                     busy += 1
                     continue
                 idle += 1
@@ -511,3 +514,24 @@ def test_idle_for_holds_for_every_continuation():
     # Not vacuous: with these tight limits (budget 20, a reminder at 15, a
     # 24-token loop window) most positions still are idle, and some are not.
     assert idle > busy > 0 and checked > 10000
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+def test_inert_for_without_a_budget_does_not_raise():
+    """Loop guard only (``budget=None``): ``inert_for`` must answer instead
+    of comparing an int with None (11/23: Inkling 2 MTP verify crashed with
+    "'<' not supported between instances of 'int' and 'NoneType'")."""
+    from omlx.api.thinking import ThinkingBudgetProcessor
+
+    proc = ThinkingBudgetProcessor(
+        think_end_token_ids=[END],
+        budget=None,
+        think_start_token_id=START,
+        loop_detector=RepetitionDetector(n=4, window=24, min_tokens=8, threshold=0.4),
+    )
+    logits = mx.zeros((1, 128))
+    proc([1, 2], logits)  # the first call takes the prompt as its baseline
+    assert proc.inert_for(4)
+    proc([1, 2, END], logits)  # the reasoning closes
+    assert proc._done
+    assert proc.inert_for(4)
