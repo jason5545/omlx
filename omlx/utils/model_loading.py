@@ -14,6 +14,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
+from ..patches.inkling2.loopcd import apply_loopcd
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
 from ..patches.raon1_mini import normalize_raon1_mini_model_file
@@ -1046,6 +1047,10 @@ def maybe_apply_pre_load_patches(
                 # The M5 packed verify kernels keep a 5-row verify close to
                 # a 4-row one on dense Qwen, so depth 4 pays there.
                 set_mtp_depth(4)
+            elif model_type == "deepseek_v41":
+                # DSpark drafts a whole dspark_block_size block per cycle.
+                block = (text_config or config).get("dspark_block_size")
+                set_mtp_depth(int(block) if block else 3)
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
@@ -1752,6 +1757,7 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
         if applied:
             logger.info(f"IndexCache applied: freq={index_cache_freq}")
 
+    apply_loopcd(model, model_settings)
     return model
 
 
